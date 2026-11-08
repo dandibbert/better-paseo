@@ -52,6 +52,9 @@ export interface TasksOptions {
    * Needs `includeDone`.
    */
   includeArchived?: boolean;
+  /** Cross-host Tasks stores do not call this plugin installation's local
+   * server RPCs for a different daemon. SDK-backed fields still work. */
+  remoteHost?: boolean;
 }
 
 /**
@@ -928,10 +931,13 @@ interface TaskStore {
 }
 
 const stores = new WeakMap<PaseoApi, TaskStore>();
+/** Isolated from the local store: the local plugin RPC enrichers know only
+ * this installation's daemon, never an arbitrarily connected other host. */
+const remoteStores = new WeakMap<PaseoApi, TaskStore>();
 /** Stores with a warm hold, so turning the board off can drop them all. */
 const heldStores = new Set<TaskStore>();
 
-function createStore(api: PaseoApi): TaskStore {
+function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
   const listeners = new Set<() => void>();
   const entries = new Map<string, AgentEntry>();
   const sourceMembers = new Map<string, Set<string>>();
@@ -1729,7 +1735,7 @@ function createStore(api: PaseoApi): TaskStore {
    * a tick so one snapshot's agents go together.
    */
   function requestLastTurnFor(agent: PaseoAgent) {
-    if (!lastTurnLoader || boardConsumers === 0) return;
+    if (!localServerExtras || !lastTurnLoader || boardConsumers === 0) return;
     const prompt = agent.lastUserMessageAt ?? "";
     const working = agent.status === "running";
     const known = lastTurns.get(agent.id);
@@ -1751,7 +1757,7 @@ function createStore(api: PaseoApi): TaskStore {
    * `turns.last` waits for a record still being written.
    */
   function askAfterTurnEnd(agentId: string) {
-    if (!lastTurnLoader || boardConsumers === 0) return;
+    if (!localServerExtras || !lastTurnLoader || boardConsumers === 0) return;
     const run = generation;
     setTimeout(() => {
       if (run !== generation || !entries.has(agentId)) return;
@@ -1764,7 +1770,7 @@ function createStore(api: PaseoApi): TaskStore {
     const loader = lastTurnLoader;
     const ids = [...lastTurnQueue];
     lastTurnQueue = new Set();
-    if (!loader) return;
+    if (!localServerExtras || !loader) return;
     for (let start = 0; start < ids.length; start += LAST_TURN_BATCH) {
       void loader(ids.slice(start, start + LAST_TURN_BATCH)).then((turns) => {
         if (run !== generation) return;
@@ -1805,7 +1811,7 @@ function createStore(api: PaseoApi): TaskStore {
    */
   let subagentDueAt = Number.POSITIVE_INFINITY;
   function scheduleSubagents(delay: number) {
-    if (!subagentLoader || consumers === 0) return;
+    if (!localServerExtras || !subagentLoader || consumers === 0) return;
     const due = Date.now() + delay;
     if (subagentTimer !== null && subagentDueAt <= due) return;
     if (subagentTimer !== null) clearTimeout(subagentTimer);
@@ -1820,7 +1826,7 @@ function createStore(api: PaseoApi): TaskStore {
 
   async function readSubagents(run: number) {
     const loader = subagentLoader;
-    if (!loader || subagentReading) return;
+    if (!localServerExtras || !loader || subagentReading) return;
     subagentReading = true;
     try {
       await readReads(run);
@@ -1877,6 +1883,7 @@ function createStore(api: PaseoApi): TaskStore {
 
   /** The server's inferred origins; a changed one relinks its card to the parent it names. */
   async function readOrigins(run: number) {
+    if (!localServerExtras) return;
     const loader = parentOriginsLoader;
     if (!loader) return;
     try {
@@ -1907,6 +1914,7 @@ function createStore(api: PaseoApi): TaskStore {
 
   /** The server's read marks; a changed one moves its card (and lets a failed parent go). */
   async function readReads(run: number) {
+    if (!localServerExtras) return;
     const loader = readMarksLoader;
     if (!loader) return;
     try {
@@ -2187,6 +2195,7 @@ function createStore(api: PaseoApi): TaskStore {
    * shows on the next board. Without either, labels keep stand-in colors.
    */
   async function readLabelDefinitions(run: Run) {
+    if (!localServerExtras) return;
     const loader = labelDefinitionsLoader;
     if (!loader) return;
     try {
@@ -2835,6 +2844,7 @@ function createStore(api: PaseoApi): TaskStore {
   function fetchProjectIcon(projectId: string): Promise<ProjectIconData | null> {
     const iconApi = api.projects as PaseoApi["projects"] & OptionalProjectIconsApi;
     if (typeof iconApi.icon === "function") return iconApi.icon(projectId).then((result) => result.icon);
+    if (!localServerExtras) return Promise.resolve(null);
     return new Promise((resolve) => {
       if (!iconBatch) {
         const batch = new Map<string, Array<(icon: ProjectIconData | null) => void>>();
@@ -2859,7 +2869,7 @@ function createStore(api: PaseoApi): TaskStore {
 
   function requestProjectIcon(projectId: string) {
     const iconApi = api.projects as PaseoApi["projects"] & OptionalProjectIconsApi;
-    if (typeof iconApi.icon !== "function" && !projectIconsLoader) return;
+    if (typeof iconApi.icon !== "function" && (!localServerExtras || !projectIconsLoader)) return;
     const revision = projects.get(projectId)?.projectIconRevision ?? null;
     const cached = projectIcons.get(projectId);
     if (cached?.revision === revision) return;
@@ -3076,13 +3086,22 @@ function getStore(api: PaseoApi): TaskStore {
   return store;
 }
 
+function getRemoteStore(api: PaseoApi): TaskStore {
+  let store = remoteStores.get(api);
+  if (!store) {
+    store = createStore(api, false);
+    remoteStores.set(api, store);
+  }
+  return store;
+}
+
 /**
  * All lanes, all subscriptions. The board screen calls this once.
  * `beforeRelease` runs as the board lets go, before its subscriptions could
  * close: a warm hold taken there keeps them open.
  */
 export function useTasks(paseo: PaseoApi, options: TasksOptions, beforeRelease?: (paseo: PaseoApi) => void): TasksHandle {
-  const store = getStore(paseo);
+  const store = options.remoteHost ? getRemoteStore(paseo) : getStore(paseo);
   const archived = options.includeDone && options.includeArchived === true;
   // Before the subscription (a layout effect runs ahead of it), so a first
   // board reads the done list once, with archived agents or without; after,
