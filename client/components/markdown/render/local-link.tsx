@@ -14,10 +14,15 @@ import type { RenderContext } from "./context";
  */
 export function LocalLink({
   path,
+  href,
+  sourceType,
   context,
   children,
 }: {
   path: string;
+  /** Original Markdown href, without premature percent-decoding. */
+  href?: string;
+  sourceType?: "inline-code";
   context: RenderContext;
   children: ReactNode;
 }) {
@@ -27,6 +32,22 @@ export function LocalLink({
   const absolutePath = resolveLocalLink(path, pathContext.cwd);
   const reveal = context.onRevealPath ?? pathContext.reveal;
   const copies = (capabilities.touch && !capabilities.hover) || !reveal;
+  const openNative = context.onOpenFileLink;
+  const onPress = () => {
+    if (openNative) {
+      const target = href ?? path;
+      openNative(
+        sourceType === "inline-code"
+          ? { href: target, text: path, sourceType }
+          : { href: target },
+        "preferred",
+      );
+    } else if (copies) {
+      void copy(absolutePath, { feedback: "toast", label: "Copy path" });
+    } else {
+      reveal?.(absolutePath);
+    }
+  };
   // `onPress` on a Text, as for a web link: a View mid sentence would break
   // the line box.
   return (
@@ -34,8 +55,8 @@ export function LocalLink({
       selectable
       accessibilityRole="link"
       accessibilityLabel={absolutePath}
-      accessibilityHint={copies ? "Copies the path" : "Reveals the file"}
-      onPress={() => (copies ? void copy(absolutePath, { feedback: "toast", label: "Copy path" }) : reveal(absolutePath))}
+      accessibilityHint={openNative ? "Opens the file in Paseo" : copies ? "Copies the path" : "Reveals the file"}
+      onPress={onPress}
       style={context.styles.link}
     >
       {children}
