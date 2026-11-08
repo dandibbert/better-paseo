@@ -1,12 +1,14 @@
-import React, { useMemo, useRef } from "react";
+import React, { useMemo, useRef, useState } from "react";
 import { Pressable, Text, View } from "react-native";
 import { TasksTypography, HOST_FONT as F, HOST_LINE } from "../typography";
 import type { PluginScreenProps } from "@getpaseo/plugin/client";
+import * as pluginClient from "@getpaseo/plugin/client";
 import { Icon } from "@getpaseo/plugin/client/react-native";
 import { useDeviceTasksPreferences } from "../device-preferences";
 import { useTasksLanguage } from "../i18n";
 import { pluginRoot } from "../../components/focus-ring";
 import { HAIRLINE } from "./board-style";
+import type { TasksSettings } from "../../../shared/tasks-settings";
 import { SearchCoverageProvider } from "./search-loading";
 import { DesktopBoard } from "./desktop-board";
 import { MenuBoundsContext } from "./menu";
@@ -14,6 +16,7 @@ import { carriedSettings } from "./carry";
 import { tasksSettingsOpener, useTasksEnabledStore, useTasksSettings } from "./enabled";
 import { boardIsCompact } from "./navigation";
 import { PhoneBoard } from "./phone-board";
+import { AllHostsBoard } from "./all-hosts-screen";
 import { BOARD_STRINGS } from "./strings";
 import { useBoard, type BoardLayoutHandlers } from "./use-board";
 
@@ -52,7 +55,7 @@ function BoardReader(props: PluginScreenProps) {
   if (!device.ready) return <BoardBlank {...props} />;
   if (!settings) return <BoardBlank {...props} />;
   if (!settings.enabled) return <BoardOff {...props} />;
-  return <BoardContent {...props} />;
+  return <BoardContent {...props} cardSettings={device.settings ?? settings} />;
 }
 
 function BoardBlank(props: PluginScreenProps) {
@@ -60,7 +63,73 @@ function BoardBlank(props: PluginScreenProps) {
 }
 
 /** The layout follows the host's: the phone layout on its compact layout, the lanes everywhere else. */
-function BoardContent(props: PluginScreenProps) {
+/**
+ * Host enumeration is a client capability. A stock or older Paseo client may
+ * omit it; that client keeps the original single-daemon board unchanged.
+ * This stable wrapper calls the real SDK hook when the host supports it.
+ */
+interface ConfiguredHost {
+  serverId: string;
+  label: string;
+  status: "idle" | "connecting" | "online" | "offline" | "error";
+}
+const EMPTY_HOSTS: readonly ConfiguredHost[] = [];
+const readConfiguredHosts =
+  (pluginClient as unknown as { useHosts?: () => readonly ConfiguredHost[] }).useHosts ?? (() => EMPTY_HOSTS);
+let rememberedScope: "all" | "current" = "all";
+
+function BoardContent(props: PluginScreenProps & { cardSettings: TasksSettings }) {
+  const hosts = readConfiguredHosts();
+  const [scope, setScope] = useState<"all" | "current">(() => rememberedScope);
+  const language = useTasksLanguage();
+  // Older Paseo apps may expose host discovery without the cross-host SDK
+  // client factory; leave their existing single-host board working.
+  const multiHost = hosts.length > 1 &&
+    typeof (pluginClient as unknown as { getPaseoClient?: unknown }).getPaseoClient === "function";
+  const selectedAll = multiHost && scope === "all";
+  const changeScope = (next: "all" | "current") => {
+    rememberedScope = next;
+    setScope(next);
+  };
+  const colors = props.theme.colors;
+  return (
+    <View style={{ flex: 1, minHeight: 0, backgroundColor: colors.surface0 }}>
+      {multiHost ? (
+        <View style={{ flexDirection: "row", gap: 7, alignItems: "center", paddingHorizontal: 12,
+          paddingVertical: 8, borderBottomWidth: HAIRLINE, borderBottomColor: colors.border }}>
+          <Pressable accessibilityRole="button" accessibilityState={{ selected: selectedAll }}
+            onPress={() => changeScope("all")}
+            style={{ paddingVertical: 7, paddingHorizontal: 12, borderRadius: 8,
+              backgroundColor: selectedAll ? colors.surface2 : colors.surface1 }}>
+            <Text style={{ fontSize: 13, fontWeight: selectedAll ? "600" : "400",
+              color: selectedAll ? colors.foreground : colors.foregroundMuted }}>
+              {language === "zh" ? "全部主机" : "All hosts"} · {hosts.length}
+            </Text>
+          </Pressable>
+          <Pressable accessibilityRole="button" accessibilityState={{ selected: !selectedAll }}
+            onPress={() => changeScope("current")}
+            style={{ paddingVertical: 7, paddingHorizontal: 12, borderRadius: 8,
+              backgroundColor: !selectedAll ? colors.surface2 : colors.surface1 }}>
+            <Text numberOfLines={1} style={{ fontSize: 13, fontWeight: !selectedAll ? "600" : "400",
+              color: !selectedAll ? colors.foreground : colors.foregroundMuted }}>
+              {props.host.label}
+            </Text>
+          </Pressable>
+        </View>
+      ) : null}
+      {selectedAll ? (
+        <TasksTypography theme={props.theme}>
+          <AllHostsBoard screen={props} hosts={hosts} settings={props.cardSettings} />
+        </TasksTypography>
+      ) : (
+        <LocalBoardContent {...props} />
+      )}
+    </View>
+  );
+}
+
+/** Local board retains the complete existing operations, filters and details. */
+function LocalBoardContent(props: PluginScreenProps) {
   const rootRef = useRef<View>(null);
   const handlers = useRef<BoardLayoutHandlers | null>(null);
   const compact = boardIsCompact(props.layout.compact);

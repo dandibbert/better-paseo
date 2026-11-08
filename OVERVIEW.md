@@ -1,6 +1,10 @@
-Better Paseo puts every agent on one Tasks board, on phone, iPad and desktop. It also redraws conversations as compact rows for tool calls, reasoning, replies, prompts, checklists and errors.
+Better Paseo puts every agent on a Tasks board, on phone, iPad and desktop. When the Paseo client knows more than one host, the board offers **All hosts** alongside the current daemon's complete Tasks board. All hosts aggregates status lanes from online, configured hosts, labels each card with its source host, and routes Agent opening and permission responses back to that host. A disconnected host is shown as offline, not as zero completed tasks. Search and time-range controls work across loaded cards; the full set of single-daemon filters, server-specific operations, and detailed views remains available when switched to that daemon. It also redraws conversations as compact rows for tool calls, reasoning, replies, prompts, checklists and errors.
 
 Paseo's native `render_ui` GenUI cards keep their native rendering (including streaming, fallbacks and follow-up actions) instead of becoming compact tool-call rows. Other tool calls start collapsed. The timeline offers syntax highlighting, streaming Markdown, block details, previews and copying, including table-cell selection. The Tasks board supports search and filters, agent details, stop and archive actions, permission responses, and manual or model-generated titles. Available actions and selection controls vary by platform and host capabilities.
+
+## All-host Tasks board
+
+The board uses Paseo's client-side `useHosts` / `getPaseoClient(serverId)` capabilities to read only hosts already configured and reachable from this client. It does not require or discover a server-to-server pairing, fetch credentials, or open inbound ports. The all-host view reuses Better Paseo's task cards and applies the current device's card preferences. It keeps host and Agent IDs together when aggregating. The normal per-host board remains available for host-specific Stop, archive/unarchive, in-depth task details, and full conversation search. An older Paseo client without host enumeration continues to show the original single-host board.
 
 ## Setup and settings
 
