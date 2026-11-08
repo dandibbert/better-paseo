@@ -1,5 +1,5 @@
 import type { TasksHandle } from "../data";
-import { LANE_ORDER, type LaneId, type TaskCard } from "../model";
+import { LANE_ORDER, settledAt, type LaneId, type TaskCard } from "../model";
 
 /** A host is always identified by its configured Paseo serverId, never by its display label. */
 export interface AggregateHost {
@@ -38,8 +38,15 @@ function matchesQuery(item: AggregateTask, query: string): boolean {
   ].some((value) => value?.toLocaleLowerCase().includes(query));
 }
 
-function lastUpdated(card: TaskCard): number {
-  const timestamp = Date.parse(card.timing.updatedAt);
+function sortTimestamp(card: TaskCard): number {
+  // Daemons can bump updatedAt while restoring a closed agent. Keep settled
+  // and archived tasks in their true historical position instead.
+  const time = card.lane === "archived"
+    ? card.timing.archivedAt ?? settledAt(card.timing)
+    : card.lane === "done" ? settledAt(card.timing)
+    : card.lane === "needs_input" ? card.timing.attentionAt ?? card.timing.updatedAt
+    : card.timing.updatedAt;
+  const timestamp = Date.parse(time);
   return Number.isFinite(timestamp) ? timestamp : 0;
 }
 
@@ -74,7 +81,7 @@ export function aggregateHostTasks(
     }
   }
   for (const lane of LANE_ORDER) {
-    lanes[lane].sort((a, b) => lastUpdated(b.card) - lastUpdated(a.card) ||
+    lanes[lane].sort((a, b) => sortTimestamp(b.card) - sortTimestamp(a.card) ||
       a.serverId.localeCompare(b.serverId) || a.card.id.localeCompare(b.card.id));
   }
   return lanes;
