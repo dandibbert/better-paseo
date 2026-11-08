@@ -82,7 +82,10 @@ function BoardContent(props: PluginScreenProps & { cardSettings: TasksSettings }
   const hosts = readConfiguredHosts();
   const [scope, setScope] = useState<"all" | "current">(() => rememberedScope);
   const language = useTasksLanguage();
-  const multiHost = hosts.length > 1;
+  // Older Paseo apps may expose host discovery without the cross-host SDK
+  // client factory; leave their existing single-host board working.
+  const multiHost = hosts.length > 1 &&
+    typeof (pluginClient as { getPaseoClient?: unknown }).getPaseoClient === "function";
   const selectedAll = multiHost && scope === "all";
   const changeScope = (next: "all" | "current") => {
     rememberedScope = next;
