@@ -3,7 +3,7 @@ import { Platform, StyleSheet, View, type LayoutChangeEvent, type ViewStyle } fr
 import { useAgent, usePaseo, useRpc } from "@getpaseo/plugin/client";
 import { useRevealedText } from "./ui/use-revealed-text";
 import { ChatComposerContext, type ComposerTimelineItemProps as PluginTimelineItemProps } from "./ui/chat-composer";
-import { NativeFileLinkContext, type NativeFileLinkActions } from "./components/markdown/native-file-links";
+import { NativeFileLinkContext, NativeLinkMenuContext, type NativeFileLinkActions } from "./components/markdown/native-file-links";
 import type { PluginTheme } from "@getpaseo/plugin";
 import { useThemeTokens } from "./components/theme-tokens";
 import { ToolCallout } from "./components/tool-callouts";
@@ -945,7 +945,9 @@ export function LiveAssistantRenderer(props: PluginTimelineItemProps<LiveAssista
   const fileLinks = (props as typeof props & { fileLinks?: NativeFileLinkActions }).fileLinks;
   return <BlockPlacement agentId={props.agentId} timestamp={props.timestamp} kind="activity">
     <NativeFileLinkContext.Provider value={fileLinks?.open ?? null}>
-      <ChatComposerContext.Provider value={props.composer}><AssistantMemo {...props} /></ChatComposerContext.Provider>
+      <NativeLinkMenuContext.Provider value={fileLinks?.showMenu ?? null}>
+        <ChatComposerContext.Provider value={props.composer}><AssistantMemo {...props} /></ChatComposerContext.Provider>
+      </NativeLinkMenuContext.Provider>
     </NativeFileLinkContext.Provider>
   </BlockPlacement>;
 }
