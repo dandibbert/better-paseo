@@ -1,5 +1,6 @@
 import type { ExtendedThemeTokens } from "../../theme-tokens";
 import type { MarkdownStyles, MarkdownVariant, VariantMetrics } from "./styles";
+import type { NativeFileLinkActions } from "../native-file-links";
 
 /**
  * Everything a block needs besides its own source. Built once per
@@ -22,4 +23,6 @@ export interface RenderContext {
   plainProse?: boolean;
   /** Press on a path in the prose; absent: `PathText` falls back to its context. */
   onRevealPath?: (path: string) => void;
+  /** Present on Paseo clients with native workspace file-panel support. */
+  onOpenFileLink?: NativeFileLinkActions["open"];
 }

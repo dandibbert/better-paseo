@@ -4,7 +4,7 @@ Paseo's native `render_ui` GenUI cards keep their native rendering (including st
 
 ## Setup and settings
 
-Paseo 0.14.0 or later is required. No separate service account is needed. Settings control reply rendering, fonts, previews and the Tasks board, including an optional provider, model and prompt for title generation. Mermaid code blocks use Paseo’s diagram renderer after the fence closes or the reply ends. Turning off plugin Markdown returns the whole reply to Paseo, including its file links.
+Paseo 0.14.0 or later is required. No separate service account is needed. Settings control reply rendering, fonts, previews and the Tasks board, including an optional provider, model and prompt for title generation. Mermaid code blocks use Paseo’s diagram renderer after the fence closes or the reply ends. File hyperlinks in enhanced replies open Paseo's native workspace file panel on hosts with the timeline file-link bridge, while keeping the entire reply in Better Paseo's Markdown renderer. The bridge supports desktop and mobile, including relative paths, encoded names and line anchors. On older hosts the plugin retains its existing reveal/copy behavior; turning off plugin Markdown restores the host's file links for every reply.
 
 ## Data access and limits
 

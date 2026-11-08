@@ -2,9 +2,10 @@ import { INCOMPLETE_IMAGE_PLACEHOLDER } from "remend";
 import type { Token, Tokens } from "../../../vendor/marked";
 import { decodeEntities, isPathLike, softBreaks } from "./text";
 import { localImagePath, localPath } from "./local-path";
+import { isWorkspaceFileHref } from "./file-link-target";
 import { lexBlock } from "../lex";
 
-export type ProseLink = { kind: "path" | "file" | "url"; target: string };
+export type ProseLink = { kind: "path" | "file" | "url"; target: string; href?: string };
 export interface NativeProseSource { markdown: string; links: ProseLink[] }
 
 /** Visible text cannot introduce new Markdown syntax in the native parser. */
@@ -22,8 +23,8 @@ function code(text: string): string {
 /** Re-emit parsed runs, preserving our literal HTML, breaks, image labels and path actions. */
 function proseWriter() {
   const links: ProseLink[] = [];
-  const link = (label: string, kind: ProseLink["kind"], target: string) => {
-    const index = links.push({ kind, target }) - 1;
+  const link = (label: string, kind: ProseLink["kind"], target: string, href?: string) => {
+    const index = links.push({ kind, target, ...(href !== undefined ? { href } : {}) }) - 1;
     return `[${label}](bc-prose://${index})`;
   };
   const walk = (runs: readonly Token[] = []): string => runs.map((token): string => {
@@ -39,13 +40,15 @@ function proseWriter() {
       case "del": return `~~${walk(token.tokens)}~~`;
       case "link": {
         const path = localPath(token.href);
-        return link(walk(token.tokens), path === null ? "url" : "file", path ?? token.href);
+        const isFile = path !== null || isWorkspaceFileHref(token.href);
+        return link(walk(token.tokens), isFile ? "file" : "url", path ?? token.href, isFile ? token.href : undefined);
       }
       case "image": {
         const label = escapeProse(token.text || token.href);
         if (token.href === INCOMPLETE_IMAGE_PLACEHOLDER) return label;
         const path = localPath(token.href);
-        return link(label, path === null ? "url" : "file", path ?? token.href);
+        const isFile = path !== null || isWorkspaceFileHref(token.href);
+        return link(label, isFile ? "file" : "url", path ?? token.href, isFile ? token.href : undefined);
       }
       default: return escapeProse((token as Tokens.Generic).raw ?? "");
     }

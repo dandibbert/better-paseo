@@ -117,6 +117,15 @@ function IOSProseWithPaths({ component: Component, nativeProps, source, context 
     const link = source.links[linkIndex(nativeEvent.url)];
     if (!link) return;
     if (link.kind === "url") { openLink(link.target); return; }
+    if (context.onOpenFileLink) {
+      context.onOpenFileLink(
+        link.kind === "path"
+          ? { href: link.target, text: link.target, sourceType: "inline-code" }
+          : { href: link.href ?? link.target },
+        "preferred",
+      );
+      return;
+    }
     const absolutePath = link.kind === "file" ? resolveLocalLink(link.target, paths.cwd) : formatPath(link.target, paths).absolutePath;
     const reveal = context.onRevealPath ?? paths.reveal;
     if ((capabilities.touch && !capabilities.hover) || !reveal) {

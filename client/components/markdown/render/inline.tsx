@@ -9,6 +9,7 @@ import { codeSurface } from "../../host-font-escape";
 import { decodeEntities, isPathLike, softBreaks } from "./text";
 import { localPath } from "./local-path";
 import { LocalLink } from "./local-link";
+import { isWorkspaceFileHref } from "./file-link-target";
 import { ProseSpan } from "../../../ui/prose-text";
 
 /** The visible text of an inline run, for measuring and summaries. */
@@ -82,8 +83,13 @@ export function renderInline(
         return;
       case "codespan":
         if (isPathLike(token.text)) {
-          if (context.renderText) {
-            out.push(<LocalLink key={key} path={token.text} context={context}><ProseSpan style={codeStyle}>{context.renderText(token.text)}</ProseSpan></LocalLink>);
+          // PathText intentionally copies paths on touch even when onReveal is
+          // set, so native file-panel actions must use LocalLink on every
+          // platform. Without that capability, retain its original UI.
+          if (context.renderText || context.onOpenFileLink) {
+            out.push(<LocalLink key={key} path={token.text} sourceType="inline-code" context={context}>
+              <ProseSpan style={codeStyle}>{context.renderText ? context.renderText(token.text) : token.text}</ProseSpan>
+            </LocalLink>);
             return;
           }
           out.push(
@@ -130,8 +136,8 @@ export function renderInline(
         const children = renderInline(token.tokens, context, key, inBold);
         const local = localPath(token.href);
         out.push(
-          local !== null ? (
-            <LocalLink key={key} path={local} context={context}>
+          local !== null || (context.onOpenFileLink && isWorkspaceFileHref(token.href)) ? (
+            <LocalLink key={key} path={local ?? token.href} href={token.href} context={context}>
               {children}
             </LocalLink>
           ) : (
@@ -152,9 +158,9 @@ export function renderInline(
         // local image in a paragraph is drawn as the image, in `blocks.tsx`;
         // this is one in a heading, a list item or a table cell.)
         const local = localPath(token.href);
-        if (local !== null) {
+        if (local !== null || (context.onOpenFileLink && isWorkspaceFileHref(token.href))) {
           out.push(
-            <LocalLink key={key} path={local} context={context}>
+            <LocalLink key={key} path={local ?? token.href} href={token.href} context={context}>
               {label}
             </LocalLink>,
           );

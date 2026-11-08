@@ -3,6 +3,7 @@ import { Platform, StyleSheet, View, type LayoutChangeEvent, type ViewStyle } fr
 import { useAgent, usePaseo, useRpc } from "@getpaseo/plugin/client";
 import { useRevealedText } from "./ui/use-revealed-text";
 import { ChatComposerContext, type ComposerTimelineItemProps as PluginTimelineItemProps } from "./ui/chat-composer";
+import { NativeFileLinkContext, type NativeFileLinkActions } from "./components/markdown/native-file-links";
 import type { PluginTheme } from "@getpaseo/plugin";
 import { useThemeTokens } from "./components/theme-tokens";
 import { ToolCallout } from "./components/tool-callouts";
@@ -939,8 +940,13 @@ export function LiveTodoRenderer(props: PluginTimelineItemProps<LiveTodoPayload>
 export function LiveAssistantRenderer(props: PluginTimelineItemProps<LiveAssistantPayload>) {
   const held = useHeldRow({ compact: props.layout.compact });
   if (held) return held;
+  // This field is an optional host extension. Older Paseo clients do not
+  // provide it; on those clients the existing reveal/copy behavior remains.
+  const fileLinks = (props as typeof props & { fileLinks?: NativeFileLinkActions }).fileLinks;
   return <BlockPlacement agentId={props.agentId} timestamp={props.timestamp} kind="activity">
-    <ChatComposerContext.Provider value={props.composer}><AssistantMemo {...props} /></ChatComposerContext.Provider>
+    <NativeFileLinkContext.Provider value={fileLinks?.open ?? null}>
+      <ChatComposerContext.Provider value={props.composer}><AssistantMemo {...props} /></ChatComposerContext.Provider>
+    </NativeFileLinkContext.Provider>
   </BlockPlacement>;
 }
 

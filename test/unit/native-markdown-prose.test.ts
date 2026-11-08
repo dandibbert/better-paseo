@@ -54,7 +54,7 @@ describe("native prose source", () => {
     const source = nativeProseSource(inline("[**docs**](https://example.com) `src/a.ts:42` [file](file:///tmp/a%20b.md) ![alt](https://example.com/a.png) [bad](javascript:alert)"));
     expect(source.links).toEqual([
       { kind: "url", target: "https://example.com" }, { kind: "path", target: "src/a.ts:42" },
-      { kind: "file", target: "/tmp/a b.md" }, { kind: "url", target: "https://example.com/a.png" },
+      { kind: "file", target: "/tmp/a b.md", href: "file:///tmp/a%20b.md" }, { kind: "url", target: "https://example.com/a.png" },
       { kind: "url", target: "javascript:alert" },
     ]);
     expect(source.markdown).toContain("[**docs**](bc-prose://0)");
@@ -167,6 +167,60 @@ describe("iOS Markdown prose", () => {
     expect(open).toHaveBeenCalledTimes(1);
     await act(async () => renderer.unmount());
   });
+  it("uses the native file opener on iOS without copying the link", async () => {
+    const openNative = vi.fn();
+    let renderer!: ReturnType<typeof TestRenderer.create>;
+    await act(async () => { renderer = TestRenderer.create(React.createElement(MarkdownProse, {
+      context: { ...context, onOpenFileLink: openNative },
+      tokens: inline("[report](docs/My%20Plan.md#L42) [external](https://example.com)"),
+    })); });
+    const press = native(renderer)[0]!.props.onLinkPress;
+    await act(async () => press({ nativeEvent: { url: "bc-prose://0" } }));
+    expect(openNative).toHaveBeenCalledWith({ href: "docs/My%20Plan.md#L42" }, "preferred");
+    expect(copy).not.toHaveBeenCalled();
+    await act(async () => renderer.unmount());
+  });
+
+  it("opens inline-code file paths on Android rather than copying", async () => {
+    os.__rnMockOS = "android";
+    const openNative = vi.fn();
+    let renderer!: ReturnType<typeof TestRenderer.create>;
+    await act(async () => { renderer = TestRenderer.create(React.createElement(MarkdownProse, {
+      context: { ...context, onOpenFileLink: openNative },
+      tokens: inline("Open \`src/a.ts:42\` in the workspace"),
+    })); });
+    const link = renderer.root.findAll((node) =>
+      node.props.accessibilityRole === "link" && typeof node.props.onPress === "function")[0]!;
+    await act(async () => link.props.onPress());
+    expect(openNative).toHaveBeenCalledWith(
+      { href: "src/a.ts:42", text: "src/a.ts:42", sourceType: "inline-code" },
+      "preferred",
+    );
+    expect(copy).not.toHaveBeenCalled();
+    await act(async () => renderer.unmount());
+  });
+
+  it("uses the native file opener on desktop without revealing the file", async () => {
+    os.__rnMockOS = "web";
+    input.hover = true;
+    const openNative = vi.fn();
+    const reveal = vi.fn();
+    let renderer!: ReturnType<typeof TestRenderer.create>;
+    await act(async () => { renderer = TestRenderer.create(React.createElement(PathContext.Provider,
+      { value: { roots: [], mode: "relative", cwd: "/project", reveal } },
+      React.createElement(MarkdownProse, {
+        context: { ...context, onOpenFileLink: openNative },
+        tokens: inline("[source](./src/main.ts#L25)"),
+      })));
+    });
+    const link = renderer.root.findAll((node) => node.props.accessibilityRole === "link" && node.props.onPress)[0]!;
+    await act(async () => link.props.onPress());
+    expect(openNative).toHaveBeenCalledWith({ href: "./src/main.ts#L25" }, "preferred");
+    expect(reveal).not.toHaveBeenCalled();
+    expect(copy).not.toHaveBeenCalled();
+    await act(async () => renderer.unmount());
+  });
+
   it("preserves spaces in a local Markdown link when pressed", async () => {
     let renderer!: ReturnType<typeof TestRenderer.create>;
     await act(async () => { renderer = TestRenderer.create(React.createElement(PathContext.Provider,
