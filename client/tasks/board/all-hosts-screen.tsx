@@ -205,6 +205,7 @@ function LaneColumn({
   return (
     <View style={{
       width: compact ? "100%" : 302, flex: compact ? 1 : undefined, minWidth: compact ? 0 : 302,
+      alignSelf: "stretch",
       borderWidth: 1, borderColor: colors.border, backgroundColor: colors.surface0,
       borderRadius: 12, overflow: "hidden",
     }}>
