@@ -53,7 +53,7 @@ function HostReader({
 }) {
   const paseo = useMemo(() => {
     try {
-      const acquire = (pluginClient as { getPaseoClient?: (id: string) => PaseoApi }).getPaseoClient;
+      const acquire = (pluginClient as unknown as { getPaseoClient?: (id: string) => PaseoApi }).getPaseoClient;
       return acquire?.(serverId) ?? null;
     } catch {
       // Host may have changed state between the connected-host snapshot and
@@ -300,7 +300,7 @@ export function AllHostsBoard({
     const requestId = task.card.permission?.requestId;
     if (!requestId) return;
     try {
-      const acquire = (pluginClient as { getPaseoClient?: (id: string) => PaseoApi }).getPaseoClient;
+      const acquire = (pluginClient as unknown as { getPaseoClient?: (id: string) => PaseoApi }).getPaseoClient;
       const api = acquire?.(task.serverId);
       if (!api) throw new Error("Host unavailable");
       void respondToPermission(api, task.card.id, button, requestId).catch((error: unknown) =>
