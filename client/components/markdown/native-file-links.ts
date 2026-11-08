@@ -16,6 +16,13 @@ export interface NativeFileLinkActions {
     source: NativeFileLinkSource,
     disposition?: "main" | "preferred" | "side",
   ): void;
+  /** Optional on Paseo hosts with the native Markdown link menu. */
+  showMenu?(
+    source: NativeFileLinkSource,
+    point?: { x: number; y: number },
+  ): void;
 }
+
+export const NativeLinkMenuContext = createContext<NativeFileLinkActions["showMenu"] | null>(null);
 
 export const NativeFileLinkContext = createContext<NativeFileLinkActions["open"] | null>(null);
