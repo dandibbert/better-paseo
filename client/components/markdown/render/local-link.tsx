@@ -1,5 +1,5 @@
 import React, { useContext, type ReactNode } from "react";
-import { ProseSpan } from "../../../ui/prose-text";
+import { InteractiveLinkSpan } from "./interactive-link";
 import { resolveLocalLink } from "./local-path";
 import { PathContext } from "../../../ui/path-text";
 import { useCopy } from "../../../ui/use-copy";
@@ -33,15 +33,12 @@ export function LocalLink({
   const reveal = context.onRevealPath ?? pathContext.reveal;
   const copies = (capabilities.touch && !capabilities.hover) || !reveal;
   const openNative = context.onOpenFileLink;
+  const source = sourceType === "inline-code"
+    ? { href: href ?? path, text: path, sourceType } as const
+    : { href: href ?? path };
   const onPress = () => {
     if (openNative) {
-      const target = href ?? path;
-      openNative(
-        sourceType === "inline-code"
-          ? { href: target, text: path, sourceType }
-          : { href: target },
-        "preferred",
-      );
+      openNative(source, "preferred");
     } else if (copies) {
       void copy(absolutePath, { feedback: "toast", label: "Copy path" });
     } else {
@@ -51,8 +48,10 @@ export function LocalLink({
   // `onPress` on a Text, as for a web link: a View mid sentence would break
   // the line box.
   return (
-    <ProseSpan
+    <InteractiveLinkSpan
       selectable
+      context={context}
+      source={source}
       accessibilityRole="link"
       accessibilityLabel={absolutePath}
       accessibilityHint={openNative ? "Opens the file in Paseo" : copies ? "Copies the path" : "Reveals the file"}
@@ -60,6 +59,6 @@ export function LocalLink({
       style={context.styles.link}
     >
       {children}
-    </ProseSpan>
+    </InteractiveLinkSpan>
   );
 }
