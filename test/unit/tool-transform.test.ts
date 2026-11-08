@@ -45,6 +45,47 @@ describe("tool_call transformer", () => {
     expect(data(item())).not.toHaveProperty("approved");
   });
 
+  it.each([
+    "render_ui",
+    " RENDER_UI ",
+    "paseo_render_ui",
+    "mcp__paseo__render_ui",
+    "MCP__PASEO_CUSTOM__RENDER_UI",
+    "paseo.render_ui",
+    "paseo_custom.render_ui",
+  ])("does not take over Paseo GenUI tool %s", (name) => {
+    // A completed card, an in-flight skeleton, and a rejected call must all
+    // remain native. Returning { items: [] } would delete the GenUI row.
+    for (const status of ["running", "completed", "failed", "canceled"] as const) {
+      const tool = item({
+        name,
+        status,
+        detail: {
+          type: "unknown",
+          input: { type: "metric", title: "Sample", data: { value: 42 } },
+          output: null,
+        },
+      });
+      const phase = status === "running" ? "streaming" : "complete";
+      expect(transformToolCall({ item: tool, phase })).toBeUndefined();
+    }
+  });
+
+  it.each([
+    "mcp__other__render_ui",
+    "mcp__paseo__render_ui_preview",
+    "paseo.render_ui_extra",
+    "render_ui_preview",
+    "custom_render_ui",
+    "paseo_render_ui_preview",
+  ])("still enhances a non-native tool named %s", (name) => {
+    const transformed = data(item({
+      name,
+      detail: { type: "unknown", input: {}, output: null },
+    }));
+    expect(transformed).toMatchObject({ name, status: "completed", phase: "complete" });
+  });
+
   it("keeps a canceled status as the host reported it", () => {
     expect(data(item({ status: "canceled", metadata: {} }))?.status).toBe("canceled");
   });
