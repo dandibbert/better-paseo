@@ -16,8 +16,8 @@ import { aggregateHostTasks, type AggregateTask, type HostTaskSnapshots } from "
 /**
  * Each connected host has its own SDK client and Tasks store. Never merge the
  * SDK clients or agent IDs themselves: data and actions must stay host-scoped.
- * This component is read-only; task actions remain on the original host board
- * or the agent tab opened by an aggregate card.
+ * SDK-backed task state is read from each host; local-server-only enrichers
+ * are deliberately not queried for remote hosts.
  */
 interface LiveHost {
   serverId: string;
@@ -28,25 +28,28 @@ interface LiveHost {
 type ChangeSnapshot = (serverId: string, tasks: TasksHandle | null) => void;
 
 function ConnectedHostReader({
-  serverId, paseo, options, onChange,
+  serverId, paseo, options, onChange, remote,
 }: {
   serverId: string;
   paseo: PaseoApi;
   options: TasksOptions;
   onChange: ChangeSnapshot;
+  remote: boolean;
 }) {
-  const tasks = useTasks(paseo, options);
+  const remoteOptions = useMemo<TasksOptions>(() => ({ ...options, remoteHost: remote }), [options, remote]);
+  const tasks = useTasks(paseo, remoteOptions);
   useEffect(() => { onChange(serverId, tasks); }, [serverId, tasks, onChange]);
   useEffect(() => () => onChange(serverId, null), [serverId, onChange]);
   return null;
 }
 
 function HostReader({
-  serverId, options, onChange,
+  serverId, options, onChange, remote,
 }: {
   serverId: string;
   options: TasksOptions;
   onChange: ChangeSnapshot;
+  remote: boolean;
 }) {
   const paseo = useMemo(() => {
     try {
@@ -60,7 +63,7 @@ function HostReader({
   }, [serverId]);
 
   return paseo ? (
-    <ConnectedHostReader serverId={serverId} paseo={paseo} options={options} onChange={onChange} />
+    <ConnectedHostReader serverId={serverId} paseo={paseo} options={options} onChange={onChange} remote={remote} />
   ) : null;
 }
 
@@ -333,7 +336,8 @@ export function AllHostsBoard({
   return (
     <View style={{ flex: 1, minHeight: 0, backgroundColor: colors.surface0 }}>
       {online.map((host) => (
-        <HostReader key={host.serverId} serverId={host.serverId} options={options} onChange={onSnapshot} />
+        <HostReader key={host.serverId} serverId={host.serverId} options={options}
+          onChange={onSnapshot} remote={host.serverId !== screen.host.id} />
       ))}
       <ScrollView horizontal showsHorizontalScrollIndicator={false}
         contentContainerStyle={{ paddingHorizontal: 12, paddingVertical: 8, gap: 7, alignItems: "center" }}
