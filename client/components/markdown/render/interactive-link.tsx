@@ -41,7 +41,7 @@ export function InteractiveLinkSpan({
   if (Platform.OS !== "web" || !showMenu) return element;
 
   return (
-    <span onContextMenu={(event: React.MouseEvent<HTMLSpanElement>) => {
+    <span title={source.href} onContextMenu={(event: React.MouseEvent<HTMLSpanElement>) => {
       event.preventDefault();
       event.stopPropagation();
       showMenu(source, { x: event.pageX, y: event.pageY });
