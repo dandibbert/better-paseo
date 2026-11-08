@@ -83,8 +83,13 @@ export function renderInline(
         return;
       case "codespan":
         if (isPathLike(token.text)) {
-          if (context.renderText) {
-            out.push(<LocalLink key={key} path={token.text} sourceType="inline-code" context={context}><ProseSpan style={codeStyle}>{context.renderText(token.text)}</ProseSpan></LocalLink>);
+          // PathText intentionally copies paths on touch even when onReveal is
+          // set, so native file-panel actions must use LocalLink on every
+          // platform. Without that capability, retain its original UI.
+          if (context.renderText || context.onOpenFileLink) {
+            out.push(<LocalLink key={key} path={token.text} sourceType="inline-code" context={context}>
+              <ProseSpan style={codeStyle}>{context.renderText ? context.renderText(token.text) : token.text}</ProseSpan>
+            </LocalLink>);
             return;
           }
           out.push(
@@ -94,9 +99,7 @@ export function renderInline(
               tokens={context.tokens}
               verbatim
               inline
-              onReveal={context.onOpenFileLink
-                ? (path: string) => context.onOpenFileLink?.({ href: path, text: path, sourceType: "inline-code" }, "preferred")
-                : context.onRevealPath}
+              onReveal={context.onRevealPath}
               style={codeStyle}
             />,
           );
