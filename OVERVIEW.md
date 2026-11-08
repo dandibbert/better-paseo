@@ -1,6 +1,6 @@
 Better Paseo puts every agent on one Tasks board, on phone, iPad and desktop. It also redraws conversations as compact rows for tool calls, reasoning, replies, prompts, checklists and errors.
 
-Tool calls start collapsed. The timeline offers syntax highlighting, streaming Markdown, block details, previews and copying, including table-cell selection. The Tasks board supports search and filters, agent details, stop and archive actions, permission responses, and manual or model-generated titles. Available actions and selection controls vary by platform and host capabilities.
+Paseo's native `render_ui` GenUI cards keep their native rendering (including streaming, fallbacks and follow-up actions) instead of becoming compact tool-call rows. Other tool calls start collapsed. The timeline offers syntax highlighting, streaming Markdown, block details, previews and copying, including table-cell selection. The Tasks board supports search and filters, agent details, stop and archive actions, permission responses, and manual or model-generated titles. Available actions and selection controls vary by platform and host capabilities.
 
 ## Setup and settings
 
