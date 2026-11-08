@@ -40,13 +40,15 @@ function proseWriter() {
       case "del": return `~~${walk(token.tokens)}~~`;
       case "link": {
         const path = localPath(token.href);
-        return link(walk(token.tokens), path !== null || isWorkspaceFileHref(token.href) ? "file" : "url", path ?? token.href, token.href);
+        const isFile = path !== null || isWorkspaceFileHref(token.href);
+        return link(walk(token.tokens), isFile ? "file" : "url", path ?? token.href, isFile ? token.href : undefined);
       }
       case "image": {
         const label = escapeProse(token.text || token.href);
         if (token.href === INCOMPLETE_IMAGE_PLACEHOLDER) return label;
         const path = localPath(token.href);
-        return link(label, path !== null || isWorkspaceFileHref(token.href) ? "file" : "url", path ?? token.href, token.href);
+        const isFile = path !== null || isWorkspaceFileHref(token.href);
+        return link(label, isFile ? "file" : "url", path ?? token.href, isFile ? token.href : undefined);
       }
       default: return escapeProse((token as Tokens.Generic).raw ?? "");
     }
