@@ -15,6 +15,7 @@ import { scheduleLoadTraceDump } from "./client/debug/load-trace";
 import { transformCompaction, transformToolCall } from "./client/tools/transform";
 import { agentMessageSchema } from "./client/tools/agent-message";
 import { assistantRows } from "./client/assistant-transform";
+import { hasNativeFileLinks } from "./client/assistant-file-handoff";
 import { externalHistoryRows } from "./client/external-history";
 import { embeddedFontsRpc } from "./shared/font-rpc";
 import { markBitmapsRpc } from "./shared/mark-rpc";
@@ -230,6 +231,10 @@ export default function contribute(client: PluginClientContext) {
         if (item.type !== "assistant_message") return undefined;
         if (!getEnhancerPreferences().assistantMarkdown) return undefined;
         if (!item.text.trim()) return undefined;
+        // A file link needs Paseo\u0027s workspace file-panel opener, which the
+        // plugin timeline SDK cannot invoke. Yield just these replies to the
+        // native renderer; ordinary and external-link replies stay enhanced.
+        if (hasNativeFileLinks(item.text)) return undefined;
         return { items: externalHistoryRows(item.text, phase, item.messageId) ?? assistantRows(item.text, phase) };
       },
     }),
