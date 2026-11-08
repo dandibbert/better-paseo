@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { Pressable, ScrollView, Text, TextInput, View } from "react-native";
-import { getPaseoClient, type PluginHostSummary, type PluginScreenProps } from "@getpaseo/plugin/client";
+import type { PluginScreenProps } from "@getpaseo/plugin/client";
+import * as pluginClient from "@getpaseo/plugin/client";
 import type { PaseoApi } from "@getpaseo/client";
 import type { DoneWindow } from "../../../shared/tasks-settings";
 import { useTasks, type TasksHandle, type TasksOptions } from "../data";
@@ -19,7 +20,7 @@ import { aggregateHostTasks, type AggregateTask, type HostTaskSnapshots } from "
 interface LiveHost {
   serverId: string;
   label: string;
-  status: PluginHostSummary["status"];
+  status: "idle" | "connecting" | "online" | "offline" | "error";
 }
 
 type ChangeSnapshot = (serverId: string, tasks: TasksHandle | null) => void;
@@ -47,7 +48,8 @@ function HostReader({
 }) {
   const paseo = useMemo(() => {
     try {
-      return getPaseoClient(serverId);
+      const acquire = (pluginClient as { getPaseoClient?: (id: string) => PaseoApi }).getPaseoClient;
+      return acquire?.(serverId) ?? null;
     } catch {
       // Host may have changed state between the connected-host snapshot and
       // the SDK lookup. The board displays it as still connecting.
