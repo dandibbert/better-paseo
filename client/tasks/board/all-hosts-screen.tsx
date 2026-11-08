@@ -282,10 +282,12 @@ export function AllHostsBoard({
   const options = useMemo<TasksOptions>(() => ({
     doneWindow: window, includeDone: true, includeArchived: showArchived,
   }), [window, showArchived]);
-  const online = hosts.filter((host) => host.status === "online");
+  const online = useMemo(() => hosts.filter((host) => host.status === "online"), [hosts]);
+  // Never show a stale card as live after its host disconnects: snapshot
+  // removal happens in an effect, but online-host filtering is synchronous.
   const aggregated = useMemo(() => aggregateHostTasks(
-    hosts, snapshots as HostTaskSnapshots, hostFilter, query,
-  ), [hosts, snapshots, hostFilter, query]);
+    online, snapshots as HostTaskSnapshots, hostFilter, query,
+  ), [online, snapshots, hostFilter, query]);
   const laneOrder = showArchived ? LANE_ORDER : LANE_ORDER.filter((id) => id !== "archived");
   const activeCount = laneOrder.reduce((total, id) => total + aggregated[id].length, 0);
   const waiting = online.filter((host) => !snapshots[host.serverId]?.ready);
