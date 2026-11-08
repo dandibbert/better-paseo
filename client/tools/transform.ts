@@ -8,6 +8,7 @@ import { toolErrorText } from "./error-text";
 import { isTaskEcho } from "./task-notification";
 import { readCodexAsyncQuestions } from "./codex-questions";
 import { agentMessageFromDetail, agentMessageSchema, senderlessAgentMessage } from "./agent-message";
+import { isNativeGenUiToolName } from "./native-genui";
 
 type JsonValue = boolean | null | number | string | JsonValue[] | { [key: string]: JsonValue };
 
@@ -55,6 +56,10 @@ export function transformToolCall({ item, phase }: {
   phase: "streaming" | "complete";
 }): PluginTimelineTransformResult | undefined {
   if (item.type !== "tool_call") return undefined;
+  // The host owns GenUI: preserving the original tool call is essential for
+  // streaming skeletons, validated cards, fallback text and follow-up actions.
+  // An empty plugin result would hide the card, so yield with undefined.
+  if (isNativeGenUiToolName(item.name)) return undefined;
   // The host's provenance when it passes it on; otherwise the notification's own status line.
   const provenance = item.name === "agent_message"
     ? (item as { agentMessage?: unknown }).agentMessage ?? agentMessageFromDetail(item.detail) : undefined;
