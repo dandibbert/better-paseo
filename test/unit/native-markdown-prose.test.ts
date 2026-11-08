@@ -181,6 +181,25 @@ describe("iOS Markdown prose", () => {
     await act(async () => renderer.unmount());
   });
 
+  it("opens inline-code file paths on Android rather than copying", async () => {
+    os.__rnMockOS = "android";
+    const openNative = vi.fn();
+    let renderer!: ReturnType<typeof TestRenderer.create>;
+    await act(async () => { renderer = TestRenderer.create(React.createElement(MarkdownProse, {
+      context: { ...context, onOpenFileLink: openNative },
+      tokens: inline("Open \`src/a.ts:42\` in the workspace"),
+    })); });
+    const link = renderer.root.findAll((node) =>
+      node.props.accessibilityRole === "link" && typeof node.props.onPress === "function")[0]!;
+    await act(async () => link.props.onPress());
+    expect(openNative).toHaveBeenCalledWith(
+      { href: "src/a.ts:42", text: "src/a.ts:42", sourceType: "inline-code" },
+      "preferred",
+    );
+    expect(copy).not.toHaveBeenCalled();
+    await act(async () => renderer.unmount());
+  });
+
   it("uses the native file opener on desktop without revealing the file", async () => {
     os.__rnMockOS = "web";
     input.hover = true;
