@@ -75,7 +75,7 @@ interface ConfiguredHost {
 }
 const EMPTY_HOSTS: readonly ConfiguredHost[] = [];
 const readConfiguredHosts =
-  (pluginClient as { useHosts?: () => readonly ConfiguredHost[] }).useHosts ?? (() => EMPTY_HOSTS);
+  (pluginClient as unknown as { useHosts?: () => readonly ConfiguredHost[] }).useHosts ?? (() => EMPTY_HOSTS);
 let rememberedScope: "all" | "current" = "all";
 
 function BoardContent(props: PluginScreenProps & { cardSettings: TasksSettings }) {
@@ -85,7 +85,7 @@ function BoardContent(props: PluginScreenProps & { cardSettings: TasksSettings }
   // Older Paseo apps may expose host discovery without the cross-host SDK
   // client factory; leave their existing single-host board working.
   const multiHost = hosts.length > 1 &&
-    typeof (pluginClient as { getPaseoClient?: unknown }).getPaseoClient === "function";
+    typeof (pluginClient as unknown as { getPaseoClient?: unknown }).getPaseoClient === "function";
   const selectedAll = multiHost && scope === "all";
   const changeScope = (next: "all" | "current") => {
     rememberedScope = next;
