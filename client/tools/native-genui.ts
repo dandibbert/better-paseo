@@ -15,14 +15,15 @@ export function isNativeGenUiToolName(name: string): boolean {
     const segments = normalized.split("__").filter(Boolean);
     return segments.length >= 3 &&
       segments[0] === "mcp" &&
-      (segments[1] === "paseo" || segments[1].startsWith("paseo_")) &&
+      (segments[1] === "paseo" || segments[1]?.startsWith("paseo_") === true) &&
       segments.slice(2).join("__") === "render_ui";
   }
 
   if (normalized.includes(".")) {
-    const [namespace, ...toolParts] = normalized.split(".");
+    const parts = normalized.split(".");
+    const namespace = parts[0] ?? "";
     return (namespace === "paseo" || namespace.startsWith("paseo_")) &&
-      toolParts.join(".") === "render_ui";
+      parts.slice(1).join(".") === "render_ui";
   }
 
   return false;
