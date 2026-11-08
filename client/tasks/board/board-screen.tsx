@@ -8,6 +8,7 @@ import { useDeviceTasksPreferences } from "../device-preferences";
 import { useTasksLanguage } from "../i18n";
 import { pluginRoot } from "../../components/focus-ring";
 import { HAIRLINE } from "./board-style";
+import type { TasksSettings } from "../../../shared/tasks-settings";
 import { SearchCoverageProvider } from "./search-loading";
 import { DesktopBoard } from "./desktop-board";
 import { MenuBoundsContext } from "./menu";
@@ -54,7 +55,7 @@ function BoardReader(props: PluginScreenProps) {
   if (!device.ready) return <BoardBlank {...props} />;
   if (!settings) return <BoardBlank {...props} />;
   if (!settings.enabled) return <BoardOff {...props} />;
-  return <BoardContent {...props} doneWindow={device.settings?.board.doneWindow ?? settings.board.doneWindow} />;
+  return <BoardContent {...props} cardSettings={device.settings ?? settings} />;
 }
 
 function BoardBlank(props: PluginScreenProps) {
@@ -77,7 +78,7 @@ const readConfiguredHosts =
   (pluginClient as { useHosts?: () => readonly ConfiguredHost[] }).useHosts ?? (() => EMPTY_HOSTS);
 let rememberedScope: "all" | "current" = "all";
 
-function BoardContent(props: PluginScreenProps & { doneWindow: "24h" | "7d" | "all" }) {
+function BoardContent(props: PluginScreenProps & { cardSettings: TasksSettings }) {
   const hosts = readConfiguredHosts();
   const [scope, setScope] = useState<"all" | "current">(() => rememberedScope);
   const language = useTasksLanguage();
@@ -115,7 +116,7 @@ function BoardContent(props: PluginScreenProps & { doneWindow: "24h" | "7d" | "a
       ) : null}
       {selectedAll ? (
         <TasksTypography theme={props.theme}>
-          <AllHostsBoard screen={props} hosts={hosts} doneWindow={props.doneWindow} />
+          <AllHostsBoard screen={props} hosts={hosts} settings={props.cardSettings} />
         </TasksTypography>
       ) : (
         <LocalBoardContent {...props} />
