@@ -160,7 +160,8 @@ function TaskPreview({
   const [expanded, setExpanded] = useState(false);
   const buttons = useMemo(() => card.permission ? permissionButtons(card.permission, language) : [], [card.permission, language]);
   const navigate = screen.navigation?.openAgent
-    ? (agentId: string) => onOpen(task, agentId)
+    ? (agentId: string) => onOpen(task, card.subagent && agentId === card.id
+      ? card.parent?.id ?? agentId : agentId)
     : undefined;
   return (
     <View style={{ gap: 3 }}>
