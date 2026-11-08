@@ -19,6 +19,7 @@ vi.mock("@getpaseo/plugin/client", () => ({ useSettings: () => ({ data: undefine
 await import("./helpers/quiet-renderer");
 const { default: TestRenderer, act } = await import("react-test-renderer");
 const { MarkdownView } = await import("../../client/components/markdown/markdown-view");
+const { NativeLinkMenuContext } = await import("../../client/components/markdown/native-file-links");
 const { MarkdownProse } = await import("../../client/components/markdown/render/prose");
 const { buildStyles, variantMetrics } = await import("../../client/components/markdown/render/styles");
 const { buildThemeTokens } = await import("../../client/components/theme-tokens");
@@ -259,6 +260,24 @@ describe("iOS Markdown prose", () => {
     expect(openNative).not.toHaveBeenCalled();
     await act(async () => links[1]!.props.onPress());
     expect(openNative).toHaveBeenCalledWith({ href: "src/main.ts#L3" }, "preferred");
+    await act(async () => renderer.unmount());
+  });
+
+  it("passes the host menu capability through the full MarkdownView", async () => {
+    os.__rnMockOS = "web";
+    const showMenu = vi.fn();
+    let renderer!: ReturnType<typeof TestRenderer.create>;
+    await act(async () => { renderer = TestRenderer.create(
+      React.createElement(NativeLinkMenuContext.Provider, { value: showMenu },
+        React.createElement(MarkdownView, {
+          text: "Open [documentation](https://example.com/guide)", tokens, variant: "document",
+        })),
+    ); });
+    const link = renderer.root.find((node) => node.type === "span" && node.props.title === "https://example.com/guide");
+    const preventDefault = vi.fn();
+    const stopPropagation = vi.fn();
+    await act(async () => link.props.onContextMenu({ pageX: 8, pageY: 16, preventDefault, stopPropagation }));
+    expect(showMenu).toHaveBeenCalledWith({ href: "https://example.com/guide" }, { x: 8, y: 16 });
     await act(async () => renderer.unmount());
   });
 
