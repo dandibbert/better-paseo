@@ -25,4 +25,6 @@ export interface RenderContext {
   onRevealPath?: (path: string) => void;
   /** Present on Paseo clients with native workspace file-panel support. */
   onOpenFileLink?: NativeFileLinkActions["open"];
+  /** Host-owned right-click / long-press menu. Undefined on older clients. */
+  onShowLinkMenu?: NativeFileLinkActions["showMenu"];
 }

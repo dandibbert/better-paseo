@@ -19,6 +19,7 @@ vi.mock("@getpaseo/plugin/client", () => ({ useSettings: () => ({ data: undefine
 await import("./helpers/quiet-renderer");
 const { default: TestRenderer, act } = await import("react-test-renderer");
 const { MarkdownView } = await import("../../client/components/markdown/markdown-view");
+const { NativeLinkMenuContext } = await import("../../client/components/markdown/native-file-links");
 const { MarkdownProse } = await import("../../client/components/markdown/render/prose");
 const { buildStyles, variantMetrics } = await import("../../client/components/markdown/render/styles");
 const { buildThemeTokens } = await import("../../client/components/theme-tokens");
@@ -178,6 +179,116 @@ describe("iOS Markdown prose", () => {
     await act(async () => press({ nativeEvent: { url: "bc-prose://0" } }));
     expect(openNative).toHaveBeenCalledWith({ href: "docs/My%20Plan.md#L42" }, "preferred");
     expect(copy).not.toHaveBeenCalled();
+    await act(async () => renderer.unmount());
+  });
+
+  it("shows the native menu for an iOS long press on a file link", async () => {
+    os.__rnMockOS = "ios";
+    const showMenu = vi.fn();
+    const openNative = vi.fn();
+    let renderer!: ReturnType<typeof TestRenderer.create>;
+    await act(async () => { renderer = TestRenderer.create(React.createElement(MarkdownProse, {
+      context: { ...context, onOpenFileLink: openNative, onShowLinkMenu: showMenu },
+      tokens: inline("[report](docs/My%20Plan.md#L42) and \`src/main.ts:9\`"),
+    })); });
+    const press = native(renderer)[0]!.props.onLinkLongPress;
+    expect(press).toEqual(expect.any(Function));
+    await act(async () => press({ nativeEvent: { url: "bc-prose://0" } }));
+    expect(showMenu).toHaveBeenCalledWith({ href: "docs/My%20Plan.md#L42" });
+    expect(openNative).not.toHaveBeenCalled();
+    press({ nativeEvent: { url: "bc-prose://1" } });
+    expect(showMenu).toHaveBeenLastCalledWith({
+      href: "src/main.ts:9", text: "src/main.ts:9", sourceType: "inline-code",
+    });
+    press({ nativeEvent: { url: "bc-prose://99" } });
+    expect(showMenu).toHaveBeenCalledTimes(2);
+    await act(async () => renderer.unmount());
+  });
+
+  it("shows the native menu for iOS URL-only paragraphs", async () => {
+    os.__rnMockOS = "ios";
+    const showMenu = vi.fn();
+    let renderer!: ReturnType<typeof TestRenderer.create>;
+    await act(async () => { renderer = TestRenderer.create(React.createElement(MarkdownProse, {
+      context: { ...context, onShowLinkMenu: showMenu },
+      tokens: inline("[Website](https://example.com/docs)"),
+    })); });
+    native(renderer)[0]!.props.onLinkLongPress({ nativeEvent: { url: "bc-prose://0" } });
+    expect(showMenu).toHaveBeenCalledWith({ href: "https://example.com/docs" });
+    await act(async () => renderer.unmount());
+  });
+
+  it("offers a context menu on web for external and local links without opening them", async () => {
+    os.__rnMockOS = "web";
+    input.hover = true;
+    const showMenu = vi.fn();
+    const openNative = vi.fn();
+    let renderer!: ReturnType<typeof TestRenderer.create>;
+    await act(async () => { renderer = TestRenderer.create(React.createElement(MarkdownProse, {
+      context: { ...context, onOpenFileLink: openNative, onShowLinkMenu: showMenu },
+      tokens: inline("[Website](https://example.com/docs) [report](./docs/report%20v2.md#L20)"),
+    })); });
+    const spans = renderer.root.findAll((node) =>
+      node.type === "span" && typeof node.props.onContextMenu === "function");
+    expect(spans).toHaveLength(2);
+    const preventDefault = vi.fn();
+    const stopPropagation = vi.fn();
+    await act(async () => spans[0]!.props.onContextMenu({ pageX: 22, pageY: 73, preventDefault, stopPropagation }));
+    expect(preventDefault).toHaveBeenCalledOnce();
+    expect(stopPropagation).toHaveBeenCalledOnce();
+    expect(showMenu).toHaveBeenCalledWith({ href: "https://example.com/docs" }, { x: 22, y: 73 });
+    spans[1]!.props.onContextMenu({ pageX: 120, pageY: 99, preventDefault, stopPropagation });
+    expect(showMenu).toHaveBeenLastCalledWith({ href: "./docs/report%20v2.md#L20" }, { x: 120, y: 99 });
+    expect(openNative).not.toHaveBeenCalled();
+    await act(async () => renderer.unmount());
+  });
+
+  it("offers long-press menus on Android while leaving click handlers intact", async () => {
+    os.__rnMockOS = "android";
+    const showMenu = vi.fn();
+    const openNative = vi.fn();
+    let renderer!: ReturnType<typeof TestRenderer.create>;
+    await act(async () => { renderer = TestRenderer.create(React.createElement(MarkdownProse, {
+      context: { ...context, onOpenFileLink: openNative, onShowLinkMenu: showMenu },
+      tokens: inline("[Website](https://example.com) [source](src/main.ts#L3)"),
+    })); });
+    const links = renderer.root.findAll((node) =>
+      node.props.accessibilityRole === "link" && typeof node.props.onLongPress === "function");
+    expect(links).toHaveLength(2);
+    await act(async () => links[1]!.props.onLongPress());
+    expect(showMenu).toHaveBeenCalledWith({ href: "src/main.ts#L3" });
+    expect(openNative).not.toHaveBeenCalled();
+    await act(async () => links[1]!.props.onPress());
+    expect(openNative).toHaveBeenCalledWith({ href: "src/main.ts#L3" }, "preferred");
+    await act(async () => renderer.unmount());
+  });
+
+  it("passes the host menu capability through the full MarkdownView", async () => {
+    os.__rnMockOS = "web";
+    const showMenu = vi.fn();
+    let renderer!: ReturnType<typeof TestRenderer.create>;
+    await act(async () => { renderer = TestRenderer.create(
+      React.createElement(NativeLinkMenuContext.Provider, { value: showMenu },
+        React.createElement(MarkdownView, {
+          text: "Open [documentation](https://example.com/guide)", tokens, variant: "document",
+        })),
+    ); });
+    const link = renderer.root.find((node) => node.type === "span" && node.props.title === "https://example.com/guide");
+    const preventDefault = vi.fn();
+    const stopPropagation = vi.fn();
+    await act(async () => link.props.onContextMenu({ pageX: 8, pageY: 16, preventDefault, stopPropagation }));
+    expect(showMenu).toHaveBeenCalledWith({ href: "https://example.com/guide" }, { x: 8, y: 16 });
+    await act(async () => renderer.unmount());
+  });
+
+  it("does not intercept the browser menu when Paseo lacks showMenu", async () => {
+    os.__rnMockOS = "web";
+    let renderer!: ReturnType<typeof TestRenderer.create>;
+    await act(async () => { renderer = TestRenderer.create(React.createElement(MarkdownProse, {
+      context, tokens: inline("[Website](https://example.com)"),
+    })); });
+    expect(renderer.root.findAll((node) => node.type === "span" &&
+      typeof node.props.onContextMenu === "function")).toHaveLength(0);
     await act(async () => renderer.unmount());
   });
 
