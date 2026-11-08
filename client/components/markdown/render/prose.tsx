@@ -12,8 +12,9 @@ import type { RenderContext } from "./context";
 import { MARKER_GAP, MOBILE_BULLET_GAP } from "./styles";
 import { BlockSelectionContext } from "./block-selection";
 import { renderInline } from "./inline";
-import { escapeProse, nativeBlockSource, nativeProseSource, type NativeProseSource } from "./native-prose-source";
+import { escapeProse, nativeBlockSource, nativeProseSource, type NativeProseSource, type ProseLink } from "./native-prose-source";
 import { resolveLocalLink } from "./local-path";
+import type { NativeFileLinkSource } from "../native-file-links";
 
 // Paseo 0.12 registers this Fabric component and its view config before rendering plugins.
 // Use the host's native view without bundling a second Markdown runtime or native library.
@@ -90,29 +91,47 @@ function IOSProse({ context, tokens, text, prefix, style, blockTokens, gap, ...r
     enableLinkPreview: false, enableBlockContextMenu: false, streamingAnimation: false,
     md4cFlags: blockTokens ? GROUP_FLAGS : FLAGS,
     selectionMenuConfig: { copyAsMarkdown: false, copyImageUrl: false, copyLabel: "Copy" } };
-  // Ordinary prose carries no clipboard controllers, effects, or path-context subscriptions.
+  // A settled iOS paragraph uses EnrichedMarkdownText, not nested React
+  // Native Text. It exposes a distinct link long-press event; hook that here
+  // rather than relying on an inline Text handler that never mounts on iOS.
+  const onLinkLongPress = context.onShowLinkMenu ? ({ nativeEvent }: LinkEvent) => {
+    const link = source.links[linkIndex(nativeEvent.url)];
+    if (!link) return;
+    selection?.cancel();
+    context.onShowLinkMenu?.(menuSource(link));
+  } : undefined;
   return source.links.some((link) => link.kind !== "url")
-    ? <IOSProseWithPaths component={Component} nativeProps={props} source={source} context={context} />
-    : <Component {...props} onLinkPress={({ nativeEvent }: LinkEvent) => {
-      selection?.cancel();
-      const link = source.links[linkIndex(nativeEvent.url)];
-      if (link?.kind === "url") openLink(link.target);
-    }} />;
+    ? <IOSProseWithPaths component={Component} nativeProps={props} source={source} context={context}
+        onLinkLongPress={onLinkLongPress} />
+    : <Component {...props} onLinkLongPress={onLinkLongPress}
+        onLinkPress={({ nativeEvent }: LinkEvent) => {
+          selection?.cancel();
+          const link = source.links[linkIndex(nativeEvent.url)];
+          if (link?.kind === "url") openLink(link.target);
+        }} />;
 }
 
 interface LinkEvent { nativeEvent: { url: string } }
+
+/** Keep the authored href (including line fragments and percent escapes). */
+function menuSource(link: ProseLink): NativeFileLinkSource {
+  return link.kind === "path"
+    ? { href: link.target, text: link.target, sourceType: "inline-code" }
+    : { href: link.href ?? link.target };
+}
 function linkIndex(url: string): number {
   return /^bc-prose:\/\/\d+$/.test(url) ? Number(url.slice("bc-prose://".length)) : -1;
 }
 
-function IOSProseWithPaths({ component: Component, nativeProps, source, context }: {
+function IOSProseWithPaths({ component: Component, nativeProps, source, context, onLinkLongPress }: {
   component: ElementType; nativeProps: Record<string, unknown>; source: NativeProseSource; context: RenderContext;
+  onLinkLongPress?: (event: LinkEvent) => void;
 }) {
   const selection = useContext(BlockSelectionContext);
   const paths = useContext(PathContext);
   const capabilities = useInputCapabilities();
   const { copy } = useCopy();
-  return <Component {...nativeProps} onLinkPress={({ nativeEvent }: LinkEvent) => {
+  return <Component {...nativeProps} onLinkLongPress={onLinkLongPress} onLinkPress={({ nativeEvent }: LinkEvent) => {
     selection?.cancel();
     const link = source.links[linkIndex(nativeEvent.url)];
     if (!link) return;
