@@ -28,15 +28,17 @@ interface LiveHost {
 type ChangeSnapshot = (serverId: string, tasks: TasksHandle | null) => void;
 
 function ConnectedHostReader({
-  serverId, paseo, options, onChange, remote,
+  serverId, paseo, options, onChange,
 }: {
   serverId: string;
   paseo: PaseoApi;
   options: TasksOptions;
   onChange: ChangeSnapshot;
-  remote: boolean;
 }) {
-  const remoteOptions = useMemo<TasksOptions>(() => ({ ...options, remoteHost: remote }), [options, remote]);
+  // The aggregate always uses SDK-only stores, including the selected host.
+  // Global plugin-server RPC loaders belong to a single installation and
+  // could otherwise enrich cards using data from a different daemon.
+  const remoteOptions = useMemo<TasksOptions>(() => ({ ...options, remoteHost: true }), [options]);
   const tasks = useTasks(paseo, remoteOptions);
   useEffect(() => { onChange(serverId, tasks); }, [serverId, tasks, onChange]);
   useEffect(() => () => onChange(serverId, null), [serverId, onChange]);
@@ -44,12 +46,11 @@ function ConnectedHostReader({
 }
 
 function HostReader({
-  serverId, options, onChange, remote,
+  serverId, options, onChange,
 }: {
   serverId: string;
   options: TasksOptions;
   onChange: ChangeSnapshot;
-  remote: boolean;
 }) {
   const paseo = useMemo(() => {
     try {
@@ -63,7 +64,7 @@ function HostReader({
   }, [serverId]);
 
   return paseo ? (
-    <ConnectedHostReader serverId={serverId} paseo={paseo} options={options} onChange={onChange} remote={remote} />
+    <ConnectedHostReader serverId={serverId} paseo={paseo} options={options} onChange={onChange} />
   ) : null;
 }
 
@@ -338,7 +339,7 @@ export function AllHostsBoard({
     <View style={{ flex: 1, minHeight: 0, backgroundColor: colors.surface0 }}>
       {online.map((host) => (
         <HostReader key={host.serverId} serverId={host.serverId} options={options}
-          onChange={onSnapshot} remote={host.serverId !== screen.host.id} />
+          onChange={onSnapshot} />
       ))}
       <ScrollView horizontal showsHorizontalScrollIndicator={false}
         contentContainerStyle={{ paddingHorizontal: 12, paddingVertical: 8, gap: 7, alignItems: "center" }}
