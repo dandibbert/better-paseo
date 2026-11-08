@@ -13,6 +13,7 @@ import { MdBlock } from "./render/md-block";
 import { buildStyles, variantMetrics, type MarkdownVariant } from "./render/styles";
 import { useZoomedTokens } from "../../ui/text-zoom";
 import { dismissBlockSelection } from "./render/block-selection";
+import { NativeFileLinkContext } from "./native-file-links";
 
 export { MARKDOWN_VARIANTS, type MarkdownVariant } from "./render/styles";
 
@@ -136,6 +137,7 @@ export function MarkdownView({
   // Sizes follow the host's content size (S7 §2.3); the metrics object is
   // cached per input, so the context — and every finished block — stays put
   // while the reply streams.
+  const openNativeFileLink = useContext(NativeFileLinkContext);
   const timelineProse = useContext(TimelineProseContext) && size !== undefined;
   const metrics = timelineProse
     ? variantMetrics(variant, tokens.typography.content.size, compact)
@@ -153,9 +155,10 @@ export function MarkdownView({
       collapseCode,
       plainProse,
       onRevealPath,
+      onOpenFileLink: openNativeFileLink ?? undefined,
       renderText,
     }),
-    [styles, tokens, metrics, variant, collapseCode, plainProse, onRevealPath, renderText],
+    [styles, tokens, metrics, variant, collapseCode, plainProse, onRevealPath, openNativeFileLink, renderText],
   );
 
   // A streamed chunk changes the tail and leaves every block before it as it
