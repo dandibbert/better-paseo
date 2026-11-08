@@ -9,6 +9,7 @@ import { codeSurface } from "../../host-font-escape";
 import { decodeEntities, isPathLike, softBreaks } from "./text";
 import { localPath } from "./local-path";
 import { LocalLink } from "./local-link";
+import { InteractiveLinkSpan } from "./interactive-link";
 import { isWorkspaceFileHref } from "./file-link-target";
 import { ProseSpan } from "../../../ui/prose-text";
 
@@ -187,15 +188,17 @@ function renderLink(
   // paragraph's selection range. No `href`: React Native Web would render a
   // real anchor and the click would navigate the app window itself.
   return (
-    <ProseSpan
+    <InteractiveLinkSpan
       key={key}
       selectable
       accessibilityRole="link"
+      context={context}
+      source={{ href }}
       onPress={() => openLink(href)}
       style={context.styles.link}
     >
       {children}
-    </ProseSpan>
+    </InteractiveLinkSpan>
   );
 }
 
