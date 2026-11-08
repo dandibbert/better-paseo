@@ -3,11 +3,13 @@ import { Pressable, ScrollView, Text, TextInput, View } from "react-native";
 import type { PluginScreenProps } from "@getpaseo/plugin/client";
 import * as pluginClient from "@getpaseo/plugin/client";
 import type { PaseoApi } from "@getpaseo/client";
-import type { DoneWindow } from "../../../shared/tasks-settings";
+import { effectiveCard, type CardSettings, type DoneWindow, type TasksSettings } from "../../../shared/tasks-settings";
 import { useTasks, type TasksHandle, type TasksOptions } from "../data";
-import { useTasksLanguage } from "../i18n";
+import { useTasksLanguage, type TasksLanguage } from "../i18n";
 import { LANE_ORDER, type LaneId } from "../model";
-import { StatusIcon } from "../cards";
+import { StatusIcon, TaskCardView } from "../cards";
+import { permissionButtons, respondToPermission, type PermissionButton } from "../actions";
+import { useToast } from "@getpaseo/plugin/client/react-native";
 import { BOARD_STRINGS } from "./strings";
 import { aggregateHostTasks, type AggregateTask, type HostTaskSnapshots } from "./all-hosts-model";
 
@@ -105,8 +107,8 @@ const words = {
   },
 } as const;
 
-const INITIAL_LANE_LIMIT = 50;
-const MORE_LANE_LIMIT = 50;
+const INITIAL_LANE_LIMIT = 30;
+const MORE_LANE_LIMIT = 30;
 
 function chipStyle(selected: boolean, colors: PluginScreenProps["theme"]["colors"]) {
   return {
@@ -138,70 +140,47 @@ function HostChip({
   );
 }
 
+/** The existing Better Paseo card, with a small source-host label above it. */
 function TaskPreview({
-  task, screen, onOpen, archivedText, unavailableText,
+  task, screen, onOpen, onPermission, fields, language,
 }: {
   task: AggregateTask;
   screen: PluginScreenProps;
-  onOpen(task: AggregateTask): void;
-  archivedText: string;
-  unavailableText: string;
+  onOpen(task: AggregateTask, agentId: string): void;
+  onPermission(task: AggregateTask, button: PermissionButton): void;
+  fields: CardSettings;
+  language: TasksLanguage;
 }) {
   const { card } = task;
   const colors = screen.theme.colors;
-  const canOpen = Boolean(screen.navigation?.openAgent) && card.archived !== "agent";
-  const folder = card.location.projectName ?? card.location.workspaceName ?? card.location.folder;
-  const subtitle = [card.providerLabel || card.provider, card.modelLabel].filter(Boolean).join(" · ");
-  const updated = new Date(card.timing.updatedAt);
-  const updatedLabel = Number.isNaN(updated.getTime()) ? "" : updated.toLocaleString();
+  const [expanded, setExpanded] = useState(false);
+  const buttons = useMemo(() => card.permission ? permissionButtons(card.permission, language) : [], [card.permission, language]);
+  const navigate = screen.navigation?.openAgent
+    ? (agentId: string) => onOpen(task, agentId)
+    : undefined;
   return (
-    <Pressable
-      accessibilityRole="button"
-      accessibilityLabel={`${card.title} · ${task.hostLabel}`}
-      accessibilityHint={canOpen ? undefined : card.archived === "agent" ? archivedText : unavailableText}
-      disabled={!canOpen}
-      onPress={() => onOpen(task)}
-      style={{
-        borderWidth: 1, borderColor: colors.border, borderRadius: 11,
-        backgroundColor: colors.surface1, padding: 12, gap: 7, opacity: canOpen ? 1 : 0.64,
-      }}
-    >
-      <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 7 }}>
-        <View style={{ flexDirection: "row", alignItems: "center", gap: 6, flexShrink: 1 }}>
-          <StatusIcon kind={card.status} theme={screen.theme} size={15} />
-          <Text numberOfLines={1} style={{ color: colors.foregroundMuted, fontSize: 12, fontWeight: "600", flexShrink: 1 }}>
-            {task.hostLabel}
-          </Text>
-        </View>
-        {card.permission ? (
-          <Text style={{ fontSize: 11, color: colors.foregroundMuted }}>
-            {card.permission.kind === "question" ? "?" : "!"}
-          </Text>
-        ) : null}
+    <View style={{ gap: 3 }}>
+      <View style={{ paddingHorizontal: 5, paddingTop: 2, flexDirection: "row", alignItems: "center", gap: 5 }}>
+        <Text numberOfLines={1} style={{ color: colors.foregroundMuted, fontSize: 11, fontWeight: "600" }}>
+          {task.hostLabel}
+        </Text>
       </View>
-      <Text numberOfLines={2} style={{ color: colors.foreground, fontWeight: "600", fontSize: 14, lineHeight: 20 }}>
-        {card.title}
-      </Text>
-      {folder ? (
-        <Text numberOfLines={1} style={{ color: colors.foregroundMuted, fontSize: 12 }}>{folder}</Text>
-      ) : null}
-      {subtitle ? (
-        <Text numberOfLines={1} style={{ color: colors.foregroundMuted, fontSize: 11 }}>{subtitle}</Text>
-      ) : null}
-      {card.error ? (
-        <Text numberOfLines={2} style={{ color: colors.statusDanger, fontSize: 12 }}>{card.error}</Text>
-      ) : null}
-      <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 6 }}>
-        <Text numberOfLines={1} style={{ color: colors.foregroundMuted, fontSize: 11, flexShrink: 1 }}>{updatedLabel}</Text>
-        <Text style={{ color: colors.accent, fontSize: 12, fontWeight: "500" }}>{canOpen ? "↗" : "—"}</Text>
-      </View>
-    </Pressable>
+      <TaskCardView card={card} theme={screen.theme} compact={screen.layout.compact}
+        fields={fields} titleLines={2} hostId={task.serverId} language={language}
+        focused={false} highlighted={false} stopPhase="idle"
+        permissionButtons={buttons} subtasksExpanded={expanded}
+        onSubtasksExpandedChange={(_agentId, value) => setExpanded(value)}
+        onOpen={navigate}
+        onReveal={(agentId, parentId) => onOpen(task, parentId ?? agentId)}
+        onPermission={(_card, button) => onPermission(task, button)}
+      />
+    </View>
   );
 }
 
 function LaneColumn({
   laneId, tasks, screen, compact, label, emptyLabel, limit, onMore, onLoadOlder, onOpen,
-  archivedText, unavailableText, moreText, olderText,
+  onPermission, fields, language, moreText, olderText,
 }: {
   laneId: LaneId;
   tasks: AggregateTask[];
@@ -212,9 +191,10 @@ function LaneColumn({
   limit: number;
   onMore(): void;
   onLoadOlder?(): void;
-  onOpen(task: AggregateTask): void;
-  archivedText: string;
-  unavailableText: string;
+  onOpen(task: AggregateTask, agentId: string): void;
+  onPermission(task: AggregateTask, button: PermissionButton): void;
+  fields: CardSettings;
+  language: TasksLanguage;
   moreText: string;
   olderText: string;
 }) {
@@ -236,7 +216,7 @@ function LaneColumn({
         contentContainerStyle={{ paddingHorizontal: 8, paddingBottom: 12, gap: 8 }}>
         {tasks.slice(0, limit).map((task) => (
           <TaskPreview key={task.key} task={task} screen={screen} onOpen={onOpen}
-            archivedText={archivedText} unavailableText={unavailableText} />
+            onPermission={onPermission} fields={fields} language={language} />
         ))}
         {tasks.length === 0 ? (
           <Text style={{ color: colors.foregroundMuted, fontSize: 12, padding: 12, textAlign: "center" }}>
@@ -259,20 +239,22 @@ function LaneColumn({
 }
 
 export function AllHostsBoard({
-  screen, hosts, doneWindow,
+  screen, hosts, settings,
 }: {
   screen: PluginScreenProps;
   hosts: readonly LiveHost[];
-  doneWindow: DoneWindow;
+  settings: TasksSettings;
 }) {
   const language = useTasksLanguage();
   const ui = words[language];
   const labels = BOARD_STRINGS[language];
   const colors = screen.theme.colors;
+  const toast = useToast();
+  const fields = useMemo(() => effectiveCard(settings, screen.layout.compact), [settings, screen.layout.compact]);
   const [hostFilter, setHostFilter] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [showArchived, setShowArchived] = useState(false);
-  const [window, setWindow] = useState<DoneWindow>(doneWindow);
+  const [window, setWindow] = useState<DoneWindow>(settings.board.doneWindow);
   const [lane, setLane] = useState<LaneId>("needs_input");
   const [limits, setLimits] = useState<Record<LaneId, number>>({
     needs_input: INITIAL_LANE_LIMIT, running: INITIAL_LANE_LIMIT,
@@ -304,10 +286,26 @@ export function AllHostsBoard({
   const failed = online.filter((host) => snapshots[host.serverId]?.error);
   const notOnline = hosts.filter((host) => host.status !== "online");
   const compact = screen.layout.compact;
-  const onOpen = useCallback((task: AggregateTask) => {
-    const agentId = task.card.subagent ? task.card.parent?.id ?? task.card.id : task.card.id;
+  const onOpen = useCallback((task: AggregateTask, agentId: string) => {
     screen.navigation?.openAgent({ serverId: task.serverId, agentId });
   }, [screen.navigation]);
+  const onPermission = useCallback((task: AggregateTask, button: PermissionButton) => {
+    if (button.kind === "open") {
+      onOpen(task, task.card.id);
+      return;
+    }
+    const requestId = task.card.permission?.requestId;
+    if (!requestId) return;
+    try {
+      const acquire = (pluginClient as { getPaseoClient?: (id: string) => PaseoApi }).getPaseoClient;
+      const api = acquire?.(task.serverId);
+      if (!api) throw new Error("Host unavailable");
+      void respondToPermission(api, task.card.id, button, requestId).catch((error: unknown) =>
+        toast.error(error instanceof Error ? error.message : String(error)));
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : String(error));
+    }
+  }, [onOpen, toast]);
   const refresh = useCallback(() => {
     for (const host of online) {
       if (hostFilter && host.serverId !== hostFilter) continue;
@@ -388,7 +386,7 @@ export function AllHostsBoard({
               compact label={labels.lanes[laneOrder.includes(lane) ? lane : "running"]}
               emptyLabel={ui.empty} limit={limits[lane]} onMore={() => showMore(lane)}
               onLoadOlder={lane === "done" && hasMoreHistory ? loadOlder : undefined}
-              onOpen={onOpen} archivedText={ui.archived} unavailableText={ui.navUnavailable}
+              onOpen={onOpen} onPermission={onPermission} fields={fields} language={language}
               moreText={ui.more} olderText={ui.older} />
           </View>
         </>
@@ -399,7 +397,7 @@ export function AllHostsBoard({
             <LaneColumn key={id} laneId={id} tasks={aggregated[id]} screen={screen} compact={false}
               label={labels.lanes[id]} emptyLabel={ui.empty} limit={limits[id]} onMore={() => showMore(id)}
               onLoadOlder={id === "done" && hasMoreHistory ? loadOlder : undefined}
-              onOpen={onOpen} archivedText={ui.archived} unavailableText={ui.navUnavailable}
+              onOpen={onOpen} onPermission={onPermission} fields={fields} language={language}
               moreText={ui.more} olderText={ui.older} />
           ))}
         </ScrollView>
