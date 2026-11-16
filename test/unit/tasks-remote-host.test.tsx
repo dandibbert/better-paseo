@@ -62,7 +62,8 @@ describe("cross-host task store isolation", () => {
       expect(labels).not.toHaveBeenCalled();
       expect(projectIcons).not.toHaveBeenCalled();
     } finally {
-      if (renderer) await act(async () => renderer.unmount());
+      const mounted = renderer;
+      if (mounted) await act(async () => mounted.unmount());
       setLastTurnLoader(null);
       setSubagentLoader(null);
       setReadMarksLoader(null);
