@@ -968,6 +968,29 @@ export function BetterPaseoSettingsPage({ theme, layout, host }: PluginSurfacePr
 
       <Section title={t.sectionMessages} look={look} hidden={!chat}>
         <SettingRow
+          title={t.footerMetricTitle}
+          description={t.footerMetricDescription}
+          look={look}
+          stacked
+          first
+          control={<Segmented
+            label={t.footerMetricTitle}
+            value={preferences.footerMetric}
+            options={[
+              { value: "off", label: t.footerMetricOff },
+              { value: "tps", label: "TPS" },
+              { value: "ttft", label: "TTFT" },
+              { value: "apiTurns", label: t.footerMetricApiTurns },
+              { value: "toolCalls", label: t.footerMetricToolCalls },
+              { value: "cost", label: t.footerMetricCost },
+              { value: "outputTokens", label: "Tokens" },
+            ]}
+            onChange={(footerMetric) => updateEnhancerPreferences({ footerMetric })}
+            look={look}
+          />}
+          disabled={!preferences.assistantMarkdown}
+        />
+        <SettingRow
           title={t.bubbleTitle}
           description={t.bubbleDescription}
           control={
@@ -979,7 +1002,6 @@ export function BetterPaseoSettingsPage({ theme, layout, host }: PluginSurfacePr
             />
           }
           look={look}
-          first
         />
         <SettingRow
           title={t.markdownTitle}
