@@ -12,6 +12,7 @@ import { formatFullStamp, formatDuration } from "../ui/time";
 import { TYPE } from "../ui/tokens/typography";
 import { unselectable } from "./selection";
 import type { TurnUsage } from "./user-message";
+import type { TurnTelemetry } from "../state/turn-duration";
 
 export interface FooterDetailsProps {
   agentName?: string | null;
@@ -23,6 +24,7 @@ export interface FooterDetailsProps {
   completedAt?: number | null;
   durationMs?: number | null;
   usage?: TurnUsage | null;
+  telemetry?: TurnTelemetry;
   tokens: ExtendedThemeTokens;
 }
 
@@ -44,7 +46,7 @@ export function useFooterDetailsWidth(): number {
 /**
  * Two columns: a plain label, then its toolbar icon, value and inline copy action.
  */
-export function FooterDetails({ agentName, modelId, modelName, thinkingLabel, startedAt, completedAt, durationMs, usage, tokens }: FooterDetailsProps) {
+export function FooterDetails({ agentName, modelId, modelName, thinkingLabel, startedAt, completedAt, durationMs, usage, telemetry, tokens }: FooterDetailsProps) {
   const { language } = useEnhancerPreferences();
   const rows: Array<{ label: string; icon: string; provider?: string | null; value: string; copyText?: string; copyLabel?: string }> = [];
   if (agentName) rows.push({ label: "Agent", icon: "Bot", provider: agentName, value: agentName, copyLabel: "Copy agent" });
@@ -61,6 +63,23 @@ export function FooterDetails({ agentName, modelId, modelName, thinkingLabel, st
     if (typeof count !== "number" || !Number.isFinite(count) || count < 0) continue;
     rows.push({ label, icon, value: count.toLocaleString(resolveLanguage(language) === "zh" ? "zh-CN" : "en-US") });
   }
+  for (const [label, icon, value, unit] of [
+    ["TPS", "Gauge", telemetry?.outputTps, " t/s"],
+    ["TTFT", "Timer", telemetry?.ttftMs, " ms"],
+    ["API turns", "Repeat", telemetry?.apiTurnCount, ""],
+    ["Tool calls", "Wrench", telemetry?.toolCallCount, ""],
+    ["API duration", "Timer", telemetry?.apiDurationMs, " ms"],
+    ["Generation", "Timer", telemetry?.generationDurationMs, " ms"],
+    ["Tool duration", "Timer", telemetry?.toolDurationMs, " ms"],
+    ["Approval wait", "Timer", telemetry?.approvalWaitMs, " ms"],
+    ["Cache write", "Database", telemetry?.usage?.cacheCreationInputTokens, ""],
+  ] as const) {
+    if (typeof value === "number" && Number.isFinite(value) && value >= 0)
+      rows.push({ label, icon, value: `${value.toLocaleString("en-US", { maximumFractionDigits: 1 })}${unit}` });
+  }
+  if (typeof telemetry?.usage?.totalCostUsd === "number" && Number.isFinite(telemetry.usage.totalCostUsd) && telemetry.usage.totalCostUsd >= 0)
+    rows.push({ label: "Reported cost", icon: "DollarSign", value: `${telemetry.usage.totalCostUsd.toFixed(4)}` });
+  if (telemetry?.stopReason) rows.push({ label: "Stop reason", icon: "CircleStop", value: telemetry.stopReason });
   const textStyle = [styles.text, unselectable, { color: tokens.foregroundMuted, fontFamily: tokens.fontUi }];
   return (
     <View>
