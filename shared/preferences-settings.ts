@@ -23,6 +23,7 @@ export const UI_FONTS = ["host", "inter", "system"] as const;
 export const MONO_FONTS = ["host", "custom"] as const;
 export const TOOL_DETAILS = ["collapsed", "expand-failed"] as const;
 export const PATH_DISPLAYS = ["relative", "absolute"] as const;
+export const FOOTER_METRICS = ["off", "tps", "ttft", "apiTurns", "toolCalls", "cost", "outputTokens"] as const;
 export const ROW_LABEL_STYLES = ["icon", "label", "both"] as const;
 export const MARKDOWN_VARIANTS_STORED = ["document", "compact", "terminal"] as const;
 export const SETTINGS_LANGUAGES = ["system", "en", "zh"] as const;
@@ -136,6 +137,7 @@ export const preferencesSchema = z.preprocess((raw) => migrateHoverDelay(migrate
   assistantMarkdown: flag(true),
   markdownVariant: z.enum(MARKDOWN_VARIANTS_STORED).catch("document"),
   rowLabelStyle: z.enum(ROW_LABEL_STYLES).catch("icon"),
+  footerMetric: z.enum(FOOTER_METRICS).catch("tps"),
   compactRowSpacing: flag(true),
   compactReplySpacing: flag(true),
   language: z.enum(SETTINGS_LANGUAGES).catch("system"),
