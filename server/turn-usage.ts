@@ -141,22 +141,25 @@ export function registerTurnUsageServer(
         }
       }
       const error = turnError(agent.provider, outcome, items);
-      const timing = {
-        turnId,
-        ...(agent.model ? { model: agent.model } : {}),
-        ...(startedAt !== undefined && startedAt <= endedAt ? { startedAt } : {}),
-        endedAt,
-        ...(error !== undefined ? { error } : {}),
-      };
       let usage: RecordedTurn["usage"];
+      let model: string | undefined;
       if (outcome.kind === "completed") {
         try {
-          const parsed = turnUsageSchema.safeParse((await paseo.agents.ref(agent.id).refresh())?.agent.lastUsage);
+          const snapshot = (await paseo.agents.ref(agent.id).refresh())?.agent;
+          if (typeof snapshot?.model === "string" && snapshot.model.trim()) model = snapshot.model;
+          const parsed = turnUsageSchema.safeParse(snapshot?.lastUsage);
           if (parsed.success && Object.keys(parsed.data).length) usage = parsed.data;
         } catch {
           // A missed reading costs one turn's figures, never its timing.
         }
       }
+      const timing = {
+        turnId,
+        ...(model ? { model } : {}),
+        ...(startedAt !== undefined && startedAt <= endedAt ? { startedAt } : {}),
+        endedAt,
+        ...(error !== undefined ? { error } : {}),
+      };
       try { await ledger.record(agent.id, usage ? { ...timing, usage } : timing); }
       catch { /* A full disk costs the record, never the turn. */ }
     })();
