@@ -54,6 +54,38 @@ import { resolveLanguage, type SettingsLanguagePreference } from "./i18n/setting
 import { SETTINGS_STRINGS, type SettingsStrings } from "./i18n/settings-page-strings";
 import { describeMonoSource } from "./settings-mono-source";
 
+/** A wrapping single-choice group; seven segments cannot fit on a phone. */
+function FooterMetricControl({ value, look }: { value: import("./preferences").FooterMetricPreference; look: PageLook }) {
+  const { tokens } = look;
+  const choices: ReadonlyArray<{ value: import("./preferences").FooterMetricPreference; label: string }> = [
+    { value: "off", label: look.t.footerMetricOff },
+    { value: "tps", label: "TPS" },
+    { value: "ttft", label: "TTFT" },
+    { value: "apiTurns", label: look.t.footerMetricApiTurns },
+    { value: "toolCalls", label: look.t.footerMetricToolCalls },
+    { value: "cost", label: look.t.footerMetricCost },
+    { value: "outputTokens", label: "Tokens" },
+  ];
+  return <View accessibilityRole="radiogroup" accessibilityLabel={look.t.footerMetricTitle}
+    style={{ flexDirection: "row", flexWrap: "wrap", gap: space.xs }}>
+    {choices.map((choice) => {
+      const selected = choice.value === value;
+      return <Pressable key={choice.value} accessibilityRole="radio"
+        accessibilityState={{ selected, checked: selected }} aria-checked={selected}
+        accessibilityLabel={choice.label}
+        onPress={() => updateEnhancerPreferences({ footerMetric: choice.value })}
+        style={{ paddingHorizontal: space.md, paddingVertical: space.sm,
+          borderRadius: radiusV2.chip, borderWidth: 1, borderColor: selected ? tokens.accent : tokens.v2.border,
+          backgroundColor: selected ? tokens.v2.surface2 : tokens.v2.surface1 }}>
+        <Text style={[settingsTextStyle(tokens, -1),
+          { fontFamily: tokens.fontUi, fontWeight: selected ? "600" : "400", color: selected ? tokens.foreground : tokens.foregroundMuted }]}>
+          {choice.label}
+        </Text>
+      </Pressable>;
+    })}
+  </View>;
+}
+
 /** What the settings page says about the daemon store, or null when all is well. */
 function storageHint(sync: SyncStatus, t: SettingsStrings): string | null {
   if (sync.failed) return t.syncFailed;
@@ -973,21 +1005,7 @@ export function BetterPaseoSettingsPage({ theme, layout, host }: PluginSurfacePr
           look={look}
           stacked
           first
-          control={<Segmented
-            label={t.footerMetricTitle}
-            value={preferences.footerMetric}
-            options={[
-              { value: "off", label: t.footerMetricOff },
-              { value: "tps", label: "TPS" },
-              { value: "ttft", label: "TTFT" },
-              { value: "apiTurns", label: t.footerMetricApiTurns },
-              { value: "toolCalls", label: t.footerMetricToolCalls },
-              { value: "cost", label: t.footerMetricCost },
-              { value: "outputTokens", label: "Tokens" },
-            ]}
-            onChange={(footerMetric) => updateEnhancerPreferences({ footerMetric })}
-            look={look}
-          />}
+          control={<FooterMetricControl value={preferences.footerMetric} look={look} />}
           disabled={!preferences.assistantMarkdown}
         />
         <SettingRow
