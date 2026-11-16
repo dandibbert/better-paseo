@@ -140,6 +140,12 @@ const en = {
     "Reduce spacing between a finished reply and the next plugin row. Turn off if they overlap.",
 
   sectionMessages: "Messages",
+  footerMetricTitle: "Reply footer metric",
+  footerMetricDescription: "Show one metric after each reply; hover or click to inspect all available data. Requires plugin markdown.",
+  footerMetricOff: "Off",
+  footerMetricApiTurns: "API turns",
+  footerMetricToolCalls: "Tools",
+  footerMetricCost: "Cost",
   bubbleTitle: "Enhanced prompt bubble",
   bubbleDescription:
     "Show token usage and a Copy button. Supported pasted images are displayed; other attachments stay with Paseo.",
@@ -349,6 +355,12 @@ const zh: SettingsStrings = {
   replySpacingDescription: "缩小已完成回复与后续插件行的间距；重叠时请关闭。",
 
   sectionMessages: "消息",
+  footerMetricTitle: "回复底部指标",
+  footerMetricDescription: "每条回复只显示一项指标；悬停或单击查看所有可用数据。需要启用插件 Markdown。",
+  footerMetricOff: "关闭",
+  footerMetricApiTurns: "API 回合",
+  footerMetricToolCalls: "工具次数",
+  footerMetricCost: "费用",
   bubbleTitle: "增强提问气泡",
   bubbleDescription: "显示 token 用量和复制按钮；支持的粘贴图片一并显示，其他附件交给 Paseo。",
   markdownTitle: "回复使用插件 Markdown",
