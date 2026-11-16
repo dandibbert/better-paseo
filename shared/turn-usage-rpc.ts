@@ -17,6 +17,7 @@ export const turnUsageSchema = z.object({
   inputTokens: z.number().optional(),
   cachedInputTokens: z.number().optional(),
   outputTokens: z.number().optional(),
+  cacheCreationInputTokens: z.number().optional(),
   totalCostUsd: z.number().optional(),
   contextWindowMaxTokens: z.number().optional(),
   contextWindowUsedTokens: z.number().optional(),
@@ -24,6 +25,7 @@ export const turnUsageSchema = z.object({
 
 export const recordedTurnSchema = z.object({
   turnId: z.string(),
+  model: z.string().optional(),
   /** When the server saw the turn start, in epoch milliseconds, if it did. */
   startedAt: z.number().optional(),
   /** When the server saw the turn end, in epoch milliseconds. */
