@@ -253,7 +253,7 @@ describe("iOS Markdown prose", () => {
       tokens: inline("[Website](https://example.com) [source](src/main.ts#L3)"),
     })); });
     const links = renderer.root.findAll((node) =>
-      node.type === "Text" && node.props.accessibilityRole === "link" && typeof node.props.onLongPress === "function");
+      (node.type as unknown) === "Text" && node.props.accessibilityRole === "link" && typeof node.props.onLongPress === "function");
     expect(links).toHaveLength(2);
     await act(async () => links[1]!.props.onLongPress());
     expect(showMenu).toHaveBeenCalledWith({ href: "src/main.ts#L3" });
