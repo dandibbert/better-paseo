@@ -1844,11 +1844,11 @@ function Usage(props: Inner) {
       {detailHero(card) !== "turn" ? <ContextBar context={contextView(card)} tokens={tokens} theme={props.theme} touch={touch} language={props.language} font={font} /> : null}
       <TokenBar mix={tokenMix(card)} tokens={tokens} theme={props.theme} touch={touch} language={props.language} font={font} />
       <View>
-        {line("cost", "Coins", words.totalCost, cost !== null ? `${cost.toFixed(2)}` : "—", true)}
+        {line("cost", "Coins", words.totalCost, cost !== null ? `$${cost.toFixed(2)}` : "—", true)}
         {sessionSpend?.usd != null ? line("session-cost", "Calculator",
           props.language === "zh" ? (sessionSpend.source === "estimated" ? "会话费用估算 · API 等值" : "会话费用 · 已报告") :
             (sessionSpend.source === "estimated" ? "Session estimate · API equivalent" : "Session cost · reported"),
-          `${sessionSpend.usd.toFixed(sessionSpend.usd < 0.01 ? 4 : 2)}${sessionSpend.pricedTurns < sessionSpend.totalTurns ? " *" : ""}`, true) : null}
+          `$${sessionSpend.usd.toFixed(sessionSpend.usd < 0.01 ? 4 : 2)}${sessionSpend.pricedTurns < sessionSpend.totalTurns ? " *" : ""}`, true) : null}
         {line("turn", "Hourglass", words.lastTurnTime, card.timing.lastTurnMs !== null ? formatDuration(card.timing.lastTurnMs) : "—", false)}
       </View>
     </View>
