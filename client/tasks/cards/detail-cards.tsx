@@ -4,6 +4,7 @@ import type { PluginTheme } from "@getpaseo/plugin";
 import { useRpc } from "@getpaseo/plugin/client";
 import { Icon, ScrollView as SheetScrollView, useToast } from "@getpaseo/plugin/client/react-native";
 import { revealPathRpc } from "../../../shared/file-rpc";
+import { sessionSpendRpc } from "../../../shared/session-spend-rpc";
 import { openLink } from "../../components/open-link";
 import { MarkdownView } from "../../components/markdown/markdown-view";
 import { variantMetrics } from "../../components/markdown/render/styles";
@@ -1816,6 +1817,16 @@ function TimelineTextSkeleton(props: { tokens: TaskTokens; id: string; line: num
 
 function Usage(props: Inner) {
   const { card, m, tokens } = props;
+  const readSpend = useRpc(sessionSpendRpc);
+  const readSpendRef = useRef(readSpend);
+  readSpendRef.current = readSpend;
+  const [sessionSpend, setSessionSpend] = useState<{ usd: number | null; source: string; pricedTurns: number; totalTurns: number } | null>(null);
+  useEffect(() => {
+    let active = true;
+    setSessionSpend(null);
+    void readSpendRef.current({ agentId: card.id }).then((value) => { if (active) setSessionSpend(value); }).catch(() => {});
+    return () => { active = false; };
+  }, [card.id, card.timing.lastTurnEndedAt]);
   const words = cardStrings(props.language).details;
   const touch = props.touch === true;
   const font = F.sm;
@@ -1833,7 +1844,11 @@ function Usage(props: Inner) {
       {detailHero(card) !== "turn" ? <ContextBar context={contextView(card)} tokens={tokens} theme={props.theme} touch={touch} language={props.language} font={font} /> : null}
       <TokenBar mix={tokenMix(card)} tokens={tokens} theme={props.theme} touch={touch} language={props.language} font={font} />
       <View>
-        {line("cost", "Coins", words.totalCost, cost !== null ? `$${cost.toFixed(2)}` : "—", true)}
+        {line("cost", "Coins", words.totalCost, cost !== null ? `${cost.toFixed(2)}` : "—", true)}
+        {sessionSpend?.usd != null ? line("session-cost", "Calculator",
+          props.language === "zh" ? (sessionSpend.source === "estimated" ? "会话费用估算 · API 等值" : "会话费用 · 已报告") :
+            (sessionSpend.source === "estimated" ? "Session estimate · API equivalent" : "Session cost · reported"),
+          `${sessionSpend.usd.toFixed(sessionSpend.usd < 0.01 ? 4 : 2)}${sessionSpend.pricedTurns < sessionSpend.totalTurns ? " *" : ""}`, true) : null}
         {line("turn", "Hourglass", words.lastTurnTime, card.timing.lastTurnMs !== null ? formatDuration(card.timing.lastTurnMs) : "—", false)}
       </View>
     </View>
