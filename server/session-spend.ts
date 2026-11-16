@@ -58,7 +58,12 @@ export function findRates(models: readonly ModelRates[], model: string, provider
   const variants = [id, id.split("/").at(-1)!];
   const matches = models.filter((entry) => variants.includes(entry.id) || variants.includes(`${entry.provider}/${entry.id}`));
   if (!matches.length) return null;
-  const preferred = provider ? matches.filter((entry) => entry.provider === provider || (provider === "codex" && entry.provider === "openai")) : [];
+  const canonicalProvider: Record<string, string> = {
+    codex: "openai", omp: "openai", claude: "anthropic", grok: "xai", gemini: "google",
+    cursor: "cursor", opencode: "opencode",
+  };
+  const source = provider ? (canonicalProvider[provider.toLowerCase()] ?? provider.toLowerCase()) : null;
+  const preferred = source ? matches.filter((entry) => entry.provider === source) : [];
   const candidates = preferred.length ? preferred : matches;
   const unique = new Map(candidates.map((entry) => [JSON.stringify(entry.cost), entry.cost]));
   return unique.size === 1 ? candidates[0]!.cost : null;
