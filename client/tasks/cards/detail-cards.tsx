@@ -1848,7 +1848,7 @@ function Usage(props: Inner) {
         {sessionSpend?.usd != null ? line("session-cost", "Calculator",
           props.language === "zh" ? (sessionSpend.source === "estimated" ? "会话费用估算 · API 等值" : "会话费用 · 已报告") :
             (sessionSpend.source === "estimated" ? "Session estimate · API equivalent" : "Session cost · reported"),
-          `$${sessionSpend.usd.toFixed(sessionSpend.usd < 0.01 ? 4 : 2)}${sessionSpend.pricedTurns < sessionSpend.totalTurns ? " *" : ""}`, true) : null}
+          `$${sessionSpend.usd.toFixed(sessionSpend.usd < 0.01 ? 4 : 2)}${sessionSpend.pricedTurns < sessionSpend.totalTurns ? (props.language === "zh" ? " · 部分回合" : " · partial turns") : ""}`, true) : null}
         {line("turn", "Hourglass", words.lastTurnTime, card.timing.lastTurnMs !== null ? formatDuration(card.timing.lastTurnMs) : "—", false)}
       </View>
     </View>
