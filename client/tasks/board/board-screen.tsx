@@ -75,7 +75,7 @@ interface ConfiguredHost {
 }
 const EMPTY_HOSTS: readonly ConfiguredHost[] = [];
 const readConfiguredHosts =
-  (pluginClient as unknown as { useHosts?: () => readonly ConfiguredHost[] }).useHosts ?? (() => EMPTY_HOSTS);
+  ("useHosts" in pluginClient ? (pluginClient as unknown as { useHosts: () => readonly ConfiguredHost[] }).useHosts : undefined) ?? (() => EMPTY_HOSTS);
 let rememberedScope: "all" | "current" = "all";
 
 function BoardContent(props: PluginScreenProps & { cardSettings: TasksSettings }) {
