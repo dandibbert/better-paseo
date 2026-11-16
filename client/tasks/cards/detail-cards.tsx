@@ -1860,6 +1860,7 @@ function Usage(props: Inner) {
         {line("cost", "Coins", words.totalCost, cost !== null ? `$${cost.toFixed(2)}` : "—", true)}
         <Pressable
           testID="detail-usage-session-spend"
+          {...tipProps(props.language === "zh" ? "计算会话费用估算" : "Calculate session cost estimate")}
           accessibilityRole="button"
           accessibilityLabel={props.language === "zh" ? "计算会话费用估算" : "Calculate session cost estimate"}
           accessibilityState={{ busy: spendLoading }}
@@ -1873,7 +1874,7 @@ function Usage(props: Inner) {
           <View style={{ flex: 1 }} />
           <Text style={{ fontSize: font, fontWeight: "600", fontFamily: MONO, color: tokens.foreground }}>
             {spendLoading ? "…" : sessionSpend?.usd != null
-              ? `${sessionSpend.usd.toFixed(sessionSpend.usd < 0.01 ? 4 : 2)}${sessionSpend.pricedTurns < sessionSpend.totalTurns ? (props.language === "zh" ? " · 部分" : " · partial") : ""}`
+              ? `$${sessionSpend.usd.toFixed(sessionSpend.usd < 0.01 ? 4 : 2)}${sessionSpend.pricedTurns < sessionSpend.totalTurns ? (props.language === "zh" ? " · 部分" : " · partial") : ""}`
               : props.language === "zh" ? "点击计算" : "Calculate"}
           </Text>
         </Pressable>
