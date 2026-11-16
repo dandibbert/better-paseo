@@ -62,7 +62,9 @@ describe("all-hosts Tasks aggregation", () => {
   it("searches host names, titles, paths and labels without cross-host mixing", () => {
     expect(aggregateHostTasks(hosts, initial, null, "bero").review).toHaveLength(1);
     expect(aggregateHostTasks(hosts, initial, null, "approve").needs_input).toHaveLength(1);
-    expect(aggregateHostTasks(hosts, initial, null, "BUILD").running).toHaveLength(1);
+    // Every test card has the "build" label, so use a title-specific search here.
+    expect(aggregateHostTasks(hosts, initial, null, "Build iOS").running).toHaveLength(1);
+    expect(aggregateHostTasks(hosts, initial, null, "build").running).toHaveLength(2);
     expect(aggregateHostTasks(hosts, initial, null, "nomatch").running).toHaveLength(0);
   });
 
