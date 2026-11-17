@@ -19,6 +19,7 @@ import { MARK_BITMAPS } from "./server/mark-bitmaps";
 import { writePerfDump } from "./server/perf-dump";
 import { registerTasksServer } from "./server/tasks/register";
 import { registerTurnUsageServer } from "./server/turn-usage";
+import { createAgyUsageSource } from "./server/agy-usage-source";
 import { shellOpenCommand, type PathEntry } from "./server/open-path";
 
 /**
@@ -473,6 +474,8 @@ export default function contribute(server: PluginServerContext) {
   registerTasksServer(server);
   // Each turn's token usage, kept on disk for the turn details.
   registerTurnUsageServer(server);
+  // AGY account /usage quotas appear in the existing Paseo Usage screen.
+  server.registerUsageSource(createAgyUsageSource());
 
   server.handle(revealPathRpc, async (input) => {
     const requested = await resolveSelector(input.path, input.cwd);
