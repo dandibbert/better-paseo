@@ -675,10 +675,10 @@ const TurnFooter = memo(function TurnFooter({
   const timing = useTurnFooter(paseo, agentId, at.getTime(), text, running, streaming);
   if (!timing) return null;
   return <CompletedReplyFooter agentId={agentId} text={text} at={new Date(timing.completedAt)} tokens={tokens}
-    compact={compact} durationMs={timing.durationMs} startedAt={timing.startedAt} usage={timing.usage} />;
+    compact={compact} durationMs={timing.durationMs} startedAt={timing.startedAt} usage={timing.usage} telemetry={timing.telemetry} />;
 });
 
-function CompletedReplyFooter({ agentId, text, at, tokens, compact, durationMs, startedAt, usage }: {
+function CompletedReplyFooter({ agentId, text, at, tokens, compact, durationMs, startedAt, usage, telemetry }: {
   agentId: string;
   text: string;
   at: Date;
@@ -687,6 +687,7 @@ function CompletedReplyFooter({ agentId, text, at, tokens, compact, durationMs, 
   durationMs: number | null;
   startedAt: number | null;
   usage?: TurnUsage;
+  telemetry?: import("./state/turn-duration").TurnTelemetry;
 }) {
   const agentName = useAgent(agentId, (agent) => agent.provider);
   const modelId = useAgent(agentId, (agent) => agent.model);
@@ -696,7 +697,7 @@ function CompletedReplyFooter({ agentId, text, at, tokens, compact, durationMs, 
   const model = useFooterModel(paseo, agentName, modelId, thinkingOptionId, cwd);
   return <AssistantFooter text={text} at={at} agentName={agentName} modelId={modelId} modelName={model.modelName}
     thinkingLabel={model.thinkingLabel}
-    durationMs={durationMs} startedAt={startedAt} usage={usage} tokens={tokens} compact={compact} />;
+    durationMs={durationMs} startedAt={startedAt} usage={usage} telemetry={telemetry} tokens={tokens} compact={compact} />;
 }
 
 /**

@@ -62,7 +62,25 @@ export function startsTurn(previous: Entry, next: Entry, marks?: TurnMarks): boo
   return holds(marks.ends, after - 1, before - END_SPLIT_MS);
 }
 
+export interface TurnTelemetry {
+  ttftMs?: number;
+  timeToRequestMs?: number;
+  outputTps?: number;
+  apiTurnCount?: number;
+  toolCallCount?: number;
+  durationMs?: number;
+  apiDurationMs?: number;
+  generationDurationMs?: number;
+  toolDurationMs?: number;
+  approvalWaitMs?: number;
+  canonicalModel?: string;
+  model?: string;
+  stopReason?: string;
+  usage?: { inputTokens?: number; cachedInputTokens?: number; cacheCreationInputTokens?: number; outputTokens?: number; totalCostUsd?: number };
+}
+
 export interface CompletedTurnFooter {
+  telemetry?: TurnTelemetry;
   turnId?: string;
   usage?: NonNullable<PaseoAgent["lastUsage"]>;
   at: number;
@@ -126,7 +144,10 @@ export function completedTurnFooters(
       startedAt = recorded ?? (firstAt < completedAt ? firstAt : NaN);
     }
     const duration = completedAt - startedAt;
-    result.push({ ...(turnId ? { turnId } : {}), at, text: reply.item.text, completedAt,
+    // Newer Paseo persists telemetry on the terminal assistant timeline row.
+    // Older SDKs do not declare this optional field; retain compatibility.
+    const telemetry = (reply as Entry & { telemetry?: TurnTelemetry }).telemetry;
+    result.push({ ...(turnId ? { turnId } : {}), ...(telemetry ? { telemetry } : {}), at, text: reply.item.text, completedAt,
       startedAt: Number.isFinite(duration) && duration >= 0 ? startedAt : null,
       durationMs: Number.isFinite(duration) && duration >= 0 ? duration : null });
   };

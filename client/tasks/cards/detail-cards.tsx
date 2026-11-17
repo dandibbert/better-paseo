@@ -4,6 +4,7 @@ import type { PluginTheme } from "@getpaseo/plugin";
 import { useRpc } from "@getpaseo/plugin/client";
 import { Icon, ScrollView as SheetScrollView, useToast } from "@getpaseo/plugin/client/react-native";
 import { revealPathRpc } from "../../../shared/file-rpc";
+import { sessionSpendRpc } from "../../../shared/session-spend-rpc";
 import { openLink } from "../../components/open-link";
 import { MarkdownView } from "../../components/markdown/markdown-view";
 import { variantMetrics } from "../../components/markdown/render/styles";
@@ -1816,6 +1817,29 @@ function TimelineTextSkeleton(props: { tokens: TaskTokens; id: string; line: num
 
 function Usage(props: Inner) {
   const { card, m, tokens } = props;
+  const readSpend = useRpc(sessionSpendRpc);
+  const readSpendRef = useRef(readSpend);
+  readSpendRef.current = readSpend;
+  const [sessionSpend, setSessionSpend] = useState<{ usd: number | null; source: string; pricedTurns: number; totalTurns: number } | null>(null);
+  const [spendLoading, setSpendLoading] = useState(false);
+  const spendRequest = useRef(0);
+  useEffect(() => {
+    setSessionSpend(null);
+    setSpendLoading(false);
+    return () => { spendRequest.current += 1; };
+  }, [card.id, card.timing.lastTurnEndedAt]);
+  const loadSessionSpend = () => {
+    if (spendLoading) return;
+    const request = ++spendRequest.current;
+    setSpendLoading(true);
+    // Request only on explicit interaction. The details panel can mount many
+    // times (and on many hosts), so fetching on mount is both wasteful and
+    // interferes with unrelated plugin RPCs in older host/test environments.
+    void Promise.resolve().then(() => readSpendRef.current({ agentId: card.id }))
+      .then((value) => { if (request === spendRequest.current) setSessionSpend(value ?? null); })
+      .catch(() => { if (request === spendRequest.current) setSessionSpend(null); })
+      .finally(() => { if (request === spendRequest.current) setSpendLoading(false); });
+  };
   const words = cardStrings(props.language).details;
   const touch = props.touch === true;
   const font = F.sm;
@@ -1834,6 +1858,26 @@ function Usage(props: Inner) {
       <TokenBar mix={tokenMix(card)} tokens={tokens} theme={props.theme} touch={touch} language={props.language} font={font} />
       <View>
         {line("cost", "Coins", words.totalCost, cost !== null ? `$${cost.toFixed(2)}` : "—", true)}
+        <Pressable
+          testID="detail-usage-session-spend"
+          {...tipProps(props.language === "zh" ? "计算会话费用估算" : "Calculate session cost estimate")}
+          accessibilityRole="button"
+          accessibilityLabel={props.language === "zh" ? "计算会话费用估算" : "Calculate session cost estimate"}
+          accessibilityState={{ busy: spendLoading }}
+          onPress={loadSessionSpend}
+          style={{ minHeight: touch ? 32 : 24, flexDirection: "row", alignItems: "center", gap: 6 }}
+        >
+          <Icon name="Calculator" size={14} color={tokens.foregroundMuted} />
+          <Text style={{ fontSize: font, color: tokens.foregroundMuted }}>
+            {props.language === "zh" ? "会话费用 · API 等值" : "Session spend · API equivalent"}
+          </Text>
+          <View style={{ flex: 1 }} />
+          <Text style={{ fontSize: font, fontWeight: "600", fontFamily: MONO, color: tokens.foreground }}>
+            {spendLoading ? "…" : sessionSpend?.usd != null
+              ? `$${sessionSpend.usd.toFixed(sessionSpend.usd < 0.01 ? 4 : 2)}${sessionSpend.pricedTurns < sessionSpend.totalTurns ? (props.language === "zh" ? " · 部分" : " · partial") : ""}`
+              : props.language === "zh" ? "点击计算" : "Calculate"}
+          </Text>
+        </Pressable>
         {line("turn", "Hourglass", words.lastTurnTime, card.timing.lastTurnMs !== null ? formatDuration(card.timing.lastTurnMs) : "—", false)}
       </View>
     </View>

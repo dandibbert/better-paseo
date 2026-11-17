@@ -14,6 +14,8 @@ import { FooterDetails, useFooterDetailsWidth } from "./footer-details";
 import { useInputCapabilities } from "../ui/use-input-capabilities";
 import { useScrollDismiss } from "../ui/scroll-anchor";
 import type { TurnUsage } from "./user-message";
+import type { TurnTelemetry } from "../state/turn-duration";
+import type { FooterMetricPreference } from "../preferences";
 import { useEnhancerPreferences } from "../preferences";
 import { resolveLanguage } from "../i18n/settings-strings";
 import { toolbarLabel } from "../i18n/toolbar-strings";
@@ -44,18 +46,20 @@ interface AssistantFooterProps {
   durationMs?: number | null;
   startedAt?: number | null;
   usage?: TurnUsage | null;
+  telemetry?: TurnTelemetry;
   tokens: ExtendedThemeTokens;
   /** `layout.compact`: a 44pt touch target for Copy. */
   compact?: boolean;
 }
 
-export function AssistantFooter({ text, at, agentName, modelId, modelName, thinkingLabel, durationMs, startedAt, usage, tokens, compact = false }: AssistantFooterProps) {
+export function AssistantFooter({ text, at, agentName, modelId, modelName, thinkingLabel, durationMs, startedAt, usage, telemetry, tokens, compact = false }: AssistantFooterProps) {
   // The shared copy path (plan §3.8): a check for 1.2 s on success, a toast
   // on failure, and no timer left running after unmount.
   const { copied, copy } = useCopy();
   const modelCopy = useCopy();
   const capabilities = useInputCapabilities(compact);
-  const { language } = useEnhancerPreferences();
+  const { language, footerMetric } = useEnhancerPreferences();
+  const metric = formatFooterMetric(footerMetric, telemetry, usage);
   const hintLanguage = resolveLanguage(language);
   const timeLabel = startedAt != null ? "Start time" : "End time";
   const timeStamp = formatFullStamp(startedAt != null ? new Date(startedAt) : at);
@@ -70,9 +74,9 @@ export function AssistantFooter({ text, at, agentName, modelId, modelName, think
   // replayed turn spans a millisecond or two. Their live turns time normally.
   const visibleDurationMs = (agentName === "grok" || agentName === "cursor") && durationMs != null &&
     durationMs < REPLAY_COLLAPSE_MS ? null : durationMs;
-  const { fit, measure } = useOneLineFit(compact, Boolean(modelName), visibleDurationMs != null);
+  const { fit, measure } = useOneLineFit(compact, Boolean(modelName), visibleDurationMs != null, metric !== null);
   const details = <FooterDetails agentName={agentName} modelId={modelId} modelName={modelName} thinkingLabel={thinkingLabel}
-    startedAt={startedAt} completedAt={at.getTime()} durationMs={visibleDurationMs} usage={usage} tokens={tokens} />;
+    startedAt={startedAt} completedAt={at.getTime()} durationMs={visibleDurationMs} usage={usage} telemetry={telemetry} tokens={tokens} />;
   const copyModel = useCallback(() => {
     if (modelId) void modelCopy.copy(modelId, { label: "Copy model name" });
   }, [modelId, modelCopy.copy]);
@@ -189,6 +193,12 @@ export function AssistantFooter({ text, at, agentName, modelId, modelName, think
             <Text style={styles.time}>{formatFooterStamp(at)}</Text>
           </ToolbarItem>
         ) : null}
+        {metric ? (
+          <ToolbarItem onLayout={compact ? measure.metric : undefined} label={`${metric.label}: ${metric.value}`} accessibilityLabel={`${metric.label}: ${metric.value}`} tokens={tokens} align="end" buttonStyle={styles.metadata} details={details} detailsWidth={detailsWidth} onLongPress={longPress}>
+            <Icon name="Gauge" size={DISCLOSURE_HEADER.icon} color={tokens.foregroundMuted} />
+            <Text style={styles.time}>{metric.value}</Text>
+          </ToolbarItem>
+        ) : null}
         {visibleDurationMs != null ? (
           <ToolbarItem onLayout={compact ? measure.duration : undefined} label={`${toolbarLabel("Elapsed time", language)}${hintLanguage === "zh" ? "：" : ":"} ${formatDuration(visibleDurationMs, hintLanguage, true)}`} accessibilityLabel={`Elapsed time: ${formatDuration(visibleDurationMs, "en")}`} tokens={tokens} align="end" buttonStyle={styles.metadata} onLongPress={longPress}>
             <Icon name="Hourglass" size={DISCLOSURE_HEADER.icon} color={tokens.foregroundMuted} />
@@ -215,7 +225,7 @@ const FOOTER_HEIGHT = 24;
 /** A replayed Grok or Cursor turn spans under this; a live model turn never does. */
 const REPLAY_COLLAPSE_MS = 1_000;
 
-type FooterSlot = "copy" | "model" | "clock" | "duration";
+type FooterSlot = "copy" | "model" | "clock" | "duration" | "metric";
 export interface FooterFit { model: boolean; clock: boolean }
 
 /**
@@ -230,8 +240,9 @@ export function fitOneLine(widths: Partial<Record<FooterSlot, number>>, row: num
   };
   // Half a point of rounding must not drop an item that fits.
   const fits = (slots: readonly FooterSlot[]) => span(slots) <= row + 0.5;
-  if (fits(["copy", "model", "clock", "duration"])) return { model: true, clock: true };
-  if (fits(["copy", "model", "duration"])) return { model: true, clock: false };
+  const extra = widths.metric !== undefined ? ["metric" as const] : [];
+  if (fits(["copy", "model", "clock", "duration", ...extra])) return { model: true, clock: true };
+  if (fits(["copy", "model", "duration", ...extra])) return { model: true, clock: false };
   return { model: false, clock: false };
 }
 
@@ -241,17 +252,36 @@ const FIT_ALL: FooterFit = { model: true, clock: true };
  * Measures the compact row and its items. A dropped item keeps its last width,
  * so a wider row brings it back; an item not drawn at all counts for nothing.
  */
-function useOneLineFit(compact: boolean, hasModel: boolean, hasDuration: boolean) {
+function useOneLineFit(compact: boolean, hasModel: boolean, hasDuration: boolean, hasMetric: boolean) {
   const [widths, setWidths] = useState<Partial<Record<FooterSlot | "row", number>>>({});
   const measure = useMemo(() => {
     const slot = (name: FooterSlot | "row") => (event: LayoutChangeEvent) => {
       const width = event.nativeEvent.layout.width;
       setWidths((previous) => previous[name] === width ? previous : { ...previous, [name]: width });
     };
-    return { row: slot("row"), copy: slot("copy"), model: slot("model"), clock: slot("clock"), duration: slot("duration") };
+    return { row: slot("row"), copy: slot("copy"), model: slot("model"), clock: slot("clock"), duration: slot("duration"), metric: slot("metric") };
   }, []);
-  const { row, model, duration, ...rest } = widths;
-  const fit = compact && row ? fitOneLine({ ...rest, ...(hasModel ? { model } : {}), ...(hasDuration ? { duration } : {}) },
+  const { row, model, duration, metric, ...rest } = widths;
+  const fit = compact && row ? fitOneLine({ ...rest, ...(hasModel ? { model } : {}), ...(hasDuration ? { duration } : {}), ...(hasMetric ? { metric } : {}) },
     row, space.sm) : FIT_ALL;
   return { fit, measure };
+}
+
+/** The configured metric is a single compact chip; absent data is never guessed. */
+export function formatFooterMetric(metric: FooterMetricPreference, telemetry?: TurnTelemetry, usage?: TurnUsage | null): { label: string; value: string } | null {
+  const read = (value: unknown): number | null => typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+  let value: number | null = null;
+  let label = "";
+  switch (metric) {
+    case "tps": label = "Output TPS"; value = read(telemetry?.outputTps); break;
+    case "ttft": label = "First token"; value = read(telemetry?.ttftMs); break;
+    case "apiTurns": label = "API turns"; value = read(telemetry?.apiTurnCount); break;
+    case "toolCalls": label = "Tool calls"; value = read(telemetry?.toolCallCount); break;
+    case "cost": label = "Reported cost"; value = read(telemetry?.usage?.totalCostUsd); break;
+    case "outputTokens": label = "Output tokens"; value = read(usage?.outputTokens ?? telemetry?.usage?.outputTokens); break;
+    default: return null;
+  }
+  if (value === null) return null;
+  const displayed = metric === "tps" ? `${value.toFixed(1)} t/s` : metric === "ttft" ? `${Math.round(value)} ms` : metric === "cost" ? `$${value.toFixed(value < 0.01 ? 4 : 3)}` : value.toLocaleString("en-US");
+  return { label, value: displayed };
 }

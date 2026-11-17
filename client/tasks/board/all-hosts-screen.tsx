@@ -323,7 +323,8 @@ export function AllHostsBoard({
   const loadOlder = useCallback(() => {
     for (const host of online) {
       if (hostFilter && host.serverId !== hostFilter) continue;
-      if (snapshots[host.serverId]?.lanes.done.hasMore) snapshots[host.serverId].loadMoreDone();
+      const snapshot = snapshots[host.serverId];
+      if (snapshot?.lanes.done.hasMore) snapshot.loadMoreDone();
     }
   }, [online, snapshots, hostFilter]);
   const hasMoreHistory = online.some((host) => (!hostFilter || hostFilter === host.serverId) &&

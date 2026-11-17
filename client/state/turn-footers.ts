@@ -181,7 +181,7 @@ export function createTurnFooterStore(source: () => Timeline, loadRecorded?: (si
       const previous = get(footer.at, footer.text);
       const value = previous?.completedAt === footer.completedAt && previous.startedAt === footer.startedAt &&
         previous.durationMs === footer.durationMs && previous.turnId === footer.turnId &&
-        previous.usage === footer.usage ? previous : footer;
+        previous.usage === footer.usage && JSON.stringify(previous.telemetry) === JSON.stringify(footer.telemetry) ? previous : footer;
       let at = next.get(footer.at);
       if (!at) next.set(footer.at, at = new Map());
       at.set(footer.text, value);
