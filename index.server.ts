@@ -475,7 +475,8 @@ export default function contribute(server: PluginServerContext) {
   // Each turn's token usage, kept on disk for the turn details.
   registerTurnUsageServer(server);
   // AGY account /usage quotas appear in the existing Paseo Usage screen.
-  server.registerUsageSource(createAgyUsageSource());
+  // Older host/test harnesses may not expose Usage Sources; chat features still load.
+  server.registerUsageSource?.(createAgyUsageSource());
 
   server.handle(revealPathRpc, async (input) => {
     const requested = await resolveSelector(input.path, input.cwd);
