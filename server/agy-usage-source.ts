@@ -3,15 +3,12 @@ import { createHash } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { promisify } from "node:util";
 import { z } from "zod";
-import {
-  toneFromUsedPct,
-  unavailable,
-  windowFromUsedPct,
-  type UsageAccount,
-  type UsageReport,
-  type UsageScope,
-  type UsageSourceRegistration,
-  type UsageWindow,
+import type {
+  UsageAccount,
+  UsageReport,
+  UsageScope,
+  UsageSourceRegistration,
+  UsageWindow,
 } from "@getpaseo/plugin/server/usage";
 
 /**
@@ -25,6 +22,18 @@ const VERSION_TIMEOUT_MS = 2_500;
 const QUERY_TIMEOUT_MS = 16_000; // Under Paseo's 20-second usage-source deadline, even with version check.
 const MIN_AGY = [1, 1, 15] as const;
 const SIGNED_OUT = /please sign in|not logged in|not logged into|authentication required/i;
+
+// Keep these tiny transforms local: the plugin SDK is a development-only
+// type dependency in Better Paseo, so importing its runtime helpers would
+// break plugins installed with npm ci --omit=dev.
+type UsageProblem = Extract<UsageReport, { status: "unavailable" }>["problem"];
+function unavailable(problem: UsageProblem): UsageReport {
+  return { status: "unavailable", problem };
+}
+
+function toneFromPercent(value: number): UsageWindow["tone"] {
+  return value > 90 ? "danger" : value >= 70 ? "warning" : "ok";
+}
 
 type CliEnv = NodeJS.ProcessEnv;
 export interface AgyRunner {
@@ -102,14 +111,15 @@ function quotaWindow(value: unknown, group: string): UsageWindow | null {
   if (!id) return null;
   const kind = windowName(nonempty(bucket.window) ?? nonempty(bucket.name) ?? "");
   const usedPct = Math.round((1 - fraction) * 1000) / 10;
-  return windowFromUsedPct({
+  return {
     id: group + "/" + id,
     label: group + " · " + kind.label,
     shortLabel: (shortGroup(group) + " " + kind.short).trim(),
-    utilizationPct: usedPct,
+    usedPct,
+    remainingPct: Math.max(0, 100 - usedPct),
     resetsAt: resetTime(bucket.reset_time),
-    tone: toneFromUsedPct(usedPct),
-  });
+    tone: toneFromPercent(usedPct),
+  };
 }
 
 function quotaGroups(value: unknown): UsageWindow[][] {
