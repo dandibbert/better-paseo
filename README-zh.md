@@ -52,6 +52,12 @@ paseo plugin update better-paseo --yes  # 不询问，直接更新
 
 ---
 
+### AGY 账号配额（原生 Usage 页面）
+
+Better Paseo 会在现有的 **Paseo → Usage** 页面注册一个 Antigravity 配额来源，无须修改 Paseo 本体、安装第二个插件或打开单独的面板。这里展示的是 **AGY 账号剩余配额**，而不是本轮 Token 消耗或 API 费用。Gemini 与 Claude/GPT 的 5 小时、每周额度分别显示，并保留原有的刷新、固定到侧边栏与重置时间显示。
+
+插件通过 daemon 主机已登录的 AGY CLI 执行 `agy -p /usage --output-format json`；需要 AGY >= 1.1.15。它会核实返回数据是零推理回合的 `usage` / `quota` 命令，避免把 `/usage` 当普通提示词执行。查询结果使用 Paseo 原有的 Usage 缓存。若 AGY 没有加入 daemon 的 PATH，可在启动 daemon 前设置 `PASEO_ANTIGRAVITY_BIN` 为可执行文件绝对路径。
+
 ## 手机与 iPad
 
 Paseo 在桌面、网页、iOS 和 Android 上运行的是同一个插件。Better Paseo 不是把桌面布局缩小，而是让每个界面按设备和可用空间选自己的形态。
