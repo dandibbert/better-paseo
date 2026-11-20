@@ -59,12 +59,12 @@ function FooterMetricControl({ value, look }: { value: import("./preferences").F
   const { tokens } = look;
   const choices: ReadonlyArray<{ value: import("./preferences").FooterMetricPreference; label: string }> = [
     { value: "off", label: look.t.footerMetricOff },
-    { value: "tps", label: "TPS" },
-    { value: "ttft", label: "TTFT" },
+    { value: "tps", label: look.t.footerMetricTps },
+    { value: "ttft", label: look.t.footerMetricTtft },
     { value: "apiTurns", label: look.t.footerMetricApiTurns },
     { value: "toolCalls", label: look.t.footerMetricToolCalls },
     { value: "cost", label: look.t.footerMetricCost },
-    { value: "outputTokens", label: "Tokens" },
+    { value: "outputTokens", label: look.t.footerMetricOutputTokens },
   ];
   return <View accessibilityRole="radiogroup" accessibilityLabel={look.t.footerMetricTitle}
     style={{ flexDirection: "row", flexWrap: "wrap", gap: space.xs }}>

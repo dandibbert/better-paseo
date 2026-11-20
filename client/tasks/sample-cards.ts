@@ -221,10 +221,51 @@ function allSamples(now: number): TaskCard[] {
 /** Only the preview draws these: the board tests count the others. */
 const PREVIEW_ONLY: ReadonlySet<string> = new Set(["sample-question", "sample-stopped", "sample-archived", "sample-archived-workspace"]);
 
+const ZH_SAMPLE_OVERRIDES: Readonly<Record<string, { title?: string; error?: string; parentTitle?: string; permissionTitle?: string; permissionSummary?: string }>> = {
+  "sample-input": { title: "在预发环境执行数据库迁移" },
+  "sample-question": { title: "选择 CSV 导出的日期格式", permissionTitle: "待回答", permissionSummary: "使用 ISO 8601 格式，还是跟随当前地区的短日期格式？" },
+  "sample-running": { title: "将状态环组件移植到 React Native" },
+  "sample-child-1": { title: "测量侧边栏状态环尺寸", parentTitle: "将状态环组件移植到 React Native" },
+  "sample-failed": { title: "重新生成 Shiki 语法高亮基准", error: "Provider 退出（退出码 1）：已触发速率限制" },
+  "sample-unread": { title: "整理昨天的 QA 测试记录" },
+  "sample-done": { title: "将插件 SDK 升级至 0.12" },
+  "sample-stopped": { title: "重写首次引导文案", error: "已手动停止" },
+  "sample-archived": { title: "调研侧边栏拖拽手柄交互" },
+  "sample-archived-workspace": { title: "测试旧版导出格式" },
+};
+
+const ZH_CHILD_TITLES: Readonly<Record<string, string>> = {
+  "sample-child-1": "测量侧边栏状态环尺寸",
+  "sample-child-2": "编写状态环几何尺寸测试",
+  "sample-child-3": "整理各状态配色方案",
+};
+
 export function sampleCards(now: number = Date.now()): TaskCard[] {
   return allSamples(now).filter((card) => !PREVIEW_ONLY.has(card.id));
 }
 
-export function previewSampleCards(now: number = Date.now()): TaskCard[] {
-  return allSamples(now);
+export function previewSampleCards(now: number = Date.now(), language: "en" | "zh" = "en"): TaskCard[] {
+  const cards = allSamples(now);
+  if (language !== "zh") return cards;
+  return cards.map((card) => {
+    const patch = ZH_SAMPLE_OVERRIDES[card.id];
+    const children = card.children.map((child) => ({
+      ...child,
+      title: ZH_CHILD_TITLES[child.id] ?? child.title,
+    }));
+    return {
+      ...card,
+      title: patch?.title ?? card.title,
+      error: patch?.error ?? card.error,
+      parent: card.parent && patch?.parentTitle ? { ...card.parent, title: patch.parentTitle } : card.parent,
+      permission: card.permission
+        ? {
+            ...card.permission,
+            title: patch?.permissionTitle ?? card.permission.title,
+            summary: patch?.permissionSummary ?? card.permission.summary,
+          }
+        : null,
+      children,
+    };
+  });
 }

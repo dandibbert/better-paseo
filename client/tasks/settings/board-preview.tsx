@@ -21,21 +21,31 @@ import { previewSampleCards } from "../sample-cards";
 export const PREVIEW_LANES_MAX_HEIGHT = 440;
 
 const noop = () => {};
-const SETTING_PREVIEW_TITLES: Record<string, string> = {
-  "sample-input": "Run the staging database migration after confirming the rollback plan with every service owner, checking all affected deployment targets, and recording recovery steps for the release",
-  "sample-question": "Choose a consistent date format for CSV exports across locales, then confirm it reads clearly in spreadsheets and matches each region's expected display preferences",
-  "sample-running": "Port the task status ring to React Native while preserving its accessible labels, animation behavior, and layout on small phone screens with larger text settings",
-  "sample-failed": "Regenerate the Shiki syntax highlighting baselines after the renderer upgrade and compare every changed theme against the release snapshots in supported browsers",
-  "sample-done": "Upgrade the plugin SDK to its latest stable release and verify that existing task cards still render all metadata fields correctly on desktop and mobile",
-  "sample-archived": "Investigate sidebar drag behavior across desktop, tablet, and mobile layouts, then document which interaction should stay consistent in every supported interface",
+const SETTING_PREVIEW_TITLES: Record<TasksLanguage, Record<string, string>> = {
+  en: {
+    "sample-input": "Run the staging database migration after confirming the rollback plan with every service owner, checking all affected deployment targets, and recording recovery steps for the release",
+    "sample-question": "Choose a consistent date format for CSV exports across locales, then confirm it reads clearly in spreadsheets and matches each region's expected display preferences",
+    "sample-running": "Port the task status ring to React Native while preserving its accessible labels, animation behavior, and layout on small phone screens with larger text settings",
+    "sample-failed": "Regenerate the Shiki syntax highlighting baselines after the renderer upgrade and compare every changed theme against the release snapshots in supported browsers",
+    "sample-done": "Upgrade the plugin SDK to its latest stable release and verify that existing task cards still render all metadata fields correctly on desktop and mobile",
+    "sample-archived": "Investigate sidebar drag behavior across desktop, tablet, and mobile layouts, then document which interaction should stay consistent in every supported interface",
+  },
+  zh: {
+    "sample-input": "在向各服务负责人确认回滚方案、核对所有受影响的部署目标并记录发布恢复步骤后，执行预发数据库迁移",
+    "sample-question": "为不同地区的 CSV 导出统一日期格式，并确认在表格软件中清晰可读且符合各区域的显示习惯",
+    "sample-running": "将任务状态环迁移到 React Native，同时保留无障碍标签、动画效果以及小屏手机在大字号下的排版布局",
+    "sample-failed": "在渲染器升级后重新生成 Shiki 语法高亮基准，并在各支持浏览器中逐项比对主题快照差异",
+    "sample-done": "将插件 SDK 升级至最新稳定版，并验证桌面端与移动端上的任务卡片仍能完整展示所有元数据字段",
+    "sample-archived": "排查桌面、平板与手机布局下的侧边栏拖拽行为，并整理出各端应保持一致的交互规范",
+  },
 };
 
 /** The sample cards by lane, in the board's order, the stopped one saying so in the board's words. */
 export function previewLanes(now: number, language: TasksLanguage): Record<LaneId, TaskCard[]> {
   const stopped = BOARD_STRINGS[language].stoppedManually;
   const lanes = { needs_input: [], running: [], review: [], done: [], archived: [] } as Record<LaneId, TaskCard[]>;
-  for (const card of previewSampleCards(now)) {
-    const title = SETTING_PREVIEW_TITLES[card.id];
+  for (const card of previewSampleCards(now, language)) {
+    const title = SETTING_PREVIEW_TITLES[language][card.id];
     const sample = title ? { ...card, title } : card;
     lanes[card.lane].push(sample.stoppedManually ? { ...sample, error: stopped } : sample);
   }

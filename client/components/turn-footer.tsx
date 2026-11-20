@@ -194,7 +194,7 @@ export function AssistantFooter({ text, at, agentName, modelId, modelName, think
           </ToolbarItem>
         ) : null}
         {metric ? (
-          <ToolbarItem onLayout={compact ? measure.metric : undefined} label={`${metric.label}: ${metric.value}`} accessibilityLabel={`${metric.label}: ${metric.value}`} tokens={tokens} align="end" buttonStyle={styles.metadata} details={details} detailsWidth={detailsWidth} onLongPress={longPress}>
+          <ToolbarItem onLayout={compact ? measure.metric : undefined} label={`${toolbarLabel(metric.label, language)}${hintLanguage === "zh" ? "：" : ":"} ${metric.value}`} accessibilityLabel={`${metric.label}: ${metric.value}`} tokens={tokens} align="end" buttonStyle={styles.metadata} details={details} detailsWidth={detailsWidth} onLongPress={longPress}>
             <Icon name="Gauge" size={DISCLOSURE_HEADER.icon} color={tokens.foregroundMuted} />
             <Text style={styles.time}>{metric.value}</Text>
           </ToolbarItem>

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { SETTINGS_SCREEN_TITLES, resolveLanguage, systemLanguage } from "../../client/i18n/settings-strings";
 import { SETTINGS_STRINGS } from "../../client/i18n/settings-page-strings";
+import { copiedToast, toolbarLabel } from "../../client/i18n/toolbar-strings";
 import { parsePreferences, DEFAULT_PREFERENCES } from "../../client/preferences";
 
 describe("settings language", () => {
@@ -45,5 +46,29 @@ describe("settings language", () => {
         if (key !== "languageEnglish" && key !== "languageChinese") expect(zh[key], key).not.toBe(en[key]);
       }
     }
+  });
+
+  it("translates turn telemetry and copy toasts into Chinese", () => {
+    for (const label of [
+      "Output TPS",
+      "First token",
+      "TPS",
+      "TTFT",
+      "API turns",
+      "Tool calls",
+      "API duration",
+      "Generation",
+      "Tool duration",
+      "Approval wait",
+      "Cache write",
+      "Reported cost",
+      "Stop reason",
+      "Output tokens",
+    ]) {
+      expect(toolbarLabel(label, "zh")).not.toBe(label);
+    }
+    expect(copiedToast("Copy error", "zh")).toBe("已复制错误");
+    expect(copiedToast("Copy sent message", "zh")).toBe("已复制发送消息");
+    expect(copiedToast("Copy message", "zh")).toBe("已复制消息");
   });
 });

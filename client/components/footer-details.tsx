@@ -75,7 +75,7 @@ export function FooterDetails({ agentName, modelId, modelName, thinkingLabel, st
     ["Cache write", "Database", telemetry?.usage?.cacheCreationInputTokens, ""],
   ] as const) {
     if (typeof value === "number" && Number.isFinite(value) && value >= 0)
-      rows.push({ label, icon, value: `${value.toLocaleString("en-US", { maximumFractionDigits: 1 })}${unit}` });
+      rows.push({ label, icon, value: `${value.toLocaleString(resolveLanguage(language) === "zh" ? "zh-CN" : "en-US", { maximumFractionDigits: 1 })}${unit}` });
   }
   if (typeof telemetry?.usage?.totalCostUsd === "number" && Number.isFinite(telemetry.usage.totalCostUsd) && telemetry.usage.totalCostUsd >= 0)
     rows.push({ label: "Reported cost", icon: "DollarSign", value: `${telemetry.usage.totalCostUsd.toFixed(4)}` });
