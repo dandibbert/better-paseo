@@ -77,14 +77,6 @@ paseo plugin update better-paseo        # reviews the update and asks
 paseo plugin update better-paseo --yes  # applies it without asking
 ```
 
----
-
-### AGY account quota (native Usage screen)
-
-Better Paseo contributes an Antigravity quota source to the existing **Paseo → Usage** screen. No Paseo core update, second plugin, or separate view is required. These are **subscription quota windows**, not per-turn tokens or API-equivalent costs. Gemini and Claude/GPT five-hour and weekly quota windows use Paseo's existing refresh, pinning, and reset-time presentation.
-
-The plugin invokes `agy -p /usage --output-format json` using the signed-in AGY CLI on the daemon host (requires AGY >= 1.1.15). It verifies a zero-turn `usage` / `quota` command response rather than accepting a model reply. Paseo's normal Usage cache applies. If AGY is not in the daemon's PATH, set `PASEO_ANTIGRAVITY_BIN` to the executable's absolute path before launching the daemon.
-
 ## Phones and iPad
 
 Paseo runs the same plugin on desktop, web, iOS and Android. Better Paseo does not scale a desktop
