@@ -35,6 +35,39 @@ async function readJson(response: Response): Promise<unknown> {
 }
 
 const sha = z.string().regex(/^[a-f0-9]{40}$/);
+const BETTER_PASEO_GIT_REMOTE_RE = /^(?:https:\/\/github\.com\/|git@github\.com:)([a-z0-9](?:[a-z0-9-]*[a-z0-9])?)\/better-paseo(?:\.git)?$/i;
+
+function parseBetterPaseoGitRemote(remote: string): { owner: string; isUpstream: boolean } | null {
+  const match = BETTER_PASEO_GIT_REMOTE_RE.exec(remote.trim());
+  if (!match?.[1]) return null;
+  return { owner: match[1], isUpstream: match[1].toLowerCase() === "roundreddot" };
+}
+
+async function readText(response: Response): Promise<string> {
+  if (!response.body) throw new Error("Empty response.");
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > MAX_RESPONSE_BYTES) {
+        await reader.cancel();
+        throw new Error("Response too large.");
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+  return new TextDecoder().decode(bytes);
+}
+
 const registrySchema = z.object({
   id: z.literal("roundreddot/better-paseo"),
   artifact: z.object({ kind: z.literal("git"), remote: z.literal("https://github.com/RoundRedDot/better-paseo.git"), commit: sha }),
@@ -49,11 +82,13 @@ const installationSchema = z.object({
 });
 
 const version = z.string().regex(/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/);
+const buildNumber = z.number().int().min(100_000_000_000).max(999_999_999_999);
+const packageMetaSchema = z.object({ version, build: buildNumber });
 const releasesSchema = z.object({
-  releases: z.array(z.object({ hash: sha, version, build: z.number().int().min(100_000_000_000).max(999_999_999_999) })),
+  releases: z.array(z.object({ hash: sha, version, build: buildNumber })),
 });
 const notesSchema = z.object({
-  versionNotes: z.array(z.object({ version, build: z.number().int().min(100_000_000_000).max(999_999_999_999), zh: z.array(z.string().min(1)).min(1), en: z.array(z.string().min(1)).min(1) }))
+  versionNotes: z.array(z.object({ version, build: buildNumber, zh: z.array(z.string().min(1)).min(1), en: z.array(z.string().min(1)).min(1) }))
     .refine((entries) => new Set(entries.map((entry) => `${entry.version}:${entry.build}`)).size === entries.length),
 });
 type Notes = { status: "available"; releases: Array<{ version: string; zh: string[]; en: string[] }> } | { status: "missing" | "unavailable" };
@@ -85,10 +120,11 @@ export function createUpdateCheck(deps = { fetchVersion: fetch, connect: connect
         try {
           const daemon = client as typeof client & { listPlugins(): Promise<Array<{ id: string; installation?: unknown }>> };
           const installation = installationSchema.parse((await daemon.listPlugins()).find((entry) => entry.id === "better-paseo")?.installation);
+          const parsedRemote = installation.identity.kind === "git" ? parseBetterPaseoGitRemote(installation.identity.remote) : null;
           if (installation.identity.kind !== "git" || installation.currentRevision !== cache.state.current ||
               (cache.state.source === "registry") !== !!installation.identity.registry ||
-              !/^(https:\/\/github\.com\/RoundRedDot\/better-paseo(?:\.git)?|git@github\.com:RoundRedDot\/better-paseo(?:\.git)?)$/i.test(installation.identity.remote) ||
-              (installation.identity.registry && (installation.identity.registry.url !== "https://plugins.paseo.sh" || installation.identity.registry.id !== "roundreddot/better-paseo"))) return;
+              !parsedRemote ||
+              (installation.identity.registry && (!parsedRemote.isUpstream || installation.identity.registry.url !== "https://plugins.paseo.sh" || installation.identity.registry.id !== "roundreddot/better-paseo"))) return;
         } finally {
           await client.close().catch(() => {});
         }
@@ -105,10 +141,6 @@ export function createUpdateCheck(deps = { fetchVersion: fetch, connect: connect
     const client = await deps.connect("cid_better_paseo_update_check");
     if (!client) throw new Error("Could not connect to the host.");
     try {
-      stage = "registry";
-      const response = await deps.fetchVersion(REGISTRY_URL, { signal: AbortSignal.timeout(10_000), cache: "no-store", redirect: "error" });
-      if (!response.ok) throw new Error("Could not read the plugin directory.");
-      const latest = registrySchema.parse(await readJson(response)).artifact.commit;
       stage = "installation";
       const daemon = client as typeof client & { listPlugins(): Promise<Array<{ id: string; installation?: unknown }>> };
       const plugin = (await daemon.listPlugins()).find((entry) => entry.id === "better-paseo");
@@ -117,15 +149,45 @@ export function createUpdateCheck(deps = { fetchVersion: fetch, connect: connect
         state = { state: "local" };
         return;
       }
-      if (current.identity.kind !== "git" || !/^(https:\/\/github\.com\/RoundRedDot\/better-paseo(?:\.git)?|git@github\.com:RoundRedDot\/better-paseo(?:\.git)?)$/i.test(current.identity.remote)) {
+      const parsedRemote = current.identity.kind === "git" ? parseBetterPaseoGitRemote(current.identity.remote) : null;
+      if (current.identity.kind !== "git" || !parsedRemote) {
         state = { state: "unsupported" };
         return;
       }
-      if (current.identity.registry && (current.identity.registry.url !== "https://plugins.paseo.sh" || current.identity.registry.id !== "roundreddot/better-paseo")) {
+      if (current.identity.registry && (!parsedRemote.isUpstream || current.identity.registry.url !== "https://plugins.paseo.sh" || current.identity.registry.id !== "roundreddot/better-paseo")) {
         state = { state: "unsupported" };
         return;
       }
       const revision = sha.parse(current.currentRevision);
+      if (!parsedRemote.isUpstream) {
+        stage = "registry";
+        const headResponse = await deps.fetchVersion(`https://api.github.com/repos/${parsedRemote.owner}/better-paseo/commits/HEAD`, {
+          headers: { Accept: "application/vnd.github.sha" },
+          signal: AbortSignal.timeout(10_000),
+          cache: "no-store",
+        });
+        if (!headResponse.ok) throw new Error("Could not read the Git repository head.");
+        const latest = sha.parse((await readText(headResponse)).trim());
+        let versions: Versions = { status: "unavailable" };
+        try {
+          const [localRaw, remoteResponse] = await Promise.all([
+            readFile(new URL("../package.json", import.meta.url), "utf8"),
+            deps.fetchVersion(`https://raw.githubusercontent.com/${parsedRemote.owner}/better-paseo/${latest}/package.json`, { signal: AbortSignal.timeout(10_000), cache: "no-store" }),
+          ]);
+          const localPkg = packageMetaSchema.parse(JSON.parse(localRaw));
+          if (remoteResponse.ok) {
+            const remotePkg = packageMetaSchema.parse(await readJson(remoteResponse));
+            versions = { status: "available", current: localPkg.version, latest: remotePkg.version, currentBuild: localPkg.build, latestBuild: remotePkg.build };
+          }
+        } catch {
+        }
+        state = { state: "done", source: "git", current: revision, latest, matches: revision === latest, checkedAt: Date.now(), notes: { status: "missing" }, versions };
+        return;
+      }
+      stage = "registry";
+      const response = await deps.fetchVersion(REGISTRY_URL, { signal: AbortSignal.timeout(10_000), cache: "no-store", redirect: "error" });
+      if (!response.ok) throw new Error("Could not read the plugin directory.");
+      const latest = registrySchema.parse(await readJson(response)).artifact.commit;
       let notes: Notes = { status: "unavailable" };
       let versions: Versions = { status: "unavailable" };
       try {

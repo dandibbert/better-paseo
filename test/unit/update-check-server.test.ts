@@ -150,6 +150,35 @@ describe("market update check", () => {
     }
   });
 
+  it("checks GitHub HEAD for Better Paseo fork Git installations", async () => {
+    const forkInstallation = {
+      identity: { kind: "git", remote: "https://github.com/dandibbert/better-paseo" },
+      currentRevision: current,
+    };
+    const connect = vi.fn(async () => ({ listPlugins: async () => [{ id: "better-paseo", installation: forkInstallation }], close: async () => {} }) as never);
+    const fetchVersion = vi.fn(async (url: string | URL | Request) => {
+      const text = String(url);
+      if (text === "https://api.github.com/repos/dandibbert/better-paseo/commits/HEAD") {
+        return new Response(latest, { status: 200 });
+      }
+      if (text === `https://raw.githubusercontent.com/dandibbert/better-paseo/${latest}/package.json`) {
+        return new Response(JSON.stringify({ version: "1.5.0", build: 202611212010 }), { status: 200 });
+      }
+      return new Response("", { status: 404 });
+    });
+    const check = createUpdateCheck({ fetchVersion: fetchVersion as typeof fetch, connect });
+    check("check");
+    expect(await finish(check)).toMatchObject({
+      state: "done",
+      source: "git",
+      current,
+      latest,
+      matches: false,
+      notes: { status: "missing" },
+      versions: { status: "available", latest: "1.5.0", latestBuild: 202611212010 },
+    });
+  });
+
   it("rejects failed and oversized marketplace responses", async () => {
     const connect = vi.fn(async () => ({ listPlugins: async () => plugins, close: async () => {} }) as never);
     for (const response of [new Response("error", { status: 503 }), new Response("x".repeat(70_000))]) {
