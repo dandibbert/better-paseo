@@ -105,4 +105,40 @@ describe("tool_call transformer", () => {
       phase: "complete",
     });
   });
+
+  it("does not take over user-origin shell cards or request_terminal_control", () => {
+    const userShell = item({
+      name: "shell",
+      status: "running",
+      detail: {
+        type: "shell",
+        command: "git status",
+        origin: "user",
+        terminalId: "term-1",
+      } as unknown as ToolCallTimelineItem["detail"],
+    });
+    expect(transformToolCall({ item: userShell, phase: "streaming" })).toBeUndefined();
+
+    const agentShell = data(
+      item({
+        name: "shell",
+        detail: { type: "shell", command: "git status" },
+      }),
+    );
+    expect(agentShell).toMatchObject({ name: "shell", status: "completed" });
+
+    for (const name of [
+      "request_terminal_control",
+      "paseo_request_terminal_control",
+      "mcp__paseo__request_terminal_control",
+      "paseo.request_terminal_control",
+    ]) {
+      const control = item({
+        name,
+        status: "running",
+        detail: { type: "unknown", input: { terminalId: "t1", reason: "Auth" }, output: null },
+      });
+      expect(transformToolCall({ item: control, phase: "streaming" })).toBeUndefined();
+    }
+  });
 });
