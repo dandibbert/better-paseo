@@ -202,6 +202,7 @@ export function shortAgentId(id: string): string {
 const PROVIDER_NAMES: Record<string, string> = {
   claude: "Claude", codex: "Codex", cursor: "Cursor", grok: "Grok", gemini: "Gemini", copilot: "Copilot",
   opencode: "OpenCode", omp: "OMP", pi: "Pi", antigravity: "Antigravity", deepseek: "DeepSeek", ollama: "Ollama",
+  "antigravity-t3": "Antigravity",
 };
 
 /** `cursor/grok-4.7` names its harness first. */

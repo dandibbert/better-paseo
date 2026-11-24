@@ -73,6 +73,7 @@ describe("agent identity helpers", () => {
     expect(shortAgentId("remote::reviewer")).toBe("reviewer");
     expect(providerName("cursor/grok-4.7")).toBe("Cursor");
     expect(providerName("acme")).toBe("acme");
+    expect(providerName("antigravity-t3")).toBe("Antigravity");
   });
 
   it("reads a permission request and drops the model-facing instruction", () => {

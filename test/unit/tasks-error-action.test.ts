@@ -95,6 +95,8 @@ describe("other provider card error summaries", () => {
     expect(errorAction(error, "zh")).toBe("查看账户用量，等待重置或升级订阅。");
     expect(errorAction(error, "en")).toBe("Check account usage, wait for the reset, or upgrade your subscription.");
     expect(formatCardError(`${error} Extra details`, "antigravity", "zh")).toBe(`${error} Extra details`);
+    // Antigravity through T3 reports the same quota message.
+    expect(formatCardError(error, "antigravity-t3", "en")).toBe("Individual quota reached · Resets in 4h52m54s at time of error");
   });
   it.each([
     ["codex", "You've hit your usage limit.", "账户用量已达上限", "Account usage limit reached"],
