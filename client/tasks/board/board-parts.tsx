@@ -8,7 +8,8 @@ import { DONE_WINDOWS } from "../../../shared/tasks-settings";
 import { useHover } from "../../ui/use-hover";
 import { hoverFill } from "../hover-fill";
 import { useReducedMotion } from "../../ui/use-reduced-motion";
-import { liftStyle, scaleStyle, surfaceLift, type LiftSize, type PressInput } from "../cards/surface-lift";
+import { liftStyle, liftedButtonOutline, scaleStyle, surfaceLift, type LiftSize, type PressInput } from "../cards/surface-lift";
+import { buttonHue } from "../cards/action-style";
 import { usePressCue } from "../cards/action-pressable";
 import { TaskCardView, taskTokens, type CardCallbacks } from "../cards";
 import { useTodoSummary } from "../data/todo-summary";
@@ -962,3 +963,70 @@ export function SlashMark(props: { size: number; color: string; gap: string }) {
   );
 }
 
+/** Batch mark-read control for the green unread tasks in the Review lane. */
+export function MarkAllReadButton(props: {
+  count: number;
+  pending: boolean;
+  compact: boolean;
+  iconOnly?: boolean;
+  theme: PluginTheme;
+  strings: BoardStrings;
+  onPress(): void;
+  pressIn?: { onPressIn(event: { nativeEvent: { pageX: number; pageY: number } }): void };
+  testID?: string;
+}) {
+  const { pending, compact, iconOnly = false, theme, strings } = props;
+  const scale = useTasksFontScale();
+  const tokens = taskTokens(theme);
+  const hue = buttonHue(tokens, "read");
+  const { hovered, hoverProps } = useHover();
+  const press = usePressCue(hovered, !pending);
+  const height = taskControlHeight(compact ? 32 : 24, scale);
+  const iconSize = compact ? 14 : 13;
+  const label = compact ? strings.markAllRead : strings.markAllReadShort;
+  return (
+    <Pressable
+      accessibilityRole="button"
+      accessibilityLabel={strings.markAllReadTip(props.count)}
+      accessibilityState={pending ? { busy: true, disabled: true } : undefined}
+      disabled={pending}
+      {...tipProps(strings.markAllReadTip(props.count))}
+      {...hoverProps}
+      onPress={press.guard(props.onPress)}
+      onPressIn={(event) => {
+        press.onPressIn(event);
+        props.pressIn?.onPressIn(event);
+      }}
+      onPressOut={press.onPressOut}
+      onTouchStart={press.onTouchStart}
+      onTouchMove={press.onTouchMove}
+      onTouchEnd={press.onTouchEnd}
+      onTouchCancel={press.onTouchCancel}
+      testID={props.testID}
+      style={{
+        height,
+        ...(iconOnly ? { width: height } : { paddingHorizontal: compact ? 12 : 8 }),
+        borderRadius: compact ? 7 : 6,
+        ...liftedButtonOutline(tokens, hue.border, false, surfaceLift(hovered && !pending, press.pressed && !pending)),
+        backgroundColor: "transparent",
+        flexDirection: "row",
+        alignItems: "center",
+        justifyContent: "center",
+        gap: 4,
+        opacity: pending ? 0.6 : 1,
+        flexShrink: 0,
+      }}
+    >
+      {pending ? (
+        <SpinnerRing size={iconSize} color={hue.color} testID={props.testID ? `${props.testID}-spinner` : undefined} />
+      ) : (
+        <Icon name="CheckCheck" size={iconSize} color={hue.color} />
+      )}
+      {iconOnly ? null : (
+        <Text numberOfLines={1} style={{ fontSize: compact ? F.base : F.sm, fontWeight: "500", color: hue.color }}>
+          {label}
+        </Text>
+      )}
+    </Pressable>
+  );
+}

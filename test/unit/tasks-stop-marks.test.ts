@@ -113,6 +113,21 @@ describe("tasks stop marks", () => {
     await expect(marks.mark("agent-a")).resolves.toBeUndefined();
     expect(await ids(marks)).toEqual(["agent-a"]);
   });
+
+  it("marks and clears batches in input order with one write when changed", async () => {
+    const marks = createStopMarks(path, now);
+    await marks.markMany(["agent-a", "agent-b", "agent-c"]);
+    clock += 1000;
+    await marks.markMany(["agent-a", "agent-d"]);
+    expect(await ids(createStopMarks(path, now))).toEqual(["agent-b", "agent-c", "agent-a", "agent-d"]);
+
+    await writeFile(path, "sentinel");
+    await marks.clearMany(["unknown-1", "unknown-2"]);
+    expect(await readFile(path, "utf8")).toBe("sentinel");
+
+    await marks.clearMany(["agent-b", "agent-d"]);
+    expect(await ids(createStopMarks(path, now))).toEqual(["agent-c", "agent-a"]);
+  });
 });
 
 describe("tasks stop marks on the server", () => {

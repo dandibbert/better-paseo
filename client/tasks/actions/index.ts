@@ -571,6 +571,10 @@ export interface ReadControl {
   /** The request is out, or the daemon took it and the card has not left review yet. */
   pending(agentId: string): boolean;
   press(card: TaskCard): void;
+  /** Mark every eligible card in the batch as read. */
+  pressMany(cards: readonly TaskCard[]): void;
+  /** True while a batch read request is waiting on the server. */
+  batchPending: boolean;
   /** The board's cards changed: a mark whose card left review is done. */
   reconcile(): void;
 }
@@ -579,6 +583,8 @@ export interface ReadControl {
 export const READ_VERIFY_MS = 10_000;
 /** The server gives the daemon 10 s; past this the request has failed. */
 const READ_RPC_TIMEOUT_MS = 15_000;
+/** Max agents sent per `tasks.read` RPC call (server schema allows up to 50). */
+const READ_BATCH_SIZE = 25;
 
 /**
  * One mark-read controller for the whole board. Like a stop, a read is
@@ -601,20 +607,31 @@ export function useReadControl(options: {
   const available = useSyncExternalStore(server.subscribe, () => server.capabilities()?.read === true);
   const [pendingIds, setPendingIds] = useState<ReadonlySet<string>>(() => new Set());
   const pendingRef = useRef<ReadonlySet<string>>(pendingIds);
+  const [batchPending, setBatchPending] = useState(false);
+  const batchCountRef = useRef(0);
   /** Reads the daemon accepted, until their card leaves review. */
   const verifyingRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+  const lastVerifyErrorRef = useRef(0);
   const mountedRef = useRef(false);
   const latest = useRef({ capabilitiesRpc, readRpc, toast, language, isReadable: options.isReadable, onRead: options.onRead });
   latest.current = { capabilitiesRpc, readRpc, toast, language, isReadable: options.isReadable, onRead: options.onRead };
 
-  const setPending = useCallback((agentId: string, pending: boolean) => {
-    if (pendingRef.current.has(agentId) === pending) return;
-    const next = new Set(pendingRef.current);
-    if (pending) next.add(agentId);
-    else next.delete(agentId);
+  const setPendingMany = useCallback((agentIds: readonly string[], pending: boolean) => {
+    let next: Set<string> | null = null;
+    for (const agentId of agentIds) {
+      if ((next ?? pendingRef.current).has(agentId) === pending) continue;
+      next ??= new Set(pendingRef.current);
+      if (pending) next.add(agentId);
+      else next.delete(agentId);
+    }
+    if (!next) return;
     pendingRef.current = next;
     setPendingIds(next);
   }, []);
+
+  const setPending = useCallback((agentId: string, pending: boolean) => {
+    setPendingMany([agentId], pending);
+  }, [setPendingMany]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -635,14 +652,18 @@ export function useReadControl(options: {
     latest.current.toast.error(zh ? `标为已读失败：${detail}` : `Could not mark as read: ${detail}`);
   }, []);
 
-  const settle = useCallback((agentId: string) => {
+  const settle = useCallback((agentId: string, coalesceError = false) => {
     const timer = verifyingRef.current.get(agentId);
     if (timer === undefined) return;
     clearTimeout(timer);
     verifyingRef.current.delete(agentId);
     if (!mountedRef.current) return;
     if (latest.current.isReadable?.(agentId) === true) {
-      failed(latest.current.language === "zh" ? "任务仍在待查看。" : "the task is still to review.");
+      const now = Date.now();
+      if (!coalesceError || now - lastVerifyErrorRef.current > 500) {
+        lastVerifyErrorRef.current = now;
+        failed(latest.current.language === "zh" ? "任务仍在待查看。" : "the task is still to review.");
+      }
     }
     setPending(agentId, false);
   }, [failed, setPending]);
@@ -681,9 +702,59 @@ export function useReadControl(options: {
       });
   }, [available, failed, setPending, settle]);
 
+  const pressMany = useCallback((cards: readonly TaskCard[]) => {
+    if (!available) return;
+    const agentIds = [...new Set(
+      cards
+        .filter((card) => card.readable === true && card.status !== "failed" && !card.subagent && !pendingRef.current.has(card.id))
+        .map((card) => card.id),
+    )];
+    if (agentIds.length === 0) return;
+    setPendingMany(agentIds, true);
+    batchCountRef.current += 1;
+    setBatchPending(true);
+    const timeoutMessage = latest.current.language === "zh" ? "请求没有响应。" : "The request did not answer.";
+    void (async () => {
+      try {
+        for (let offset = 0; offset < agentIds.length; offset += READ_BATCH_SIZE) {
+          const chunk = agentIds.slice(offset, offset + READ_BATCH_SIZE);
+          let result: { ok: boolean; error: string | null };
+          try {
+            result = await withTimeout(
+              Promise.resolve().then(() => latest.current.readRpc({ agentIds: chunk })),
+              READ_RPC_TIMEOUT_MS,
+              timeoutMessage,
+            );
+          } catch (error: unknown) {
+            if (!mountedRef.current) return;
+            failed(shortError(error));
+            setPendingMany(agentIds.slice(offset), false);
+            return;
+          }
+          if (!mountedRef.current) return;
+          if (!result.ok) {
+            failed(result.error ?? (latest.current.language === "zh" ? "未知错误。" : "Unknown error."));
+            setPendingMany(agentIds.slice(offset), false);
+            return;
+          }
+          latest.current.onRead?.(chunk[0]!);
+          const doneIds: string[] = [];
+          for (const agentId of chunk) {
+            if (latest.current.isReadable?.(agentId) !== true) doneIds.push(agentId);
+            else verifyingRef.current.set(agentId, setTimeout(() => settle(agentId, true), READ_VERIFY_MS));
+          }
+          if (doneIds.length > 0) setPendingMany(doneIds, false);
+        }
+      } finally {
+        batchCountRef.current = Math.max(0, batchCountRef.current - 1);
+        if (mountedRef.current && batchCountRef.current === 0) setBatchPending(false);
+      }
+    })();
+  }, [available, failed, setPendingMany, settle]);
+
   const pending = useCallback((agentId: string) => pendingIds.has(agentId), [pendingIds]);
 
-  return useMemo(() => ({ available, pending, press, reconcile }), [available, pending, press, reconcile]);
+  return useMemo(() => ({ available, pending, press, pressMany, batchPending, reconcile }), [available, pending, press, pressMany, batchPending, reconcile]);
 }
 
 /** Mark unread for a done card, to the left of Archive. */

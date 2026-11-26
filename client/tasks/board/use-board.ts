@@ -13,7 +13,7 @@ import { filterLanes, openedTask, setTasksArchivedLane, useTasks, withSubagentCa
 import { useSearchFirstPrompts, retrySearchPrompt, type SearchCoverageControl } from "../data/search-first-prompts";
 import { useSearchConversations } from "../data/search-conversations";
 import { useTasksLanguage, type TasksLanguage } from "../i18n";
-import { LANE_ORDER, boardLaneOrder, opensInPaseo, turnRunning, type BoardFilters, type LaneId, type LaneModel, type TaskCard, type TaskPermission } from "../model";
+import { LANE_ORDER, boardLaneOrder, isUnreadReviewCard, opensInPaseo, turnRunning, type BoardFilters, type LaneId, type LaneModel, type TaskCard, type TaskPermission } from "../model";
 import { useDeviceTasksPreferences } from "../device-preferences";
 import { DEFAULT_CARD_TITLE_LINES, type CardTitleLineCount } from "../device-store";
 import { MOTION } from "./board-style";
@@ -107,6 +107,10 @@ export interface BoardController {
   visible: boolean;
   stop: StopControl;
   read: ReadControl;
+  /** Mark every green finished task in the visible Review lane as read. */
+  readAll(): void;
+  /** True while checking availability or sending the batch mark-read request. */
+  readAllPending: boolean;
   /** Mark unread for a done task: its card, its menu and the details. */
   unread: UnreadControl;
   /** Unarchive for an archived parent in the details. */
@@ -579,6 +583,39 @@ export function useBoard(
     [hasNavigation, stopAvailable, readAvailable, unarchiveAvailable, open, handlers, setParams, titleUpdates, write, cardById, conversations.status, questionDialog],
   );
 
+  const [checkingAllRead, setCheckingAllRead] = useState(false);
+  const checkingAllReadRef = useRef(false);
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
+  const readAll = useCallback(() => {
+    const current = latest.current;
+    if (!current.read.available || checkingAllReadRef.current || current.read.batchPending) return;
+    const targets = current.lanes.review.cards.filter(isUnreadReviewCard);
+    if (targets.length === 0) return;
+    checkingAllReadRef.current = true;
+    setCheckingAllRead(true);
+    const ids = targets.map((card) => card.id);
+    void current.availability.checkMany(ids, "read").then(({ allowed, blocked }) => {
+      if (!mountedRef.current || latest.current.paseo !== current.paseo) return;
+      if (allowed.length === 0) {
+        if (blocked[0]) latest.current.toast.error(taskIssueText(blocked[0].issue, latest.current.language));
+        return;
+      }
+      const allowedSet = new Set(allowed);
+      latest.current.read.pressMany(targets.filter((card) => allowedSet.has(card.id)));
+      if (blocked[0]) {
+        latest.current.toast.error(taskIssueText(blocked[0].issue, latest.current.language));
+      }
+    }).finally(() => {
+      checkingAllReadRef.current = false;
+      if (mountedRef.current) setCheckingAllRead(false);
+    });
+  }, []);
+  const readAllPending = checkingAllRead || read.batchPending;
+
   const guardedRead = useMemo(() => ({ ...read, press: (card: TaskCard) => write(card.id, "read", () => read.press(card)) }), [read, write]);
   const guardedUnarchive = useMemo(() => ({ ...unarchive, press: (agentId: string) => write(agentId, "unarchive", () => unarchive.press(agentId)) }), [unarchive, write]);
   const guardedArchive = useMemo(() => ({ ...archive, press: (agentId: string) => write(agentId, "archive", () => archive.press(agentId)) }), [archive, write]);
@@ -623,6 +660,8 @@ export function useBoard(
     visible,
     stop,
     read: guardedRead,
+    readAll,
+    readAllPending,
     unread,
     unarchive: guardedUnarchive,
     archive: guardedArchive,

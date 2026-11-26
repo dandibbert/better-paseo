@@ -98,10 +98,30 @@ export function createStopMarks(path: string, now: () => number = Date.now) {
       prune();
       await persist();
     },
+    async markMany(agentIds: readonly string[]): Promise<void> {
+      if (agentIds.length === 0) return;
+      await load();
+      const stamp = new Date(now()).toISOString();
+      for (const agentId of agentIds) {
+        marks.delete(agentId);
+        marks.set(agentId, stamp);
+      }
+      prune();
+      await persist();
+    },
     /** The agent ran again, or is gone: forget its mark, writing only if it had one. */
     async clear(agentId: string): Promise<void> {
       await load();
       if (marks.delete(agentId)) await persist();
+    },
+    async clearMany(agentIds: readonly string[]): Promise<void> {
+      if (agentIds.length === 0) return;
+      await load();
+      let changed = false;
+      for (const agentId of agentIds) {
+        if (marks.delete(agentId)) changed = true;
+      }
+      if (changed) await persist();
     },
   };
 }

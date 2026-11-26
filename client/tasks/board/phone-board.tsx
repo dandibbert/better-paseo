@@ -23,14 +23,14 @@ import { EdgeActionBar, StatusIcon, TaskDetailCards, createDetailChrome, request
 import { panelChrome } from "../cards/panel";
 import { cardStrings } from "../cards/strings";
 import { ActionPressable } from "../cards/action-pressable";
-import { LANE_STATUS, isHistoryLane, turnRunning, type LaneId, type LaneModel, type TaskCard } from "../model";
+import { LANE_STATUS, isHistoryLane, isUnreadReviewCard, turnRunning, type LaneId, type LaneModel, type TaskCard } from "../model";
 import { activeStopChildren } from "../actions/stop-targets";
 import { useReducedMotion } from "../../ui/use-reduced-motion";
 import { holdHostGestures } from "../../ui/hold-host-gestures";
 import { findHostHorizontalScroll } from "../../ui/host-horizontal-scroll";
 import { HAIRLINE, MOTION, boardPalette } from "./board-style";
 import { BoardEmptyState } from "./empty-state";
-import { CardCell, HoverPressable, NewCardsDot, NewCardsPill, RollingCount, RoundButton, LaneFilterHint, LoadMoreRow, SkeletonCard, WindowSegments, laneHue, useBreathing, useFreshIds } from "./board-parts";
+import { CardCell, HoverPressable, NewCardsDot, NewCardsPill, RollingCount, RoundButton, LaneFilterHint, LoadMoreRow, MarkAllReadButton, SkeletonCard, WindowSegments, laneHue, useBreathing, useFreshIds } from "./board-parts";
 import { liftStyle, surfaceLift } from "../cards/surface-lift";
 import { pillDirection, useSeenCards, useTrackNewCards, useUnseenCards, useUnseenLanes } from "./new-cards";
 import { LaneMotionLayer, LaneMotionProvider, scrollNode, useLaneCovered, useLaneMotion, useLaneTarget } from "./lane-motion";
@@ -531,6 +531,42 @@ export function PhoneBoard(props: {
           <WindowSegments value={doneWindow} onChange={(value) => board.setParams((params) => ({ ...params, doneWindow: value }))} theme={theme} strings={strings} large />
         </View>
       ) : null}
+      {lane === "review" && board.read?.available ? (() => {
+        const unreadReviewCards = lanes.review.cards.filter(isUnreadReviewCard);
+        if (unreadReviewCards.length === 0) return null;
+        const readAllPending = Boolean(board.readAllPending || unreadReviewCards.some((card) => board.read?.pending(card.id)));
+        return (
+          <View
+            testID="phone-review-actions"
+            style={{
+              minHeight: 48,
+              flexDirection: "row",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: 10,
+              paddingHorizontal: 12,
+              borderBottomWidth: HAIRLINE,
+              borderBottomColor: colors.border,
+            }}
+          >
+            <View style={{ flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 8 }}>
+              <StatusIcon kind="unread" size={13} theme={theme} animated={false} />
+              <Text numberOfLines={1} style={{ fontSize: F.sm, color: colors.foregroundMuted }}>
+                {strings.markAllReadSummary(unreadReviewCards.length)}
+              </Text>
+            </View>
+            <MarkAllReadButton
+              count={unreadReviewCards.length}
+              pending={readAllPending}
+              compact
+              theme={theme}
+              strings={strings}
+              onPress={() => board.readAll?.()}
+              testID="phone-read-all-review"
+            />
+          </View>
+        );
+      })() : null}
       <View ref={gridRef} collapsable={false} style={{ flex: 1, minHeight: 0, overflow: "hidden", backgroundColor: palette.panel }} {...gesture}>
         <LaneMotionProvider value={motion}>
           {isNative() ? (

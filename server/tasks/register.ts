@@ -328,11 +328,12 @@ async function markRead(host: HostDaemonAccess, agentIds: string[]): Promise<{ o
       timer = setTimeout(() => reject(new Error("timeout")), READ_TIMEOUT_MS);
     });
     const clear = async () => {
-      for (const agentId of agentIds) {
+      const issues = await Promise.all(agentIds.map(async (agentId) => {
         const source = await daemon.fetchAgent(agentId);
-        const issue = source ? await taskDirectoryIssue(source.agent.cwd) : { code: "agent_missing" as const, detail: null };
-        if (issue) return { ok: false, error: taskIssueError(issue) };
-      }
+        return source ? await taskDirectoryIssue(source.agent.cwd) : { code: "agent_missing" as const, detail: null };
+      }));
+      const firstIssue = issues.find((issue) => issue !== null);
+      if (firstIssue) return { ok: false, error: taskIssueError(firstIssue) };
       await daemon.clearAgentAttention(agentIds);
       return { ok: true, error: null };
     };
@@ -443,10 +444,8 @@ export function registerTasksServer(
   server.handle(tasksReadRpc, async ({ agentIds }) => {
     const result = await markRead(host, agentIds);
     if (result.ok) {
-      for (const agentId of agentIds) {
-        await reads.mark(agentId);
-        await unreads.clear(agentId);
-      }
+      await reads.markMany(agentIds);
+      await unreads.clearMany(agentIds);
     }
     return result;
   });

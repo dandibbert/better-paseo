@@ -116,5 +116,30 @@ export function useTaskAvailability(tasks: TasksHandle, visible: boolean, hostId
       return UNREACHABLE.issue!;
     }
   }, [apply, hostId]);
-  return { tasks: useMemo(() => withTaskAvailability(tasks, states, cache), [tasks, tasks.lanes, tasks.byId, states, cache]), check };
+  const checkMany = useCallback(async (agentIds: string[], operation: TaskOperation) => {
+    const unique = [...new Set(agentIds)];
+    const allowed: string[] = [];
+    const blocked: Array<{ agentId: string; issue: TaskIssue }> = [];
+    for (let offset = 0; offset < unique.length; offset += 100) {
+      const batch = unique.slice(offset, offset + 100);
+      try {
+        const result = await latest.current({ agentIds: batch });
+        apply(result.entries);
+        if (scope.current !== hostId) {
+          for (const agentId of batch) blocked.push({ agentId, issue: UNREACHABLE.issue! });
+          continue;
+        }
+        for (const agentId of batch) {
+          const issue = result.entries.find((entry) => entry.agentId === agentId)?.availability.blocked[operation];
+          if (issue) blocked.push({ agentId, issue });
+          else allowed.push(agentId);
+        }
+      } catch {
+        apply(batch.map((agentId) => ({ agentId, availability: UNREACHABLE })));
+        for (const agentId of batch) blocked.push({ agentId, issue: UNREACHABLE.issue! });
+      }
+    }
+    return { allowed, blocked };
+  }, [apply, hostId]);
+  return { tasks: useMemo(() => withTaskAvailability(tasks, states, cache), [tasks, tasks.lanes, tasks.byId, states, cache]), check, checkMany };
 }

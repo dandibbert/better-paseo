@@ -302,6 +302,11 @@ export function turnRunning(card: { lane?: LaneId; waitingOnSubtasks?: boolean }
   return card.lane === "running" && card.waitingOnSubtasks !== true;
 }
 
+/** A green finished task in the Review lane that can be batch-marked as read (excludes red failed cards and provider subagents). */
+export function isUnreadReviewCard(card: Pick<TaskCard, "lane" | "status" | "readable" | "subagent">): boolean {
+  return card.lane === "review" && card.status === "unread" && card.readable === true && !card.subagent;
+}
+
 /** One lane's cards in display order, with what the done and archived lanes still have to load. */
 export interface LaneModel {
   id: LaneId;
