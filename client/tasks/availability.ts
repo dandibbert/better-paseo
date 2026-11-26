@@ -69,6 +69,39 @@ function availabilityStore(paseo: PaseoApi) {
   return store;
 }
 
+/** Checks operation availability in batches of 100, classifying any RPC/host failures as blocked. */
+export async function checkTaskAvailabilityBatch(
+  fetchAvailability: (input: { agentIds: string[] }) => Promise<{ entries: Array<{ agentId: string; availability: TaskAvailability }> }>,
+  agentIds: readonly string[],
+  operation: TaskOperation,
+  onEntries?: (entries: Array<{ agentId: string; availability: TaskAvailability }>) => void,
+  stillCurrent?: () => boolean,
+): Promise<{ allowed: string[]; blocked: Array<{ agentId: string; issue: TaskIssue }> }> {
+  const unique = [...new Set(agentIds)];
+  const allowed: string[] = [];
+  const blocked: Array<{ agentId: string; issue: TaskIssue }> = [];
+  for (let offset = 0; offset < unique.length; offset += 100) {
+    const batch = unique.slice(offset, offset + 100);
+    try {
+      const result = await fetchAvailability({ agentIds: batch });
+      onEntries?.(result.entries);
+      if (stillCurrent && !stillCurrent()) {
+        for (const agentId of batch) blocked.push({ agentId, issue: UNREACHABLE.issue! });
+        continue;
+      }
+      for (const agentId of batch) {
+        const issue = result.entries.find((entry) => entry.agentId === agentId)?.availability.blocked[operation];
+        if (issue) blocked.push({ agentId, issue });
+        else allowed.push(agentId);
+      }
+    } catch {
+      onEntries?.(batch.map((agentId) => ({ agentId, availability: UNREACHABLE })));
+      for (const agentId of batch) blocked.push({ agentId, issue: UNREACHABLE.issue! });
+    }
+  }
+  return { allowed, blocked };
+}
+
 /** Only an open, visible board probes its host; no timer or filesystem work per card. */
 export function useTaskAvailability(tasks: TasksHandle, visible: boolean, hostId: string) {
   const load = useRpc(tasksAvailabilityRpc);
@@ -116,30 +149,7 @@ export function useTaskAvailability(tasks: TasksHandle, visible: boolean, hostId
       return UNREACHABLE.issue!;
     }
   }, [apply, hostId]);
-  const checkMany = useCallback(async (agentIds: string[], operation: TaskOperation) => {
-    const unique = [...new Set(agentIds)];
-    const allowed: string[] = [];
-    const blocked: Array<{ agentId: string; issue: TaskIssue }> = [];
-    for (let offset = 0; offset < unique.length; offset += 100) {
-      const batch = unique.slice(offset, offset + 100);
-      try {
-        const result = await latest.current({ agentIds: batch });
-        apply(result.entries);
-        if (scope.current !== hostId) {
-          for (const agentId of batch) blocked.push({ agentId, issue: UNREACHABLE.issue! });
-          continue;
-        }
-        for (const agentId of batch) {
-          const issue = result.entries.find((entry) => entry.agentId === agentId)?.availability.blocked[operation];
-          if (issue) blocked.push({ agentId, issue });
-          else allowed.push(agentId);
-        }
-      } catch {
-        apply(batch.map((agentId) => ({ agentId, availability: UNREACHABLE })));
-        for (const agentId of batch) blocked.push({ agentId, issue: UNREACHABLE.issue! });
-      }
-    }
-    return { allowed, blocked };
-  }, [apply, hostId]);
+  const checkMany = useCallback((agentIds: string[], operation: TaskOperation) =>
+    checkTaskAvailabilityBatch(latest.current, agentIds, operation, apply, () => scope.current === hostId), [apply, hostId]);
   return { tasks: useMemo(() => withTaskAvailability(tasks, states, cache), [tasks, tasks.lanes, tasks.byId, states, cache]), check, checkMany };
 }

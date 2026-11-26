@@ -1,15 +1,19 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Pressable, ScrollView, Text, TextInput, View } from "react-native";
 import type { PluginScreenProps } from "@getpaseo/plugin/client";
 import * as pluginClient from "@getpaseo/plugin/client";
 import type { PaseoApi } from "@getpaseo/client";
 import { effectiveCard, type CardSettings, type DoneWindow, type TasksSettings } from "../../../shared/tasks-settings";
+import { tasksAvailabilityRpc } from "../../../shared/task-availability";
+import { checkTaskAvailabilityBatch, taskOperationIssue } from "../availability";
+import { taskIssueText } from "../cards/availability-tag";
 import { useTasks, type TasksHandle, type TasksOptions } from "../data";
 import { useTasksLanguage, type TasksLanguage } from "../i18n";
-import { LANE_ORDER, type LaneId } from "../model";
+import { LANE_ORDER, isArchivableDoneCard, isUnreadReviewCard, type LaneId, type TaskCard } from "../model";
 import { StatusIcon, TaskCardView } from "../cards";
-import { permissionButtons, respondToPermission, type PermissionButton } from "../actions";
-import { useToast } from "@getpaseo/plugin/client/react-native";
+import { archiveCardsWithApi, permissionButtons, respondToPermission, useReadControl, type PermissionButton } from "../actions";
+import { useToast } from "@getpaseo/plugin/client/ui";
+import { ArchiveAllButton, MarkAllReadButton } from "./board-parts";
 import { BOARD_STRINGS } from "./strings";
 import { aggregateHostTasks, type AggregateTask, type HostTaskSnapshots } from "./all-hosts-model";
 
@@ -28,27 +32,32 @@ interface LiveHost {
 type ChangeSnapshot = (serverId: string, tasks: TasksHandle | null) => void;
 
 function ConnectedHostReader({
-  serverId, paseo, options, onChange,
+  serverId, activeHostId, paseo, options, onChange,
 }: {
   serverId: string;
+  activeHostId: string;
   paseo: PaseoApi;
   options: TasksOptions;
   onChange: ChangeSnapshot;
 }) {
-  // The aggregate always uses SDK-only stores, including the selected host.
-  // Global plugin-server RPC loaders belong to a single installation and
-  // could otherwise enrich cards using data from a different daemon.
-  const remoteOptions = useMemo<TasksOptions>(() => ({ ...options, remoteHost: true }), [options]);
-  const tasks = useTasks(paseo, remoteOptions);
+  // Non-active hosts use SDK-only stores so global plugin-server RPC loaders
+  // never enrich a remote daemon's cards. The active host keeps its plugin store
+  // so batch Mark All Read and read marks stay in sync.
+  const hostOptions = useMemo<TasksOptions>(
+    () => (serverId === activeHostId ? options : { ...options, remoteHost: true }),
+    [options, serverId, activeHostId],
+  );
+  const tasks = useTasks(paseo, hostOptions);
   useEffect(() => { onChange(serverId, tasks); }, [serverId, tasks, onChange]);
   useEffect(() => () => onChange(serverId, null), [serverId, onChange]);
   return null;
 }
 
 function HostReader({
-  serverId, options, onChange,
+  serverId, activeHostId, options, onChange,
 }: {
   serverId: string;
+  activeHostId: string;
   options: TasksOptions;
   onChange: ChangeSnapshot;
 }) {
@@ -64,7 +73,7 @@ function HostReader({
   }, [serverId]);
 
   return paseo ? (
-    <ConnectedHostReader serverId={serverId} paseo={paseo} options={options} onChange={onChange} />
+    <ConnectedHostReader serverId={serverId} activeHostId={activeHostId} paseo={paseo} options={options} onChange={onChange} />
   ) : null;
 }
 
@@ -185,7 +194,7 @@ function TaskPreview({
 
 function LaneColumn({
   laneId, tasks, screen, compact, label, emptyLabel, limit, onMore, onLoadOlder, onOpen,
-  onPermission, fields, language, moreText, olderText,
+  onPermission, fields, language, moreText, olderText, headerAction,
 }: {
   laneId: LaneId;
   tasks: AggregateTask[];
@@ -202,6 +211,7 @@ function LaneColumn({
   language: TasksLanguage;
   moreText: string;
   olderText: string;
+  headerAction?: React.ReactNode;
 }) {
   const colors = screen.theme.colors;
   return (
@@ -217,6 +227,8 @@ function LaneColumn({
           theme={screen.theme} size={16} />
         <Text style={{ color: colors.foreground, fontWeight: "600", fontSize: 13 }}>{label}</Text>
         <Text style={{ color: colors.foregroundMuted, fontSize: 12 }}>{tasks.length}</Text>
+        <View style={{ flex: 1 }} />
+        {headerAction}
       </View>
       <ScrollView nestedScrollEnabled style={{ flex: 1 }}
         contentContainerStyle={{ paddingHorizontal: 8, paddingBottom: 12, gap: 8 }}>
@@ -332,6 +344,150 @@ export function AllHostsBoard({
   const showMore = useCallback((id: LaneId) => {
     setLimits((current) => ({ ...current, [id]: current[id] + MORE_LANE_LIMIT }));
   }, []);
+  const activeHostId = screen.host.id;
+  const activeHostLabel = hosts.find((host) => host.serverId === activeHostId)?.label ?? screen.host.label;
+  const snapshotsRef = useRef(snapshots);
+  snapshotsRef.current = snapshots;
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+  const availabilityRpc = pluginClient.useRpc(tasksAvailabilityRpc);
+  const read = useReadControl({
+    isReadable: (agentId) => snapshotsRef.current[activeHostId]?.byId.get(agentId)?.readable === true,
+    onRead: () => {
+      snapshotsRef.current[activeHostId]?.refreshReads();
+      snapshotsRef.current[activeHostId]?.refreshUnreads();
+    },
+    toast,
+  });
+  const reconcileRead = read.reconcile;
+  const activeById = snapshots[activeHostId]?.byId;
+  useEffect(() => reconcileRead(), [activeById, reconcileRead]);
+
+  const [checkingAllRead, setCheckingAllRead] = useState(false);
+  const checkingAllReadRef = useRef(false);
+  const hostUnreadReviewCards = useMemo<TaskCard[]>(
+    () => aggregated.review.filter((task) => task.serverId === activeHostId && isUnreadReviewCard(task.card)).map((task) => task.card),
+    [aggregated.review, activeHostId],
+  );
+  const otherHostUnreadCount = useMemo(
+    () => aggregated.review.filter((task) => task.serverId !== activeHostId && isUnreadReviewCard(task.card)).length,
+    [aggregated.review, activeHostId],
+  );
+  const readAllPending = checkingAllRead || read.batchPending || hostUnreadReviewCards.some((card) => read.pending(card.id));
+  const readAll = useCallback(() => {
+    if (!read.available || checkingAllReadRef.current || read.batchPending || hostUnreadReviewCards.length === 0) return;
+    checkingAllReadRef.current = true;
+    setCheckingAllRead(true);
+    const ids = hostUnreadReviewCards.map((card) => card.id);
+    void checkTaskAvailabilityBatch(availabilityRpc, ids, "read", undefined, () => mountedRef.current).then(({ allowed, blocked }) => {
+      if (!mountedRef.current) return;
+      if (allowed.length === 0) {
+        if (blocked[0]) toast.error(taskIssueText(blocked[0].issue, language));
+        return;
+      }
+      const allowedSet = new Set(allowed);
+      read.pressMany(hostUnreadReviewCards.filter((card) => allowedSet.has(card.id)));
+      if (blocked[0]) {
+        toast.error(taskIssueText(blocked[0].issue, language));
+      } else if (otherHostUnreadCount > 0) {
+        toast.show(labels.allHostsReadOthersNote(activeHostLabel, otherHostUnreadCount));
+      }
+    }).finally(() => {
+      checkingAllReadRef.current = false;
+      if (mountedRef.current) setCheckingAllRead(false);
+    });
+  }, [read, hostUnreadReviewCards, availabilityRpc, toast, language, otherHostUnreadCount, labels, activeHostLabel]);
+
+  const archivableDoneTasks = useMemo(
+    () => aggregated.done.filter((task) => isArchivableDoneCard(task.card) && !taskOperationIssue(task.card, "archive")),
+    [aggregated.done],
+  );
+  const [archiveAllPending, setArchiveAllPending] = useState(false);
+  const archiveAllRef = useRef(false);
+  const archiveAll = useCallback(() => {
+    if (archiveAllRef.current || archivableDoneTasks.length === 0) return;
+    const byHost = new Map<string, TaskCard[]>();
+    for (const task of archivableDoneTasks) {
+      const list = byHost.get(task.serverId) ?? [];
+      list.push(task.card);
+      byHost.set(task.serverId, list);
+    }
+    archiveAllRef.current = true;
+    setArchiveAllPending(true);
+    const acquire = (pluginClient as unknown as { getPaseoClient?: (id: string) => PaseoApi }).getPaseoClient;
+    void (async () => {
+      let archived = 0;
+      let failedCount = 0;
+      let firstError: string | null = null;
+      await Promise.all(
+        [...byHost.entries()].map(async ([serverId, cards]) => {
+          let api: PaseoApi | null = null;
+          try {
+            api = acquire?.(serverId) ?? null;
+          } catch {
+            api = null;
+          }
+          if (!api) {
+            failedCount += cards.length;
+            firstError ??= "Host unavailable";
+            return;
+          }
+          const result = await archiveCardsWithApi({ paseo: api, cards, language });
+          archived += result.archived;
+          failedCount += result.failed;
+          firstError ??= result.firstError;
+        }),
+      );
+      if (!mountedRef.current) return;
+      if (failedCount > 0) {
+        const detail = firstError ?? (language === "zh" ? "未知错误。" : "Unknown error.");
+        toast.error(
+          language === "zh"
+            ? `部分归档失败（${failedCount}/${archivableDoneTasks.length}）：${detail}`
+            : `Archived ${archived}/${archivableDoneTasks.length}; ${failedCount} failed: ${detail}`,
+        );
+      }
+    })().finally(() => {
+      archiveAllRef.current = false;
+      if (mountedRef.current) setArchiveAllPending(false);
+    });
+  }, [archivableDoneTasks, language, toast]);
+
+  const laneHeaderAction = (id: LaneId) => {
+    if (id === "review" && read.available && hostUnreadReviewCards.length > 0) {
+      return (
+        <MarkAllReadButton
+          count={hostUnreadReviewCards.length}
+          pending={readAllPending}
+          compact={false}
+          theme={screen.theme}
+          strings={labels}
+          onPress={readAll}
+          testID="all-hosts-read-all-review"
+        />
+      );
+    }
+    if (id === "done" && archivableDoneTasks.length > 0) {
+      return (
+        <ArchiveAllButton
+          count={archivableDoneTasks.length}
+          pending={archiveAllPending}
+          compact={false}
+          theme={screen.theme}
+          strings={labels}
+          onPress={archiveAll}
+          testID="all-hosts-archive-all-done"
+        />
+      );
+    }
+    return undefined;
+  };
+
   useEffect(() => {
     setLimits({
       needs_input: INITIAL_LANE_LIMIT, running: INITIAL_LANE_LIMIT,
@@ -339,10 +495,12 @@ export function AllHostsBoard({
     });
   }, [query, hostFilter, window, showArchived]);
 
+  const compactLaneId = laneOrder.includes(lane) ? lane : "running";
+
   return (
     <View style={{ flex: 1, minHeight: 0, backgroundColor: colors.surface0 }}>
       {online.map((host) => (
-        <HostReader key={host.serverId} serverId={host.serverId} options={options}
+        <HostReader key={host.serverId} serverId={host.serverId} activeHostId={activeHostId} options={options}
           onChange={onSnapshot} />
       ))}
       <ScrollView horizontal showsHorizontalScrollIndicator={false}
@@ -391,13 +549,13 @@ export function AllHostsBoard({
             ))}
           </ScrollView>
           <View style={{ flex: 1, paddingHorizontal: 12, paddingBottom: 12 }}>
-            <LaneColumn laneId={laneOrder.includes(lane) ? lane : "running"}
-              tasks={aggregated[laneOrder.includes(lane) ? lane : "running"]} screen={screen}
-              compact label={labels.lanes[laneOrder.includes(lane) ? lane : "running"]}
-              emptyLabel={ui.empty} limit={limits[lane]} onMore={() => showMore(lane)}
-              onLoadOlder={lane === "done" && hasMoreHistory ? loadOlder : undefined}
+            <LaneColumn laneId={compactLaneId}
+              tasks={aggregated[compactLaneId]} screen={screen}
+              compact label={labels.lanes[compactLaneId]}
+              emptyLabel={ui.empty} limit={limits[compactLaneId]} onMore={() => showMore(compactLaneId)}
+              onLoadOlder={compactLaneId === "done" && hasMoreHistory ? loadOlder : undefined}
               onOpen={onOpen} onPermission={onPermission} fields={fields} language={language}
-              moreText={ui.more} olderText={ui.older} />
+              moreText={ui.more} olderText={ui.older} headerAction={laneHeaderAction(compactLaneId)} />
           </View>
         </>
       ) : (
@@ -408,7 +566,7 @@ export function AllHostsBoard({
               label={labels.lanes[id]} emptyLabel={ui.empty} limit={limits[id]} onMore={() => showMore(id)}
               onLoadOlder={id === "done" && hasMoreHistory ? loadOlder : undefined}
               onOpen={onOpen} onPermission={onPermission} fields={fields} language={language}
-              moreText={ui.more} olderText={ui.older} />
+              moreText={ui.more} olderText={ui.older} headerAction={laneHeaderAction(id)} />
           ))}
         </ScrollView>
       )}

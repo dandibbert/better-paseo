@@ -13,7 +13,7 @@ import { filterLanes, openedTask, setTasksArchivedLane, useTasks, withSubagentCa
 import { useSearchFirstPrompts, retrySearchPrompt, type SearchCoverageControl } from "../data/search-first-prompts";
 import { useSearchConversations } from "../data/search-conversations";
 import { useTasksLanguage, type TasksLanguage } from "../i18n";
-import { LANE_ORDER, boardLaneOrder, isUnreadReviewCard, opensInPaseo, turnRunning, type BoardFilters, type LaneId, type LaneModel, type TaskCard, type TaskPermission } from "../model";
+import { LANE_ORDER, boardLaneOrder, isArchivableDoneCard, isUnreadReviewCard, opensInPaseo, turnRunning, type BoardFilters, type LaneId, type LaneModel, type TaskCard, type TaskPermission } from "../model";
 import { useDeviceTasksPreferences } from "../device-preferences";
 import { DEFAULT_CARD_TITLE_LINES, type CardTitleLineCount } from "../device-store";
 import { MOTION } from "./board-style";
@@ -117,6 +117,10 @@ export interface BoardController {
   unarchive: UnarchiveControl;
   /** Archive for a done task: its card, its menu and the details. */
   archive: ArchiveControl;
+  /** Archive every finished task in the visible Done lane. */
+  archiveAll(): void;
+  /** True while checking availability or archiving the visible Done lane batch. */
+  archiveAllPending: boolean;
   callbacks: CardCallbacks;
   questionDialog: QuestionDialogStore;
   submitQuestions(state: QuestionDialogState): Promise<void>;
@@ -616,6 +620,34 @@ export function useBoard(
   }, []);
   const readAllPending = checkingAllRead || read.batchPending;
 
+  const [checkingAllArchive, setCheckingAllArchive] = useState(false);
+  const checkingAllArchiveRef = useRef(false);
+  const archiveAll = useCallback(() => {
+    const current = latest.current;
+    if (checkingAllArchiveRef.current || current.archive.batchPending) return;
+    const targets = current.lanes.done.cards.filter(isArchivableDoneCard);
+    if (targets.length === 0) return;
+    checkingAllArchiveRef.current = true;
+    setCheckingAllArchive(true);
+    const ids = targets.map((card) => card.id);
+    void current.availability.checkMany(ids, "archive").then(({ allowed, blocked }) => {
+      if (!mountedRef.current || latest.current.paseo !== current.paseo) return;
+      if (allowed.length === 0) {
+        if (blocked[0]) latest.current.toast.error(taskIssueText(blocked[0].issue, latest.current.language));
+        return;
+      }
+      const allowedSet = new Set(allowed);
+      latest.current.archive.pressMany(targets.filter((card) => allowedSet.has(card.id)));
+      if (blocked[0]) {
+        latest.current.toast.error(taskIssueText(blocked[0].issue, latest.current.language));
+      }
+    }).finally(() => {
+      checkingAllArchiveRef.current = false;
+      if (mountedRef.current) setCheckingAllArchive(false);
+    });
+  }, []);
+  const archiveAllPending = checkingAllArchive || archive.batchPending;
+
   const guardedRead = useMemo(() => ({ ...read, press: (card: TaskCard) => write(card.id, "read", () => read.press(card)) }), [read, write]);
   const guardedUnarchive = useMemo(() => ({ ...unarchive, press: (agentId: string) => write(agentId, "unarchive", () => unarchive.press(agentId)) }), [unarchive, write]);
   const guardedArchive = useMemo(() => ({ ...archive, press: (agentId: string) => write(agentId, "archive", () => archive.press(agentId)) }), [archive, write]);
@@ -665,6 +697,8 @@ export function useBoard(
     unread,
     unarchive: guardedUnarchive,
     archive: guardedArchive,
+    archiveAll,
+    archiveAllPending,
     callbacks,
     questionDialog,
     submitQuestions,

@@ -963,8 +963,7 @@ export function SlashMark(props: { size: number; color: string; gap: string }) {
   );
 }
 
-/** Batch mark-read control for the green unread tasks in the Review lane. */
-export function MarkAllReadButton(props: {
+interface BatchLaneActionProps {
   count: number;
   pending: boolean;
   compact: boolean;
@@ -974,23 +973,29 @@ export function MarkAllReadButton(props: {
   onPress(): void;
   pressIn?: { onPressIn(event: { nativeEvent: { pageX: number; pageY: number } }): void };
   testID?: string;
+}
+
+function BatchLaneActionButton(props: BatchLaneActionProps & {
+  kind: "read" | "archive";
+  icon: "CheckCheck" | "Archive";
+  label: string;
+  tip: string;
 }) {
-  const { pending, compact, iconOnly = false, theme, strings } = props;
+  const { pending, compact, iconOnly = false, theme } = props;
   const scale = useTasksFontScale();
   const tokens = taskTokens(theme);
-  const hue = buttonHue(tokens, "read");
+  const hue = buttonHue(tokens, props.kind);
   const { hovered, hoverProps } = useHover();
   const press = usePressCue(hovered, !pending);
   const height = taskControlHeight(compact ? 32 : 24, scale);
   const iconSize = compact ? 14 : 13;
-  const label = compact ? strings.markAllRead : strings.markAllReadShort;
   return (
     <Pressable
       accessibilityRole="button"
-      accessibilityLabel={strings.markAllReadTip(props.count)}
+      accessibilityLabel={props.tip}
       accessibilityState={pending ? { busy: true, disabled: true } : undefined}
       disabled={pending}
-      {...tipProps(strings.markAllReadTip(props.count))}
+      {...tipProps(props.tip)}
       {...hoverProps}
       onPress={press.guard(props.onPress)}
       onPressIn={(event) => {
@@ -1020,13 +1025,39 @@ export function MarkAllReadButton(props: {
       {pending ? (
         <SpinnerRing size={iconSize} color={hue.color} testID={props.testID ? `${props.testID}-spinner` : undefined} />
       ) : (
-        <Icon name="CheckCheck" size={iconSize} color={hue.color} />
+        <Icon name={props.icon} size={iconSize} color={hue.color} />
       )}
       {iconOnly ? null : (
         <Text numberOfLines={1} style={{ fontSize: compact ? F.base : F.sm, fontWeight: "500", color: hue.color }}>
-          {label}
+          {props.label}
         </Text>
       )}
     </Pressable>
+  );
+}
+
+/** Batch mark-read control for the green unread tasks in the Review lane. */
+export function MarkAllReadButton(props: BatchLaneActionProps) {
+  return (
+    <BatchLaneActionButton
+      {...props}
+      kind="read"
+      icon="CheckCheck"
+      label={props.compact ? props.strings.markAllRead : props.strings.markAllReadShort}
+      tip={props.strings.markAllReadTip(props.count)}
+    />
+  );
+}
+
+/** Batch archive control for finished tasks in the Done lane. */
+export function ArchiveAllButton(props: BatchLaneActionProps) {
+  return (
+    <BatchLaneActionButton
+      {...props}
+      kind="archive"
+      icon="Archive"
+      label={props.compact ? props.strings.archiveAll : props.strings.archiveAllShort}
+      tip={props.strings.archiveAllTip(props.count)}
+    />
   );
 }

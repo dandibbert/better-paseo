@@ -4,7 +4,7 @@ import { useToast } from "@getpaseo/plugin/client/ui";
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { Alert, Platform } from "react-native";
 import { tasksCapabilitiesRpc, tasksReadRpc, tasksStopRpc, tasksStoppedRpc, tasksUnarchiveRpc, tasksUnreadRpc } from "../../../shared/tasks-rpc";
-import type { TaskCard, TaskPermission, TaskPermissionAction } from "../model";
+import { isArchivableDoneCard, type TaskCard, type TaskPermission, type TaskPermissionAction } from "../model";
 import { useTasksLanguage, type TasksLanguage } from "../i18n";
 import { confirmDialog } from "../../components/confirm-dialog";
 import { activeStopChildren, stopTargets } from "./stop-targets";
@@ -913,10 +913,68 @@ export interface ArchiveControl {
   /** The request is out; the button spins and takes no second press. */
   pending(agentId: string): boolean;
   press(agentId: string, scope?: ArchiveScope): void;
+  pressMany(cards: readonly TaskCard[]): void;
+  batchPending: boolean;
 }
 
 /** The daemon archives at once; past this the request has failed. */
 const ARCHIVE_TIMEOUT_MS = 15_000;
+const ARCHIVE_BATCH_CONCURRENCY = 6;
+
+export interface ArchiveBatchResult {
+  archived: number;
+  failed: number;
+  firstError: string | null;
+}
+
+/**
+ * Archive eligible finished cards through the provided host `PaseoApi`.
+ * Cards with non-provider children use `"self"` scope so children are detached
+ * cleanly rather than interrupted or orphaned.
+ */
+export async function archiveCardsWithApi(options: {
+  paseo: PaseoApi;
+  cards: readonly TaskCard[];
+  language: TasksLanguage;
+  onSettled?: (agentId: string) => void;
+}): Promise<ArchiveBatchResult> {
+  const { paseo, cards, language, onSettled } = options;
+  const zh = language === "zh";
+  const timeoutMessage = zh ? "归档请求没有响应。" : "The archive request did not answer.";
+  let cursor = 0;
+  let archived = 0;
+  let failed = 0;
+  let firstError: string | null = null;
+  const worker = async () => {
+    while (cursor < cards.length) {
+      const card = cards[cursor++];
+      if (!card) continue;
+      const hasChildren = card.children.some((child) => child.kind !== "provider");
+      try {
+        if (hasChildren) {
+          const progress = { detached: 0, archived: 0 };
+          await archiveScope(paseo, card.id, "self", progress);
+        } else {
+          await withTimeout(
+            Promise.resolve().then(() => paseo.agents.ref(card.id).archive()),
+            ARCHIVE_TIMEOUT_MS,
+            timeoutMessage,
+          );
+        }
+        archived += 1;
+      } catch (error: unknown) {
+        failed += 1;
+        firstError ??= shortError(error);
+      } finally {
+        onSettled?.(card.id);
+      }
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(ARCHIVE_BATCH_CONCURRENCY, cards.length) }, () => worker()),
+  );
+  return { archived, failed, firstError };
+}
 
 /**
  * One archive controller for the whole board, through the host's own client
@@ -930,9 +988,11 @@ export function useArchiveControl(options: {
   const hostToast = useToast();
   const language = useTasksLanguage();
   const [pendingIds, setPendingIds] = useState<ReadonlySet<string>>(() => new Set());
+  const [batchPending, setBatchPending] = useState(false);
   const latest = useRef({ paseo: options.paseo, toast: options.toast ?? hostToast, language });
   latest.current = { paseo: options.paseo, toast: options.toast ?? hostToast, language };
   const pendingRef = useRef(new Set<string>());
+  const batchCountRef = useRef(0);
   const mountedRef = useRef(false);
 
   useEffect(() => {
@@ -946,6 +1006,22 @@ export function useArchiveControl(options: {
     const next = new Set(pendingRef.current);
     if (on) next.add(agentId);
     else next.delete(agentId);
+    pendingRef.current = next;
+    setPendingIds(next);
+  }, []);
+
+  const setPendingMany = useCallback((agentIds: readonly string[], on: boolean) => {
+    if (agentIds.length === 0) return;
+    let changed = false;
+    const next = new Set(pendingRef.current);
+    for (const agentId of agentIds) {
+      if (on ? !next.has(agentId) : next.has(agentId)) {
+        if (on) next.add(agentId);
+        else next.delete(agentId);
+        changed = true;
+      }
+    }
+    if (!changed) return;
     pendingRef.current = next;
     setPendingIds(next);
   }, []);
@@ -991,6 +1067,48 @@ export function useArchiveControl(options: {
     Alert.alert(title, message, [{ text: cancelLabel, style: "cancel" }, { text: confirmLabel, style: "destructive", onPress: run }]);
   }, [setPending]);
 
+  const pressMany = useCallback((cards: readonly TaskCard[]) => {
+    const seen = new Set<string>();
+    const eligible: TaskCard[] = [];
+    for (const card of cards) {
+      if (seen.has(card.id) || pendingRef.current.has(card.id) || !isArchivableDoneCard(card)) continue;
+      seen.add(card.id);
+      eligible.push(card);
+    }
+    if (eligible.length === 0) return;
+    const ids = eligible.map((card) => card.id);
+    setPendingMany(ids, true);
+    batchCountRef.current += 1;
+    setBatchPending(true);
+    void archiveCardsWithApi({
+      paseo: latest.current.paseo,
+      cards: eligible,
+      language: latest.current.language,
+      onSettled: (agentId) => {
+        if (mountedRef.current) setPending(agentId, false);
+      },
+    }).then((result) => {
+      if (!mountedRef.current || result.failed === 0) return;
+      const zh = latest.current.language === "zh";
+      const detail = result.firstError ?? (zh ? "未知错误。" : "Unknown error.");
+      if (eligible.length === 1) {
+        latest.current.toast.error(zh ? `归档失败：${detail}` : `Could not archive: ${detail}`);
+      } else {
+        latest.current.toast.error(
+          zh
+            ? `部分归档失败（${result.failed}/${eligible.length}）：${detail}`
+            : `Archived ${result.archived}/${eligible.length}; ${result.failed} failed: ${detail}`,
+        );
+      }
+    }).finally(() => {
+      batchCountRef.current = Math.max(0, batchCountRef.current - 1);
+      if (mountedRef.current) {
+        setPendingMany(ids, false);
+        if (batchCountRef.current === 0) setBatchPending(false);
+      }
+    });
+  }, [setPending, setPendingMany]);
+
   const pending = useCallback((agentId: string) => pendingIds.has(agentId), [pendingIds]);
-  return useMemo(() => ({ pending, press }), [pending, press]);
+  return useMemo(() => ({ pending, press, pressMany, batchPending }), [pending, press, pressMany, batchPending]);
 }

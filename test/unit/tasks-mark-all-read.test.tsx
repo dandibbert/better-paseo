@@ -3,6 +3,8 @@ import TestRenderer, { act, type ReactTestInstance } from "react-test-renderer";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import "./helpers/quiet-renderer";
 
+type Card = import("../../client/tasks/model").TaskCard;
+
 const host = vi.hoisted(() => ({
   toastError: vi.fn(),
   toastShow: vi.fn(),
@@ -11,15 +13,27 @@ const host = vi.hoisted(() => ({
   canStop: false,
   blockedAgents: new Set<string>(),
   readRpc: vi.fn(async (_input: { agentIds: string[] }) => ({ ok: true, error: null as string | null })),
+  archiveRpc: vi.fn(async (_serverId: string, _agentId: string) => ({ archivedAt: "2026-11-26T00:00:00Z" })),
+  detachRpc: vi.fn(async (_serverId: string, _agentId: string) => undefined),
   availabilityRpc: vi.fn(async (input: { agentIds: string[] }) => ({
     entries: input.agentIds.map((agentId) => ({
       agentId,
       availability: host.blockedAgents.has(agentId)
-        ? { issue: { kind: "missingDirectory", path: "/missing" }, blocked: { read: { kind: "missingDirectory", path: "/missing" } } }
+        ? {
+            issue: { kind: "missingDirectory", path: "/missing" },
+            blocked: {
+              read: { kind: "missingDirectory", path: "/missing" },
+              archive: { kind: "missingDirectory", path: "/missing" },
+            },
+          }
         : { issue: null, blocked: {} },
     })),
   })),
-  reviewCards: [] as import("../../client/tasks/model").TaskCard[],
+  reviewCards: [] as Card[],
+  doneCards: [] as Card[],
+  configuredHosts: [] as Array<{ serverId: string; label: string; status: "idle" | "connecting" | "online" | "offline" | "error" }>,
+  remoteHostCards: new Map<object, { reviewCards: Card[]; doneCards: Card[] }>(),
+  clientsByServerId: new Map<string, object>(),
 }));
 
 vi.mock("react-native", async () => {
@@ -66,9 +80,28 @@ vi.mock("@getpaseo/plugin/client/ui", async () => {
   };
 });
 
+function makeHostApi(serverId: string) {
+  return {
+    agents: {
+      list: async () => ({ entries: [], pageInfo: { hasMore: false, nextCursor: null } }),
+      ref: (id: string) => ({
+        archive: () => host.archiveRpc(serverId, id),
+        detach: () => host.detachRpc(serverId, id),
+        timeline: {
+          refetch: () => Promise.resolve({ error: null, entries: [], epoch: "test", endCursor: null, window: { nextSeq: 0 } }),
+          subscribe: () => Object.assign(() => {}, { ready: Promise.resolve() }),
+        },
+      }),
+    },
+  };
+}
+
 const paseo = vi.hoisted(() => ({
   agents: {
-    ref: () => ({
+    list: async () => ({ entries: [], pageInfo: { hasMore: false, nextCursor: null } }),
+    ref: (id: string) => ({
+      archive: () => host.archiveRpc("host-1", id),
+      detach: () => host.detachRpc("host-1", id),
       timeline: {
         refetch: () => Promise.resolve({ error: null, entries: [], epoch: "test", endCursor: null, window: { nextSeq: 0 } }),
         subscribe: () => Object.assign(() => {}, { ready: Promise.resolve() }),
@@ -79,6 +112,8 @@ const paseo = vi.hoisted(() => ({
 
 vi.mock("@getpaseo/plugin/client", () => ({
   usePaseo: () => paseo,
+  useHosts: () => host.configuredHosts,
+  getPaseoClient: (serverId: string) => host.clientsByServerId.get(serverId),
   useRpc: (contract: { name: string }) => {
     if (contract.name === "tasks.capabilities") return () => Promise.resolve({ stop: host.canStop, read: host.canRead });
     if (contract.name === "tasks.availability") return host.availabilityRpc;
@@ -106,42 +141,66 @@ vi.mock("@getpaseo/plugin/client", () => ({
 vi.mock("../../client/tasks/data", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../client/tasks/data")>();
   const { LANE_ORDER } = await import("../../client/tasks/model");
+  const React = await import("react");
+  const cachedByApi = new WeakMap<object, { reviewCards: Card[]; doneCards: Card[]; handle: ReturnType<typeof actual.useTasks> }>();
   return {
     ...actual,
-    useTasks: () => {
-      const lanes = Object.fromEntries(
-        LANE_ORDER.map((id) => [
-          id,
-          { id, cards: id === "review" ? host.reviewCards : [], hasMore: false, loading: false, initialLoading: false },
-        ]),
-      );
-      return {
-        lanes,
-        counts: { needsInput: 0, running: 0, review: host.reviewCards.length, done: 0 },
-        byId: new Map(host.reviewCards.map((card) => [card.id, card])),
-        workspaces: [{ id: "wks_1", name: "better-paseo", projectId: "prj_1", projectName: "better-paseo" }],
-        providers: [{ id: "codex", label: "Codex" }],
-        labels: [],
-        ready: true,
-        error: null,
-        refresh: vi.fn(),
-        refreshReads: vi.fn(),
-        refreshUnreads: vi.fn(),
-        loadMoreDone: vi.fn(),
-        resolveParent: vi.fn(),
-        refreshParent: vi.fn(async () => false),
-        requestProjectIcon: vi.fn(),
-      };
+    useTasks: (api: object) => {
+      const override = host.remoteHostCards.get(api);
+      const reviewCards = override ? override.reviewCards : host.reviewCards;
+      const doneCards = override ? override.doneCards : host.doneCards;
+      return React.useMemo(() => {
+        const hit = cachedByApi.get(api);
+        if (hit && hit.reviewCards === reviewCards && hit.doneCards === doneCards) return hit.handle;
+        const allCards = [...reviewCards, ...doneCards];
+        const lanes = Object.fromEntries(
+          LANE_ORDER.map((id) => [
+            id,
+            {
+              id,
+              cards: id === "review" ? reviewCards : id === "done" ? doneCards : [],
+              hasMore: false,
+              loading: false,
+              initialLoading: false,
+            },
+          ]),
+        );
+        const handle = {
+          lanes,
+          counts: { needsInput: 0, running: 0, review: reviewCards.length, done: doneCards.length },
+          byId: new Map(allCards.map((card) => [card.id, card])),
+          workspaces: [{ id: "wks_1", name: "better-paseo", projectId: "prj_1", projectName: "better-paseo" }],
+          providers: [{ id: "codex", label: "Codex" }],
+          labels: [],
+          ready: true,
+          error: null,
+          refresh: vi.fn(),
+          refreshReads: vi.fn(),
+          refreshUnreads: vi.fn(),
+          loadMoreDone: vi.fn(),
+          resolveParent: vi.fn(),
+          refreshParent: vi.fn(async () => false),
+          requestProjectIcon: vi.fn(),
+        } as unknown as ReturnType<typeof actual.useTasks>;
+        cachedByApi.set(api, { reviewCards, doneCards, handle });
+        return handle;
+      }, [api, reviewCards, doneCards]);
     },
-    useTaskCounts: () => ({ needsInput: 0, running: 0, review: host.reviewCards.length, done: 0, ready: true }),
+    useTaskCounts: () => ({ needsInput: 0, running: 0, review: host.reviewCards.length, done: host.doneCards.length, ready: true }),
   };
 });
 
-import { READ_VERIFY_MS, useReadControl, type ReadControl } from "../../client/tasks/actions";
+import {
+  READ_VERIFY_MS,
+  useArchiveControl,
+  useReadControl,
+  type ArchiveControl,
+  type ReadControl,
+} from "../../client/tasks/actions";
 import { TasksBoardScreen } from "../../client/tasks/board/board-screen";
 import { resetTasksEnabled } from "../../client/tasks/board/enabled";
 import { resetBoardSessions } from "../../client/tasks/board/params";
-import { isUnreadReviewCard, type TaskCard } from "../../client/tasks/model";
+import { isArchivableDoneCard, isUnreadReviewCard, type TaskCard } from "../../client/tasks/model";
 import { sampleCards } from "../../client/tasks/sample-cards";
 import { DEFAULT_TASKS_SETTINGS } from "../../shared/tasks-settings";
 
@@ -167,15 +226,18 @@ const theme = {
   },
 } as never;
 
-const templateCard = sampleCards(Date.parse("2026-10-20T12:00:00Z")).find((card) => card.lane === "review" && card.status === "unread")!;
+const samples = sampleCards(Date.parse("2026-10-20T12:00:00Z"));
+const templateReviewCard = samples.find((card) => card.lane === "review" && card.status === "unread")!;
+const templateDoneCard = samples.find((card) => card.lane === "done")!;
 
 function makeCard(id: string, overrides: Partial<TaskCard> = {}): TaskCard {
+  const base = overrides.lane === "done" ? templateDoneCard : templateReviewCard;
   return {
-    ...templateCard,
+    ...base,
     id,
-    lane: "review",
-    status: "unread",
-    readable: true,
+    lane: overrides.lane ?? "review",
+    status: overrides.lane === "done" ? "done" : "unread",
+    readable: overrides.lane === "done" ? false : true,
     subagent: undefined,
     title: `Task ${id}`,
     ...overrides,
@@ -216,13 +278,25 @@ beforeEach(() => {
   host.blockedAgents = new Set();
   host.readRpc.mockReset();
   host.readRpc.mockImplementation(async () => ({ ok: true, error: null }));
+  host.archiveRpc.mockReset();
+  host.archiveRpc.mockImplementation(async () => ({ archivedAt: "2026-11-26T00:00:00Z" }));
+  host.detachRpc.mockReset();
+  host.detachRpc.mockImplementation(async () => undefined);
   host.availabilityRpc.mockClear();
+  host.configuredHosts = [];
+  host.remoteHostCards.clear();
+  host.clientsByServerId.clear();
   host.reviewCards = [
     makeCard("green-1"),
     makeCard("red-1", { status: "failed" }),
     makeCard("green-2"),
     makeCard("subagent-1", { subagent: { subtitle: "Subagent" } }),
     makeCard("already-done-like", { readable: false }),
+  ];
+  host.doneCards = [
+    makeCard("done-1", { lane: "done" }),
+    makeCard("done-2", { lane: "done" }),
+    makeCard("done-subagent", { lane: "done", subagent: { subtitle: "Subagent" } }),
   ];
   resetBoardSessions();
 });
@@ -235,13 +309,18 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-describe("isUnreadReviewCard", () => {
-  it("matches only non-subagent readable green unread cards in the review lane", () => {
+describe("isUnreadReviewCard & isArchivableDoneCard", () => {
+  it("matches only eligible cards per lane", () => {
     expect(isUnreadReviewCard(makeCard("g"))).toBe(true);
     expect(isUnreadReviewCard(makeCard("r", { status: "failed" }))).toBe(false);
     expect(isUnreadReviewCard(makeCard("s", { subagent: { subtitle: "Subagent" } }))).toBe(false);
     expect(isUnreadReviewCard(makeCard("d", { readable: false }))).toBe(false);
     expect(isUnreadReviewCard(makeCard("o", { lane: "done" }))).toBe(false);
+
+    expect(isArchivableDoneCard(makeCard("d1", { lane: "done" }))).toBe(true);
+    expect(isArchivableDoneCard(makeCard("d2", { lane: "done", archived: "agent" }))).toBe(false);
+    expect(isArchivableDoneCard(makeCard("d3", { lane: "done", subagent: { subtitle: "Subagent" } }))).toBe(false);
+    expect(isArchivableDoneCard(makeCard("r1", { lane: "review" }))).toBe(false);
   });
 });
 
@@ -285,7 +364,6 @@ describe("useReadControl.pressMany", () => {
     expect(latest!.pending("g-0")).toBe(true);
     expect(latest!.pending("failed-1")).toBe(false);
 
-    // Move first 29 cards out of readable, leave g-29 stuck to test coalesced timeout toast.
     readable = new Set(["g-29"]);
     act(() => {
       latest!.reconcile();
@@ -301,12 +379,65 @@ describe("useReadControl.pressMany", () => {
   });
 });
 
-describe("Tasks board Mark All Read UI", () => {
+describe("useArchiveControl.pressMany", () => {
+  it("archives eligible done cards, detaches children on parent cards, and reports failures", async () => {
+    let latest: ArchiveControl | undefined;
+    const childDetach = vi.fn(async () => undefined);
+    const parentArchive = vi.fn(async () => ({ archivedAt: "2026-11-26T00:00:00Z" }));
+    const customApi = {
+      agents: {
+        list: async () => ({
+          entries: [{ agent: { id: "child-1", labels: { "paseo.parent-agent-id": "done-parent" } } }],
+          pageInfo: { hasMore: false, nextCursor: null },
+        }),
+        ref: (id: string) => ({
+          detach: childDetach,
+          archive: async () => {
+            if (id === "done-fail") throw new Error("archive rejected");
+            return parentArchive();
+          },
+        }),
+      },
+    } as never;
+
+    function Harness() {
+      latest = useArchiveControl({ paseo: customApi, toast: { error: host.toastError } });
+      return null;
+    }
+
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(Harness));
+    });
+
+    const cards: TaskCard[] = [
+      makeCard("done-a", { lane: "done" }),
+      makeCard("done-parent", {
+        lane: "done",
+        children: [{ id: "child-1", title: "Child", lane: "done", status: "done", kind: "agent" }],
+      }),
+      makeCard("done-fail", { lane: "done" }),
+      makeCard("review-skip", { lane: "review" }),
+      makeCard("sub-skip", { lane: "done", subagent: { subtitle: "Subagent" } }),
+    ];
+
+    await act(async () => {
+      latest!.pressMany(cards);
+    });
+
+    expect(childDetach).toHaveBeenCalledTimes(1);
+    expect(parentArchive).toHaveBeenCalledTimes(2);
+    expect(latest!.batchPending).toBe(false);
+    expect(host.toastError).toHaveBeenCalledWith(expect.stringContaining("Archived 2/3; 1 failed: archive rejected"));
+  });
+});
+
+describe("Tasks board Mark All Read & Archive All UI", () => {
   const byId = (testID: string): ReactTestInstance[] =>
     renderer!.root.findAll((node) => typeof node.type === "string" && node.props.testID === testID);
 
-  it("shows Mark All Read on desktop review lane, skips red and blocked tasks, and hides when no green cards exist", async () => {
+  it("shows Mark All Read & Archive All on desktop lanes, skips red and blocked tasks, and hides when empty", async () => {
     host.blockedAgents.add("green-2");
+    host.blockedAgents.add("done-2");
     await act(async () => {
       renderer = TestRenderer.create(
         React.createElement(TasksBoardScreen, {
@@ -320,20 +451,27 @@ describe("Tasks board Mark All Read UI", () => {
     });
     layOut(renderer!, 1400);
 
-    const buttons = byId("lane-read-all-review");
-    expect(buttons).toHaveLength(1);
+    const readButtons = byId("lane-read-all-review");
+    expect(readButtons).toHaveLength(1);
+    const archiveButtons = byId("lane-archive-all-done");
+    expect(archiveButtons).toHaveLength(1);
 
     await act(async () => {
-      buttons[0]!.props.onPress();
+      readButtons[0]!.props.onPress();
     });
-
-    expect(host.availabilityRpc).toHaveBeenCalledWith({
-      agentIds: ["green-1", "green-2"],
-    });
+    expect(host.availabilityRpc).toHaveBeenCalledWith({ agentIds: ["green-1", "green-2"] });
     expect(host.readRpc).toHaveBeenCalledWith({ agentIds: ["green-1"] });
 
-    // Only a red failed card left -> button disappears.
+    await act(async () => {
+      archiveButtons[0]!.props.onPress();
+    });
+    expect(host.availabilityRpc).toHaveBeenCalledWith({ agentIds: ["done-1", "done-2"] });
+    expect(host.archiveRpc).toHaveBeenCalledWith("host-1", "done-1");
+    expect(host.archiveRpc).not.toHaveBeenCalledWith("host-1", "done-2");
+
+    // Empty eligible cards -> both buttons hide.
     host.reviewCards = [makeCard("red-only", { status: "failed" })];
+    host.doneCards = [];
     await act(async () => {
       renderer!.update(
         React.createElement(TasksBoardScreen, {
@@ -345,10 +483,14 @@ describe("Tasks board Mark All Read UI", () => {
         }),
       );
     });
+    await act(async () => {
+      vi.advanceTimersByTime(1000);
+    });
     expect(byId("lane-read-all-review")).toHaveLength(0);
+    expect(byId("lane-archive-all-done")).toHaveLength(0);
   });
 
-  it("shows Mark All Read contextual bar on phone when viewing the review lane", async () => {
+  it("shows Mark All Read and Archive All contextual bars on phone for review and done lanes", async () => {
     await act(async () => {
       renderer = TestRenderer.create(
         React.createElement(TasksBoardScreen, {
@@ -356,7 +498,7 @@ describe("Tasks board Mark All Read UI", () => {
           host: { id: "host-1", label: "Local" },
           layout: { compact: true, platform: "ios" },
           navigation: { openAgent: vi.fn(), openWorkspace: vi.fn() },
-          params: { lane: "review" },
+          params: {},
         }),
       );
     });
@@ -365,25 +507,71 @@ describe("Tasks board Mark All Read UI", () => {
     await act(async () => {
       byId("phone-stat-review")[0]!.props.onPress();
     });
-
     expect(byId("phone-review-actions")).toHaveLength(1);
-    const phoneButtons = byId("phone-read-all-review");
-    expect(phoneButtons).toHaveLength(1);
-
+    expect(byId("phone-done-actions")).toHaveLength(0);
     await act(async () => {
-      phoneButtons[0]!.props.onPress();
-    });
-
-    expect(host.availabilityRpc).toHaveBeenCalledWith({
-      agentIds: ["green-1", "green-2"],
+      byId("phone-read-all-review")[0]!.props.onPress();
     });
     expect(host.readRpc).toHaveBeenCalledWith({ agentIds: ["green-1", "green-2"] });
 
-    // Switch to running tab -> contextual bar hides.
-    const runningTab = byId("phone-stat-running")[0]!;
     await act(async () => {
-      runningTab.props.onPress();
+      byId("phone-stat-done")[0]!.props.onPress();
     });
     expect(byId("phone-review-actions")).toHaveLength(0);
+    expect(byId("phone-done-actions")).toHaveLength(1);
+    await act(async () => {
+      byId("phone-archive-all-done")[0]!.props.onPress();
+    });
+    expect(host.archiveRpc).toHaveBeenCalledWith("host-1", "done-1");
+    expect(host.archiveRpc).toHaveBeenCalledWith("host-1", "done-2");
+  });
+
+  it("supports Mark All Read for active host and Archive All across all online hosts in AllHostsBoard", async () => {
+    const client1 = makeHostApi("host-1");
+    const client2 = makeHostApi("host-2");
+    host.configuredHosts = [
+      { serverId: "host-1", label: "Mac Mini", status: "online" },
+      { serverId: "host-2", label: "MacBook Pro", status: "online" },
+    ];
+    host.clientsByServerId.set("host-1", client1);
+    host.clientsByServerId.set("host-2", client2);
+    host.remoteHostCards.set(client1, {
+      reviewCards: [makeCard("h1-green-1"), makeCard("h1-red", { status: "failed" })],
+      doneCards: [makeCard("h1-done-1", { lane: "done" })],
+    });
+    host.remoteHostCards.set(client2, {
+      reviewCards: [makeCard("h2-green-1")],
+      doneCards: [makeCard("h2-done-1", { lane: "done" }), makeCard("h2-done-2", { lane: "done" })],
+    });
+
+    await act(async () => {
+      renderer = TestRenderer.create(
+        React.createElement(TasksBoardScreen, {
+          theme,
+          host: { id: "host-1", label: "Mac Mini" },
+          layout: { compact: false, platform: "web" },
+          navigation: { openAgent: vi.fn(), openWorkspace: vi.fn() },
+          params: {},
+        }),
+      );
+    });
+
+    const readAllButtons = byId("all-hosts-read-all-review");
+    const archiveAllButtons = byId("all-hosts-archive-all-done");
+    expect(readAllButtons).toHaveLength(1);
+    expect(archiveAllButtons).toHaveLength(1);
+
+    await act(async () => {
+      readAllButtons[0]!.props.onPress();
+    });
+    expect(host.readRpc).toHaveBeenCalledWith({ agentIds: ["h1-green-1"] });
+    expect(host.toastShow).toHaveBeenCalledWith(expect.stringContaining("Mac Mini"));
+
+    await act(async () => {
+      archiveAllButtons[0]!.props.onPress();
+    });
+    expect(host.archiveRpc).toHaveBeenCalledWith("host-1", "h1-done-1");
+    expect(host.archiveRpc).toHaveBeenCalledWith("host-2", "h2-done-1");
+    expect(host.archiveRpc).toHaveBeenCalledWith("host-2", "h2-done-2");
   });
 });

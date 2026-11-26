@@ -5,7 +5,7 @@ import type { PluginScreenProps } from "@getpaseo/plugin/client";
 import type { PluginTheme } from "@getpaseo/plugin";
 import { TaskText as Text, HOST_FONT as F, HOST_LINE, laneTitle, TasksTypography, TasksTypographyScale, useTasksFontScale, taskControlHeight } from "../typography";
 import { StatusIcon, taskTokens, type CardCallbacks } from "../cards";
-import { LANE_ORDER, LANE_STATUS, isHistoryLane, isUnreadReviewCard, type LaneId, type LaneModel, type TaskCard } from "../model";
+import { LANE_ORDER, LANE_STATUS, isArchivableDoneCard, isHistoryLane, isUnreadReviewCard, type LaneId, type LaneModel, type TaskCard } from "../model";
 import { useReducedMotion } from "../../ui/use-reduced-motion";
 import { holdHostGestures } from "../../ui/hold-host-gestures";
 import { HAIRLINE, MOTION, PANEL_RADIUS, boardPalette } from "./board-style";
@@ -14,7 +14,7 @@ import { LANE_EMPTY_ICON } from "./strings";
 import { LANE_SCROLLBAR_WIDTH, laneScrollProps, useLaneScrollbar } from "./lane-scrollbar";
 import { followPointer, ResizeLine, resizeHandleProps, setResizing, useResizeLine } from "../../ui/resize-line";
 import { liftStyle, surfaceLift } from "../cards/surface-lift";
-import { CardCell, HoverPressable, LaneFilterHint, LoadMoreRow, MarkAllReadButton, NewCardsDot, NewCardsPill, RollingCount, SkeletonCard, VerticalLabel, laneHue, useBreathing, useFreshIds, useTap } from "./board-parts";
+import { ArchiveAllButton, CardCell, HoverPressable, LaneFilterHint, LoadMoreRow, MarkAllReadButton, NewCardsDot, NewCardsPill, RollingCount, SkeletonCard, VerticalLabel, laneHue, useBreathing, useFreshIds, useTap } from "./board-parts";
 import { CollapsedArrivalMarker, createCollapsedArrivals, useCollapsedArrivals, type CollapsedArrivals } from "./collapsed-arrivals";
 import { pillDirection, useSeenCards, useTrackNewCards, useUnseenCards } from "./new-cards";
 import { useFlash } from "./breathing";
@@ -1659,10 +1659,13 @@ function DesktopLaneView(props: DesktopLaneProps) {
   // Taps that a quick swipe starting on them must not fire (see `useTap`).
   const headerTap = useTap();
   const readAllTap = useTap();
+  const archiveAllTap = useTap();
   const collapseTap = useTap();
   const blankTap = useTap();
   const unreadReviewCards = lane.id === "review" ? lane.cards.filter(isUnreadReviewCard) : [];
   const readAllPending = Boolean(board.readAllPending || unreadReviewCards.some((card) => board.read?.pending(card.id)));
+  const archivableDoneCards = lane.id === "done" ? lane.cards.filter(isArchivableDoneCard) : [];
+  const archiveAllPending = Boolean(board.archiveAllPending || archivableDoneCards.some((card) => board.archive?.pending(card.id)));
   const drawn = useDrawnOnce(props.inView);
   const shown = props.collapsed ? LANES.collapsed : props.width;
   const resized = useLaneWidth(shown, props.sizing);
@@ -1748,6 +1751,19 @@ function DesktopLaneView(props: DesktopLaneProps) {
             pressIn={readAllTap.pressIn}
             onPress={readAllTap.tap(() => board.readAll?.()) ?? (() => {})}
             testID="lane-read-all-review"
+          />
+        ) : null}
+        {lane.id === "done" && board.archive && archivableDoneCards.length > 0 ? (
+          <ArchiveAllButton
+            count={archivableDoneCards.length}
+            pending={archiveAllPending}
+            compact={false}
+            iconOnly={props.width < 260 * Math.max(1, scale)}
+            theme={theme}
+            strings={strings}
+            pressIn={archiveAllTap.pressIn}
+            onPress={archiveAllTap.tap(() => board.archiveAll?.()) ?? (() => {})}
+            testID="lane-archive-all-done"
           />
         ) : null}
         <HoverPressable hoverTheme={theme}

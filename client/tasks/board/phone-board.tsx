@@ -23,14 +23,14 @@ import { EdgeActionBar, StatusIcon, TaskDetailCards, createDetailChrome, request
 import { panelChrome } from "../cards/panel";
 import { cardStrings } from "../cards/strings";
 import { ActionPressable } from "../cards/action-pressable";
-import { LANE_STATUS, isHistoryLane, isUnreadReviewCard, turnRunning, type LaneId, type LaneModel, type TaskCard } from "../model";
+import { LANE_STATUS, isArchivableDoneCard, isHistoryLane, isUnreadReviewCard, turnRunning, type LaneId, type LaneModel, type TaskCard } from "../model";
 import { activeStopChildren } from "../actions/stop-targets";
 import { useReducedMotion } from "../../ui/use-reduced-motion";
 import { holdHostGestures } from "../../ui/hold-host-gestures";
 import { findHostHorizontalScroll } from "../../ui/host-horizontal-scroll";
 import { HAIRLINE, MOTION, boardPalette } from "./board-style";
 import { BoardEmptyState } from "./empty-state";
-import { CardCell, HoverPressable, NewCardsDot, NewCardsPill, RollingCount, RoundButton, LaneFilterHint, LoadMoreRow, MarkAllReadButton, SkeletonCard, WindowSegments, laneHue, useBreathing, useFreshIds } from "./board-parts";
+import { ArchiveAllButton, CardCell, HoverPressable, NewCardsDot, NewCardsPill, RollingCount, RoundButton, LaneFilterHint, LoadMoreRow, MarkAllReadButton, SkeletonCard, WindowSegments, laneHue, useBreathing, useFreshIds } from "./board-parts";
 import { liftStyle, surfaceLift } from "../cards/surface-lift";
 import { pillDirection, useSeenCards, useTrackNewCards, useUnseenCards, useUnseenLanes } from "./new-cards";
 import { LaneMotionLayer, LaneMotionProvider, scrollNode, useLaneCovered, useLaneMotion, useLaneTarget } from "./lane-motion";
@@ -563,6 +563,42 @@ export function PhoneBoard(props: {
               strings={strings}
               onPress={() => board.readAll?.()}
               testID="phone-read-all-review"
+            />
+          </View>
+        );
+      })() : null}
+      {lane === "done" && board.archive ? (() => {
+        const archivableDoneCards = lanes.done.cards.filter(isArchivableDoneCard);
+        if (archivableDoneCards.length === 0) return null;
+        const archiveAllPending = Boolean(board.archiveAllPending || archivableDoneCards.some((card) => board.archive?.pending(card.id)));
+        return (
+          <View
+            testID="phone-done-actions"
+            style={{
+              minHeight: 48,
+              flexDirection: "row",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: 10,
+              paddingHorizontal: 12,
+              borderBottomWidth: HAIRLINE,
+              borderBottomColor: colors.border,
+            }}
+          >
+            <View style={{ flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 8 }}>
+              <StatusIcon kind="done" size={13} theme={theme} animated={false} />
+              <Text numberOfLines={1} style={{ fontSize: F.sm, color: colors.foregroundMuted }}>
+                {strings.archiveAllSummary(archivableDoneCards.length)}
+              </Text>
+            </View>
+            <ArchiveAllButton
+              count={archivableDoneCards.length}
+              pending={archiveAllPending}
+              compact
+              theme={theme}
+              strings={strings}
+              onPress={() => board.archiveAll?.()}
+              testID="phone-archive-all-done"
             />
           </View>
         );

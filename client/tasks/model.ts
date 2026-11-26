@@ -307,6 +307,11 @@ export function isUnreadReviewCard(card: Pick<TaskCard, "lane" | "status" | "rea
   return card.lane === "review" && card.status === "unread" && card.readable === true && !card.subagent;
 }
 
+/** A finished task in the Done lane that can be batch-archived (excludes already-archived cards and provider subagents). */
+export function isArchivableDoneCard(card: Pick<TaskCard, "lane" | "archived" | "subagent">): boolean {
+  return card.lane === "done" && !card.archived && !card.subagent;
+}
+
 /** One lane's cards in display order, with what the done and archived lanes still have to load. */
 export interface LaneModel {
   id: LaneId;
