@@ -5,15 +5,16 @@ import {
   Text,
   View,
   type LayoutChangeEvent,
-  type TextLayoutEventData,
-  type NativeSyntheticEvent,
+  type TextLayoutEvent,
   type TextStyle,
   type ViewStyle,
 } from "react-native";
 import { space, type ExtendedThemeTokens } from "../components/theme-tokens";
 import { diffLineNumbers } from "../components/diff-lines";
 import { lineNumberWidth } from "../components/syntax-highlight";
-import { selectionCodeText } from "../components/selection-actions";
+import { selectionCodeText, selectionSurface } from "../components/selection-actions";
+import { surfaceProps } from "../components/view-props";
+import { bindSelectionScopeElement, selectionScopeDataSet, SelectionTranslationContext } from "../translation/selection";
 import { unselectable } from "../components/selection";
 import { useEnhancerPreferences } from "../preferences";
 import { usePreviewWraps } from "./hover-preview";
@@ -136,9 +137,17 @@ interface PreviewLinesProps {
  * numbers are placed from where that text laid each source line out.
  */
 export function PreviewLines(props: PreviewLinesProps) {
+  const scope = useContext(SelectionTranslationContext);
+  const bindScope = useCallback((node: View | null) => {
+    if (!node || !scope) return;
+    bindSelectionScopeElement(node, scope);
+    return () => bindSelectionScopeElement(node, null);
+  }, [scope]);
   if (Platform.OS !== "web" && (props.lines.length > TEXT_CHUNK_LINES * 4 || props.text.length > TEXT_CHUNK_CHARS)) {
     return <ChunkedPreviewLines {...props} />;
   }
+  const scopeData = Platform.OS === "web" ? selectionScopeDataSet(scope) : null;
+  if (scopeData) return <View ref={bindScope} {...surfaceProps(selectionSurface, { dataSet: scopeData } as never)}><PreviewLinesBody {...props} /></View>;
   return <PreviewLinesBody {...props} />;
 }
 
@@ -305,7 +314,7 @@ function PreviewLinesBody({ text, lines, style: given, tokens: rowTokens, render
     if (sameLineTops(shown.current.tops, next) && (nextBottom === null || Math.abs(nextBottom - shown.current.bottom) < 0.5)) return;
     setMeasured({ tops: next, bottom: nextBottom });
   }, []);
-  const onTextLayout = useCallback((event: NativeSyntheticEvent<TextLayoutEventData>) => {
+  const onTextLayout = useCallback((event: TextLayoutEvent) => {
     const visual = (event.nativeEvent.lines as ReadonlyArray<VisualLine | string>)
       .map((line) => (typeof line === "string" ? { text: line } : line));
     place(sourceLineTops(visual, lineHeight, lines.length), layoutBottom(visual, lineHeight));
@@ -346,6 +355,8 @@ function PreviewLinesBody({ text, lines, style: given, tokens: rowTokens, render
         // whole column, never an individual number. Numbers stay out of copies.
         <View ref={selection.gutterRef} {...selection.gutterProps} pointerEvents="box-only"
           testID="preview-line-numbers" style={[styles.gutter, { width: gutter }, !wraps && stickyGutter(tokens)]}>
+          {selection.band ? <View testID="preview-gutter-selection" pointerEvents="none"
+            style={[styles.stripe, selection.band, { backgroundColor: tokens.textSelection }]} /> : null}
           {numbers.map((number, index) => (
             <Text key={index} selectable={false}
               style={[styles.number, {
@@ -379,7 +390,7 @@ function PreviewLinesBody({ text, lines, style: given, tokens: rowTokens, render
         ) : null}
         {selection.selectionStyle ? (
           <View testID="preview-line-selection" pointerEvents="none" style={[
-            styles.stripe, selection.selectionStyle, { backgroundColor: tokens.accentBg },
+            styles.stripe, selection.selectionStyle, { backgroundColor: tokens.textSelection },
           ]} />
         ) : null}
         {body}

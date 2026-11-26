@@ -1,12 +1,23 @@
 import type { TasksLanguage } from "../i18n";
-import type { StatusKind, WorkspaceKind } from "../model";
+import type { PermissionKind, StatusKind, TaskPermission, WorkspaceKind } from "../model";
 
 /** The cards' own words; Chinese follows the prototype. */
 const en = {
+  questions: {
+    question: (n: number) => `Question ${n}`, answered: (n: number, total: number) => `Answered ${n} / ${total}`, next: "Next", previous: "Previous question",
+    title: "Answer questions", single: "Select one", multiple: "Select multiple", text: "Your answer", other: "Other answer",
+    optional: "Optional; you may submit an empty answer", submit: "Submit answers", close: "Close", sent: "Answer submitted", expandPreview: "Show more", collapsePreview: "Show less",
+    changed: "This request changed or closed. Close this dialog and view the current question.",
+    unsupported: "This request cannot be answered reliably through the host form protocol. No answer will be submitted here.",
+    codexComma: "Codex synchronous multi-select answers cannot contain commas: the host would split your custom answer.",
+    failed: (error: string) => `Could not send answer: ${error}`,
+    context: "Agent note", contextLoading: "Reading the agent's note", contextError: "Couldn't read the agent's note", contextRetry: "Retry", copyContext: "Copy agent note",
+  },
   searchHits: {
     fields: { title: "Title", prompt: "First message", conversation: "Conversation", pr: "PR", label: "Label", branch: "Branch", folder: "Folder", project: "Project", workspace: "Workspace", path: "Path", model: "Model ID", id: "Task ID" },
     viewAll: (count: number) => `View all ${count} matches`,
     more: (count: number) => `+${count} matches`,
+    countOnly: (count: number) => `${count} matches`,
     count: (count: number, query: string) => `${count} matches · “${query}”`,
     dialog: "Search matches",
     close: "Close matches",
@@ -18,6 +29,11 @@ const en = {
     conversationUnavailable: "Conversation unavailable",
   },
   openInWorkspace: "Open in workspace",
+  awaitingAnswer: "Awaiting answer",
+  awaitingApproval: "Awaiting approval",
+  awaitingReview: "Awaiting review",
+  planRequest: "Plan",
+  viewPlan: "View plan",
   openTab: "Open",
   stop: "Stop",
   stopChildren: "Stop subtasks",
@@ -25,8 +41,12 @@ const en = {
   confirmStopAll: "Stop all",
   stopOptions: "Stop options",
   stopOnlyThis: "Stop only this task",
+  archiveOptions: "Archive options",
+  archiveOnly: "Archive only this task",
+  archiveWithChildren: "Archive with subtasks",
   stopWithChildren: "Stop with subtasks",
   markRead: "Mark as read",
+  markUnread: "Keep unread",
   copySessionId: "Copy session ID",
   copyTitle: "Copy title",
   renameTitle: "Edit title",
@@ -35,6 +55,8 @@ const en = {
   undoTitle: "Restore previous title",
   generateTitle: "Generate title",
   dismissTitleError: "Dismiss title update message",
+  dismissTaskError: "Dismiss error message",
+  dismissTaskErrorFailed: "Could not dismiss error message",
   autoTitleFailed: (error: string) => `Title update: ${error}`,
   titleLabel: "Title",
   saveTitle: "Save",
@@ -72,6 +94,7 @@ const en = {
   contextTokens: (used: string, max: string) => `${used} / ${max} tokens`,
   sessionCost: (cost: string) => `Session cost ${cost}`,
   starting: "Starting",
+  todoHint: (label: string, expanded: boolean) => `${label} · ${expanded ? "Click to collapse" : "Click to expand list"}`,
   subtasks: (total: number, parts: string) => `${total} ${total === 1 ? "subtask" : "subtasks"}: ${parts}`,
   status: {
     needs_input: "needs input",
@@ -103,6 +126,7 @@ const en = {
     subtasksStarted: "Subtasks started",
     subtasksRunning: "Subtasks have run",
     waitingSince: "Waiting for input since",
+    waitStarted: "Waiting since",
     lastTurn: "Last turn took",
     updated: "Last updated",
   },
@@ -249,10 +273,21 @@ const en = {
 type CardStrings = typeof en;
 
 const zh: CardStrings = {
+  questions: {
+    question: (n) => `问题 ${n}`, answered: (n, total) => `已回答 ${n} / ${total}`, next: "下一个", previous: "上一个问题",
+    title: "回答问题", single: "单选", multiple: "多选", text: "填写回答", other: "其他回答",
+    optional: "此项可选，可以提交空答案", submit: "提交答案", close: "关闭", sent: "回答已提交", expandPreview: "展开全文", collapsePreview: "收起",
+    changed: "问题已变更或关闭，请关闭弹窗后重新查看当前问题。",
+    unsupported: "宿主表单协议无法可靠表达此请求，当前弹窗不会提交答案。",
+    codexComma: "Codex 同步多选的自定义回答不能包含逗号，宿主会将回答拆分。",
+    failed: (error) => `发送回答失败：${error}`,
+    context: "Agent 说明", contextLoading: "正在读取 Agent 说明", contextError: "没能读取 Agent 说明", contextRetry: "重试", copyContext: "复制 Agent 说明",
+  },
   searchHits: {
     fields: { title: "标题", prompt: "首条消息", conversation: "会话内容", pr: "PR", label: "标签", branch: "分支", folder: "文件夹", project: "项目", workspace: "工作区", path: "路径", model: "模型 ID", id: "任务 ID" },
     viewAll: (count) => `查看全部 ${count} 处命中`,
     more: (count) => `+${count} 处命中`,
+    countOnly: (count) => `${count} 处命中`,
     count: (count, query) => `${count} 处命中 ·「${query}」`,
     dialog: "搜索命中",
     close: "收起命中",
@@ -264,6 +299,11 @@ const zh: CardStrings = {
     conversationUnavailable: "会话内容无法读取",
   },
   openInWorkspace: "在工作区中打开",
+  awaitingAnswer: "待回答",
+  awaitingApproval: "待授权",
+  awaitingReview: "待确认",
+  planRequest: "计划",
+  viewPlan: "查看计划",
   openTab: "打开",
   stop: "停止",
   stopChildren: "停止子任务",
@@ -271,8 +311,12 @@ const zh: CardStrings = {
   confirmStopAll: "确认停止全部",
   stopOptions: "停止选项",
   stopOnlyThis: "仅停止此任务",
+  archiveOptions: "归档选项",
+  archiveOnly: "仅归档当前卡片",
+  archiveWithChildren: "同时归档所有子任务",
   stopWithChildren: "连同子任务一起停止",
   markRead: "标为已读",
+  markUnread: "保持未读",
   copySessionId: "复制会话 ID",
   copyTitle: "复制标题",
   renameTitle: "修改标题",
@@ -281,6 +325,8 @@ const zh: CardStrings = {
   undoTitle: "恢复原标题",
   generateTitle: "生成标题",
   dismissTitleError: "关闭标题更新提示",
+  dismissTaskError: "关闭错误提示",
+  dismissTaskErrorFailed: "关闭错误提示失败",
   autoTitleFailed: (error) => `标题更新：${error}`,
   titleLabel: "标题",
   saveTitle: "保存",
@@ -313,6 +359,7 @@ const zh: CardStrings = {
   contextTokens: (used, max) => `${used} / ${max} tokens`,
   sessionCost: (cost) => `会话费用 ${cost}`,
   starting: "启动中",
+  todoHint: (label, expanded) => `${label} · ${expanded ? "点按收起" : "点按展开清单"}`,
   subtasks: (total, parts) => `${total} 个子任务：${parts}`,
   status: {
     needs_input: "待输入",
@@ -343,6 +390,7 @@ const zh: CardStrings = {
     subtasksStarted: "子任务开始",
     subtasksRunning: "子任务已运行",
     waitingSince: "开始等待输入",
+    waitStarted: "开始等待",
     lastTurn: "上一轮耗时",
     updated: "最后更新",
   },
@@ -495,4 +543,25 @@ export function subtaskSummary(children: readonly { status: StatusKind }[], lang
     .map((kind) => `${counts.get(kind)} ${strings.status[kind]}`)
     .join(" · ");
   return strings.subtasks(children.length, parts);
+}
+
+/**
+ * What a waiting request's divider says it waits for: a question, or an
+ * unknown request answered in the tab, waits for an answer; a plan for its
+ * review (Implement or Reject); a tool or a mode change for approval.
+ */
+export function requestDividerLabel(kind: PermissionKind, strings: CardStrings): string {
+  if (kind === "question" || kind === "other") return strings.awaitingAnswer;
+  if (kind === "plan") return strings.awaitingReview;
+  return strings.awaitingApproval;
+}
+
+/**
+ * A request's title as the card and the details show it. A plan arrives
+ * named after its tool (Claude's "ExitPlanMode", Codex's "Plan"), which says
+ * nothing in either language, so it reads as the plan it is.
+ */
+export function requestTitle(permission: Pick<TaskPermission, "kind" | "title">, strings: CardStrings): string {
+  if (permission.kind === "plan" && (permission.title === "ExitPlanMode" || permission.title === "Plan")) return strings.planRequest;
+  return permission.title;
 }

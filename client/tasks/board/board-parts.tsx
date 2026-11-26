@@ -1,15 +1,17 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
-import { Animated, Platform, Pressable, View, type StyleProp, type TextStyle, type ViewStyle } from "react-native";
-import { Icon } from "@getpaseo/plugin/client/react-native";
+import React, { memo, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
+import { Animated, Platform, Pressable, StyleSheet, View, type StyleProp, type TextStyle, type ViewStyle } from "react-native";
+import { Icon } from "@getpaseo/plugin/client/ui";
 import type { PluginTheme } from "@getpaseo/plugin";
 import { TaskText as Text, HOST_FONT as F, HOST_LINE, useTasksFontScale, taskControlHeight } from "../typography";
 import type { DoneWindow } from "../../../shared/tasks-settings";
 import { DONE_WINDOWS } from "../../../shared/tasks-settings";
 import { useHover } from "../../ui/use-hover";
+import { hoverFill } from "../hover-fill";
 import { useReducedMotion } from "../../ui/use-reduced-motion";
-import { liftStyle, scaleStyle, surfaceLift, type LiftSize } from "../cards/surface-lift";
+import { liftStyle, scaleStyle, surfaceLift, type LiftSize, type PressInput } from "../cards/surface-lift";
 import { usePressCue } from "../cards/action-pressable";
 import { TaskCardView, taskTokens, type CardCallbacks } from "../cards";
+import { useTodoSummary } from "../data/todo-summary";
 import { SpinnerRing } from "../cards/status-icon";
 import { tipProps } from "../cards/card-hints";
 import type { LaneId, TaskCard } from "../model";
@@ -21,6 +23,7 @@ import { useCardMotion } from "./lane-motion";
 import { useFlash } from "./breathing";
 import { useNewCardOutline } from "./new-cards";
 import { withAlpha } from "../../components/theme-tokens";
+import { CARD_RADIUS } from "../../ui/tokens/card";
 
 const nativeDriver = Platform.OS !== "web";
 
@@ -137,7 +140,7 @@ export function Segments<T extends string>(props: {
         const on = window === props.value;
         const inner = (props.stretch ? taskControlHeight(36, scale) : outer) - 6;
         return (
-          <HoverPressable
+          <HoverPressable hoverTheme={props.theme}
             key={window}
             accessibilityRole="radio"
             accessibilityState={{ selected: on }}
@@ -174,20 +177,34 @@ export { useBreathing } from "./breathing";
 
 const SKELETON_WIDTHS = ["78%", "62%", "70%"] as const;
 
-/** A first-load placeholder card (prototype 05 D). */
-export function SkeletonCard({ theme, opacity, index }: { theme: PluginTheme; opacity: Animated.Value; index: number }) {
+/** A first-load placeholder matching the card's metadata, title, pills and footer. */
+export function SkeletonCard({ theme, opacity, index, compact = false }: { theme: PluginTheme; opacity: Animated.Value; index: number; compact?: boolean }) {
   const colors = theme.colors;
+  const scale = useTasksFontScale();
   const bar = { borderRadius: 2, backgroundColor: colors.surface2 };
+  const icon = compact ? 18 : 14;
+  const pill = Math.round((compact ? 24 : 20) * scale);
+  const rowGap = compact ? 12 : 10;
   return (
     <Animated.View
-      style={{ opacity, padding: 10, gap: 9, borderWidth: HAIRLINE, borderColor: colors.border, borderRadius: 6, backgroundColor: colors.surface0 }}
+      style={{ opacity, paddingHorizontal: compact ? 14 : 12, paddingTop: compact ? 12 : 10, paddingBottom: compact ? 14 : 12, borderWidth: HAIRLINE, borderColor: colors.border, borderRadius: CARD_RADIUS, backgroundColor: colors.surface0 }}
     >
-      <View style={[bar, { height: 10, width: SKELETON_WIDTHS[index % SKELETON_WIDTHS.length] }]} />
-      <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
-        <View style={[bar, { width: 16, height: 16, borderRadius: 4 }]} />
-        <View style={[bar, { height: 8, width: "45%" }]} />
+      <View style={{ flexDirection: "row", alignItems: "center", gap: 6, height: Math.round(HOST_LINE.sm * scale) }}>
+        <View style={[bar, { width: icon, height: icon, borderRadius: 4 }]} />
+        <View style={[bar, { height: 8, width: "48%" }]} />
       </View>
-      <View style={[bar, { height: 8, width: "30%" }]} />
+      <View style={{ flexDirection: "row", alignItems: "center", gap: 6, marginTop: compact ? 6 : 5, height: Math.round(HOST_LINE.base * scale) }}>
+        <View style={[bar, { width: icon, height: icon, borderRadius: icon / 2 }]} />
+        <View style={[bar, { height: 10, width: SKELETON_WIDTHS[index % SKELETON_WIDTHS.length] }]} />
+      </View>
+      <View style={{ flexDirection: "row", gap: 4, marginTop: rowGap }}>
+        <View style={[bar, { height: pill, width: "42%", borderRadius: pill / 2 }]} />
+        <View style={[bar, { height: pill, width: "16%", borderRadius: pill / 2 }]} />
+        <View style={[bar, { height: pill, width: "14%", borderRadius: pill / 2 }]} />
+      </View>
+      <View style={{ height: Math.round(HOST_LINE.sm * scale), justifyContent: "center", marginTop: rowGap }}>
+        <View style={[bar, { height: 8, width: "24%" }]} />
+      </View>
     </Animated.View>
   );
 }
@@ -232,7 +249,7 @@ export function LoadMoreRow(props: {
       <Text style={{ flex: 1, fontSize: F.sm, color: colors.foregroundMuted, fontVariant: ["tabular-nums"] }}>
         {props.sortedLoadedOnly ? props.strings.sortedAmong(props.shown) : props.strings.shown(props.shown)}
       </Text>
-      <HoverPressable
+      <HoverPressable hoverTheme={props.theme}
         accessibilityRole="button"
         disabled={props.loading}
         onPress={props.onPress}
@@ -333,16 +350,17 @@ export function HoverPressable(
     /** What the lift treats it as (`LiftSize`); false keeps its size on every press. */
     lift?: boolean | LiftSize;
     /** `pressed` is the press cue: at once for a pointer, after a still 100 ms for a finger (`usePressCue`). */
-    style(hovered: boolean, pressed: boolean): StyleProp<ViewStyle>;
+    hoverTheme: PluginTheme;
+    style(hovered: boolean, pressed: boolean, input: PressInput): StyleProp<ViewStyle>;
   },
 ) {
-  const { style, onPress, onLongPress, onPressIn, onPressOut, onTouchStart, onTouchMove, onTouchEnd, onTouchCancel, lift: liftAs = true, ...rest } = props;
+  const { style, onPress, onLongPress, onPressIn, onPressOut, onTouchStart, onTouchMove, onTouchEnd, onTouchCancel, lift: _lift, hoverTheme, ...rest } = props;
   const { hovered, hoverProps } = useHover();
-  const reduced = useReducedMotion();
   const press = usePressCue(hovered, !rest.disabled);
-  const visual = style(hovered, press.pressed);
-  const lift = scaleStyle(liftAs === false ? 1 : surfaceLift(hovered, press.pressed, reduced, liftAs === true ? "control" : liftAs, press.input).scale);
-  const flat = visual && typeof visual === "object" && !Array.isArray(visual) ? { ...visual, ...lift } : [visual, lift];
+  const visual = StyleSheet.flatten(style(false, false, press.input));
+  const resting = visual.backgroundColor as string | undefined;
+  const base = resting && resting !== "transparent" ? resting : hoverTheme.colors.surface0;
+  const flat = { ...visual, backgroundColor: hoverFill(base, hoverTheme.colors.foreground, hovered && !rest.disabled, press.pressed, resting ?? "transparent") };
   return (
     <Pressable
       {...rest}
@@ -401,30 +419,114 @@ export interface CardCellProps {
 
 /**
  * One card in a lane: the card, its fade-in, its lane motion, and its project icon request.
- * It re-renders with the board, not with the clock; `TaskCardView`'s own
- * memo skips the cards a board update does not change.
+ * It reads what this card shows from the board and hands it on as plain
+ * values: a board update (a page landing, a loading flag, a read elsewhere)
+ * gives every lane's rows a new board, and the memoized cell under it draws
+ * again only when a value of its own changed. `TaskCardView`'s own memo then
+ * skips the clock ticks that do not change its text.
  */
 export function CardCell(props: CardCellProps) {
-  const { card, board, register } = props;
+  const { card, board } = props;
+  const query = board.params.query.trim();
+  const parent = card.subagent && card.parent ? board.cardById(card.parent.id) : undefined;
+  return (
+    <CardCellView
+      card={card}
+      theme={props.theme}
+      compact={props.compact}
+      focused={props.focused ?? false}
+      current={props.current}
+      fresh={props.fresh}
+      register={props.register}
+      copy={props.copy ?? false}
+      callbacks={props.callbacks ?? board.callbacks}
+      paseo={board.paseo}
+      hostId={board.hostId}
+      visible={board.visible}
+      todoOn={board.visible && !card.subagent && !card.closed && board.fields.plan}
+      query={query}
+      searchStatus={board.searchStatus}
+      searchPromptUnavailable={Boolean(card.closed || card.subagent && (!card.parent || !parent || parent.closed))}
+      requestIcon={board.requestIcon}
+      fields={board.fields}
+      titleLines={board.titleLines === "all" ? null : Number(board.titleLines)}
+      todoExpanded={board.expandedTodo.has(card.id)}
+      setTodoExpanded={board.setTodoExpanded}
+      subtasksExpanded={board.expandedSubtasks.has(card.id)}
+      setSubtasksExpanded={board.setSubtasksExpanded}
+      permissionButtons={board.buttonsFor(card)}
+      stopPhase={board.stop.phase(card.id)}
+      readPending={board.read.pending(card.id)}
+      unreadPending={board.unread?.pending(card.id) ?? false}
+      unarchivePending={board.unarchive.pending(card.id)}
+      archivePending={board.archive.pending(card.id)}
+      highlighted={board.highlighted === card.id}
+      clock={board.clock}
+      language={board.language}
+    />
+  );
+}
+
+interface CardCellViewProps {
+  card: TaskCard;
+  theme: PluginTheme;
+  compact: boolean;
+  focused: boolean;
+  current?: boolean;
+  fresh: boolean;
+  register?(agentId: string, node: unknown): void;
+  copy: boolean;
+  callbacks: CardCallbacks;
+  paseo: BoardController["paseo"];
+  hostId: string;
+  visible: boolean;
+  todoOn: boolean;
+  /** The board's search, trimmed; empty when it does not search. */
+  query: string;
+  searchStatus: BoardController["searchStatus"];
+  searchPromptUnavailable: boolean;
+  requestIcon: BoardController["requestIcon"];
+  fields: BoardController["fields"];
+  titleLines: number | null;
+  todoExpanded: boolean;
+  setTodoExpanded: BoardController["setTodoExpanded"];
+  subtasksExpanded: boolean;
+  setSubtasksExpanded: BoardController["setSubtasksExpanded"];
+  permissionButtons: ReturnType<BoardController["buttonsFor"]>;
+  stopPhase: ReturnType<BoardController["stop"]["phase"]>;
+  readPending: boolean;
+  unreadPending: boolean;
+  unarchivePending: boolean;
+  archivePending: boolean;
+  highlighted: boolean;
+  clock: BoardController["clock"];
+  language: BoardController["language"];
+}
+
+const noSubscription = () => () => {};
+
+const CardCellView = memo(function CardCellView(props: CardCellViewProps) {
+  const { card, register, query, searchStatus } = props;
+  const todo = useTodoSummary(props.paseo, card.id, props.todoOn, !props.copy);
   const searchPrompt = useSyncExternalStore(
-    board.params.query.trim() ? board.searchStatus.subscribe : () => () => {},
-    () => board.params.query.trim() ? board.searchStatus.prompt(card) : undefined,
+    query ? searchStatus.subscribe : noSubscription,
+    () => query ? searchStatus.prompt(card) : undefined,
     () => undefined,
   );
   const nodeRef = useRef<View>(null);
   const [arrival, setArrival] = useState(0);
   const onArrive = useCallback(() => setArrival((key) => key + 1), []);
-  const flashOpacity = useFlash(board.visible ? arrival : 0);
+  const flashOpacity = useFlash(props.visible ? arrival : 0);
   // A new task, once seen: its outline breathes in its lane's colour.
-  const outline = useNewCardOutline(board.hostId, card, props.copy ?? false);
-  const motion = useCardMotion(card.id, nodeRef, props.copy ?? false, onArrive);
+  const outline = useNewCardOutline(props.hostId, card, props.copy);
+  const motion = useCardMotion(card.id, nodeRef, props.copy, onArrive);
   useEffect(() => {
     if (!register) return;
     register(card.id, nodeRef.current);
     return () => register(card.id, null);
   }, [register, card.id]);
   // Rendered cards only, once per project while the icon is missing; the data layer dedupes the fetch.
-  const { requestIcon } = board;
+  const { requestIcon } = props;
   const projectId = card.location.projectIcon === null ? card.location.projectId : null;
   useEffect(() => {
     if (requestIcon && projectId) requestIcon(projectId);
@@ -436,29 +538,33 @@ export function CardCell(props: CardCellProps) {
         <EnterOnMount enabled={props.fresh}>
           <TaskCardView
             card={card}
-            searchQuery={board.params.query.trim().toLowerCase()}
+            todo={todo}
+            searchQuery={query.toLowerCase()}
             searchPrompt={searchPrompt}
-            searchPromptUnavailable={Boolean(card.closed || card.subagent && (!card.parent || !board.cardById(card.parent.id) || board.cardById(card.parent.id)!.closed))}
-            fields={board.fields}
-            titleLines={board.titleLines === "all" ? null : Number(board.titleLines)}
+            searchPromptUnavailable={props.searchPromptUnavailable}
+            fields={props.fields}
+            titleLines={props.titleLines}
             theme={props.theme}
             compact={props.compact}
-            subtasksExpanded={board.expandedSubtasks.has(card.id)}
-            onSubtasksExpandedChange={board.setSubtasksExpanded}
-            permissionButtons={board.buttonsFor(card)}
-            stopPhase={board.stop.phase(card.id)}
-            readPending={board.read.pending(card.id)}
-            unarchivePending={board.unarchive.pending(card.id)}
-            archivePending={board.archive.pending(card.id)}
-            focused={props.focused ?? false}
+            todoExpanded={props.todoExpanded}
+            onTodoExpandedChange={props.setTodoExpanded}
+            subtasksExpanded={props.subtasksExpanded}
+            onSubtasksExpandedChange={props.setSubtasksExpanded}
+            permissionButtons={props.permissionButtons}
+            stopPhase={props.stopPhase}
+            readPending={props.readPending}
+            unreadPending={props.unreadPending}
+            unarchivePending={props.unarchivePending}
+            archivePending={props.archivePending}
+            focused={props.focused}
             focusId={props.copy ? undefined : `task-card-${card.id}`}
             current={props.current}
-            highlighted={board.highlighted === card.id}
-            clock={board.clock}
-            language={board.language}
-            animated={board.visible}
-            hostId={board.hostId}
-            {...(props.callbacks ?? board.callbacks)}
+            highlighted={props.highlighted}
+            clock={props.clock}
+            language={props.language}
+            animated={props.visible}
+            hostId={props.hostId}
+            {...props.callbacks}
           />
         </EnterOnMount>
         <Animated.View
@@ -476,7 +582,7 @@ export function CardCell(props: CardCellProps) {
       </Animated.View>
     </View>
   );
-}
+});
 
 /**
  * The ids a lane has not shown before, so only a card that arrives (a status
@@ -710,6 +816,7 @@ export function RollingTotal(props: { board: BoardController; style: StyleProp<T
  */
 export function RoundButton(props: {
   icon: string;
+  iconContent?: ReactNode;
   label: string;
   theme: PluginTheme;
   onPress(): void;
@@ -720,6 +827,7 @@ export function RoundButton(props: {
   testID?: string;
   /** A toggle's state, read out as selected. */
   selected?: boolean;
+  toggle?: boolean;
   disabled?: boolean;
   /** Struck through, as Lucide's "-off" icons: a toggle that is off. */
   slashed?: boolean;
@@ -741,8 +849,8 @@ export function RoundButton(props: {
   const icon = props.iconSize ?? Math.round(size / 2);
   const { hovered, hoverProps } = useHover();
   const press = usePressCue(hovered, !props.disabled);
-  const lift = surfaceLift(hovered, press.pressed, undefined, "control", press.input);
-  const line = props.quietOutline && Platform.OS === "web" && !hovered ? "transparent" : props.active ? colors.accent : colors.border;
+  const line = props.quietOutline && Platform.OS === "web" ? "transparent" : props.active ? colors.accent : colors.border;
+  const fill = hoverFill(colors.surface0, colors.foreground, hovered && !props.disabled, press.pressed, "transparent");
   return (
     <Pressable
       accessibilityRole="button"
@@ -760,23 +868,23 @@ export function RoundButton(props: {
       {...hoverProps}
       hitSlop={pad || Platform.OS === "web" ? 0 : 4}
       testID={props.testID}
-      style={[{ width: size + 2 * pad, height: size + 2 * pad, alignItems: "center", justifyContent: "center", opacity: props.disabled ? 0.4 : 1 }, scaleStyle(lift.scale), props.style]}
+      style={[{ width: size + 2 * pad, height: size + 2 * pad, alignItems: "center", justifyContent: "center", opacity: props.disabled ? 0.4 : 1 }, props.style]}
     >
       <View
         style={{
           width: size,
           height: size,
-          borderRadius: props.quietOutline && Platform.OS === "web" ? 7 : size / 2,
+          borderRadius: size / 2,
           borderWidth: props.borderless ? 0 : HAIRLINE,
           borderColor: line,
-          ...(props.disabled ? { boxShadow: undefined } : liftStyle(() => taskTokens(props.theme), lift, props.borderless ? {} : { border: line, hued: !!props.active })),
+          backgroundColor: fill,
           alignItems: "center",
           justifyContent: "center",
         }}
       >
-        {props.busy ? <SpinnerRing size={icon} color={colors.foreground} testID={props.testID ? `${props.testID}-spinner` : undefined} /> : <Icon name={props.icon} size={icon} color={props.borderless && props.active ? colors.accent : colors.foreground} />}
-        {props.slashed ? <SlashMark size={icon} color={colors.foreground} gap={colors.surface0} /> : null}
-        <CornerBadge count={props.cornerBadge ?? 0} theme={props.theme} style={{ bottom: 0, right: 0 }} testID={props.testID ? `${props.testID}-count` : undefined} />
+        {props.busy ? <SpinnerRing size={icon} color={colors.foreground} testID={props.testID ? `${props.testID}-spinner` : undefined} /> : props.iconContent ?? <Icon name={props.icon} size={icon} color={props.borderless && props.active ? colors.accent : colors.foreground} />}
+        {props.slashed ? <SlashMark size={icon} color={colors.foreground} gap={fill === "transparent" ? colors.surface0 : fill} /> : null}
+        <CornerBadge count={props.cornerBadge ?? 0} theme={props.theme} ringColor={fill === "transparent" ? colors.surface0 : fill} style={{ bottom: 0, right: 0 }} testID={props.testID ? `${props.testID}-count` : undefined} />
       </View>
       {props.badge ? (
         <View
@@ -808,7 +916,7 @@ export function RoundButton(props: {
  * filter count, and the cards a switch leaves off the board. Placed by
  * its parent (`style`), in a 1 px ring of the surface. Nothing at zero.
  */
-export function CornerBadge(props: { count: number; theme: PluginTheme; style: { top?: number; right?: number; bottom?: number; left?: number }; testID?: string }) {
+export function CornerBadge(props: { count: number; theme: PluginTheme; ringColor?: string; style: { top?: number; right?: number; bottom?: number; left?: number }; testID?: string }) {
   const colors = props.theme.colors;
   const scale = useTasksFontScale();
   if (props.count <= 0) return null;
@@ -816,7 +924,7 @@ export function CornerBadge(props: { count: number; theme: PluginTheme; style: {
   return (
     <View
       pointerEvents="none"
-      style={{ position: "absolute", ...props.style, minWidth: size, height: size, paddingHorizontal: 2, borderRadius: size / 2, backgroundColor: colors.foregroundMuted, borderWidth: 1, borderColor: colors.surface0, alignItems: "center", justifyContent: "center" }}
+      style={{ position: "absolute", ...props.style, minWidth: size, height: size, paddingHorizontal: 2, borderRadius: size / 2, backgroundColor: colors.foregroundMuted, borderWidth: 1, borderColor: props.ringColor ?? colors.surface0, alignItems: "center", justifyContent: "center" }}
     >
       <Text testID={props.testID} style={{ fontSize: 8, lineHeight: 10, includeFontPadding: false, fontWeight: "600", fontVariant: ["tabular-nums"], color: colors.surface0 }}>
         {props.count > 99 ? "99+" : props.count}

@@ -4,7 +4,7 @@ import { LANE_WIDTHS, type LaneWidth } from "../../../shared/tasks-settings";
 import { BrandMark, ProjectIcon, TagMark, foldPath, taskTokens, tildePath } from "../cards";
 import { FILTER_ICONS, type ActiveChip, type ChipGroup, type FilterOption, type ProjectOption, type ShownFilterOptions } from "./filter-options";
 import type { BoardParams } from "./params";
-import type { MenuItem, MenuSection } from "./menu-model";
+import { MENU, type MenuItem, type MenuSection } from "./menu-model";
 import { NAME_KEYS, sameSort, type BoardSort, type SortDirection, type SortKey } from "./sort";
 import { sortOrderLabel, type BoardStrings } from "./strings";
 import { LaneWidthMark } from "./lane-width-mark";
@@ -112,14 +112,14 @@ export const PROJECT_MENU_WIDTH = 280;
  * width less the row's insets and padding, the icon, the count, the check
  * and the gaps between them.
  */
-const PROJECT_PATH_COLUMNS = Math.floor((PROJECT_MENU_WIDTH - 2 * 6 - 2 * 8 - 16 - 3 * 8 - 20 - 14) / 6);
+const PROJECT_PATH_COLUMNS = Math.floor((PROJECT_MENU_WIDTH - 2 * MENU.inset - 2 * 8 - 16 - 3 * 8 - 20 - 14) / 6);
 
 /**
  * One row per project, its icon leading and its folder under its name, home
  * as "~" and a long middle folded to "…/" (a web Text cannot ellipsize at
  * the head or middle); a click picks or drops all its workspaces.
  */
-export function projectMenuSections(options: ShownFilterOptions, strings: BoardStrings, hostId: string, toggle: (project: ProjectOption) => void): MenuSection[] {
+export function projectMenuSections(options: ShownFilterOptions, strings: BoardStrings, hostId: string, toggle: (project: ProjectOption) => void, home?: string): MenuSection[] {
   const projects = options.projects;
   if (projects.length === 0) return emptySection(strings.noOptions);
   return [
@@ -128,7 +128,7 @@ export function projectMenuSections(options: ShownFilterOptions, strings: BoardS
       items: projects.map((project) => {
         const item = optionItem(project, () => toggle(project), { leading: <ProjectIcon location={project.group} size={16} hostId={hostId} /> });
         const path = project.group.projectPath;
-        return path ? { ...item, detail: foldPath(tildePath(path), PROJECT_PATH_COLUMNS, 1) } : item;
+        return path ? { ...item, detail: foldPath(tildePath(path, home), PROJECT_PATH_COLUMNS, 1) } : item;
       }),
     },
   ];

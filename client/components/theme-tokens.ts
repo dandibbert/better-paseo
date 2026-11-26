@@ -19,6 +19,7 @@ import {
 import { currentPlatform } from "../ui/tokens/platform";
 import { themeKey } from "../ui/tokens/theme-key";
 import { ensureEmbeddedFonts } from "./embed-fonts";
+import { applyTextSelection } from "./text-selection";
 import { useHostAppearance, type HostAppearance } from "../ui/tokens/host-appearance-shim";
 
 export type PluginSurfaceColors = PluginTheme["colors"];
@@ -107,10 +108,16 @@ export interface ExtendedThemeTokens {
   accentForeground: string;
   accentBg: string;
   /**
-   * A dragged Markdown range, such as table cells. Soft translucent grey from
-   * the foreground, with more opacity on dark surfaces to keep it visible.
+   * Selected text: a drag, a double-tapped block, a table cell range, a line
+   * range in a preview. A translucent light blue (`textSelectionFill`), drawn
+   * behind the text, never over it.
    */
-  selectionFill: string;
+  textSelection: string;
+  /**
+   * The same blue, opaque, for iOS native text: UIKit takes the tint and draws
+   * its own translucent highlight from it, and the handles in the full tint.
+   */
+  textSelectionTint: string;
   /**
    * Inline code where it cannot have a fill (iOS, Android): the colour picked
    * in the settings, an opaque dark grey by default. See `inlineCodeColor`.
@@ -141,12 +148,14 @@ export interface ExtendedThemeTokens {
   borderSubtle: string;
 
   /**
-   * A collapsed tool row at rest (docs/prototypes/quiet-tool-rows.md): one step
+   * A collapsed tool row at rest (https://github.com/RoundRedDot/better-paseo/blob/f2ab453297c4ccb88a08e2129af0cb3528c4e628/docs/prototypes/quiet-tool-rows.md): one step
    * behind the prose, so a run of calls reads as a quiet log. Hover, press and
    * an opened row go back to `foreground`, `foregroundMuted` and the status
    * colours; see `rowTone` in `disclosure-header.tsx`.
    */
   row: {
+    /** Translucent highlight over both plain and striped row backgrounds. */
+    hover: string;
     /** Command, path, verb: `foregroundMuted`. */
     target: string;
     /** A running row's target, halfway back to `foreground`. */
@@ -164,7 +173,7 @@ export interface ExtendedThemeTokens {
     outputText: string;
   };
 
-  /** Block details palette from docs/prototypes/block-details-sheet.md §5.6. */
+  /** Block details palette from https://github.com/RoundRedDot/better-paseo/blob/f2ab453297c4ccb88a08e2129af0cb3528c4e628/docs/prototypes/block-details-sheet.md §5.6. */
   details: {
     accentSoft: string;
     grabber: string;
@@ -280,6 +289,17 @@ export function mix(from: string, to: string, t: number): string {
   return `#${channel(a.r, b.r)}${channel(a.g, b.g)}${channel(a.b, b.b)}`;
 }
 
+/** Selected text's blue: #1C76F2, at 0.2 over white #D2E4FC. */
+const TEXT_SELECTION_BLUE = "#1C76F2";
+
+/**
+ * `textSelection` for a surface: a fixed light blue, a little stronger on a
+ * dark one so it still reads. The board resolves it without the chat's tokens.
+ */
+export function textSelectionFill(colors: Pick<PluginTheme["colors"], "surface0">): string {
+  return withAlpha(TEXT_SELECTION_BLUE, isDarkSurface(colors.surface0) ? 0.3 : 0.2);
+}
+
 function isDarkSurface(color: string): boolean {
   const rgba = parseColor(color);
   if (!rgba) return true;
@@ -351,7 +371,8 @@ export function buildThemeTokens(
     accent,
     accentForeground: colors.accentForeground,
     accentBg: withAlpha(accent, isDark ? 0.14 : 0.1),
-    selectionFill: withAlpha(fg, isDark ? 0.08 : 0.06),
+    textSelection: textSelectionFill(colors),
+    textSelectionTint: TEXT_SELECTION_BLUE,
     codeInline: inlineCodeColor(preferences.inlineCodeColor, fg, colors.surface0, isDark),
     // The host draws its own prompt bubble on its most raised surface; surface2
     // is the most raised one a plugin is given.
@@ -376,6 +397,7 @@ export function buildThemeTokens(
     borderSubtle,
 
     row: {
+      hover: withAlpha(fg, isDark ? 0.08 : 0.06),
       target: colors.foregroundMuted,
       targetActive: mix(colors.foregroundMuted, fg, 0.5),
       meta: mix(colors.foregroundMuted, colors.surface0, 0.1),
@@ -449,7 +471,9 @@ export function useThemeTokens(
     () => {
       // Inter is installed only once a reader picks it.
       ensureEmbeddedFonts(tokenPreferences, resolvedPlatform);
-      return buildThemeTokens(theme.colors, tokenPreferences, { platform, theme, appearance });
+      const tokens = buildThemeTokens(theme.colors, tokenPreferences, { platform, theme, appearance });
+      applyTextSelection(tokens.textSelection, resolvedPlatform === "web");
+      return tokens;
     },
     // `theme` is read through `key`; its identity is exactly what must not count.
     [key, tokenPreferences, platform, appearance],

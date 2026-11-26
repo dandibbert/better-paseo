@@ -9,7 +9,7 @@ vi.mock("@getpaseo/plugin/client", () => ({
   useRpc: () => () => Promise.resolve(null), usePaseo: () => ({}),
   useSettings: () => ({ status: "loading" }),
 }));
-vi.mock("@getpaseo/plugin/client/react-native", async () => {
+vi.mock("@getpaseo/plugin/client/ui", async () => {
   const rn = await import("./helpers/rn-mock");
   return { Icon: rn.View, ScrollView: rn.ScrollView, TextInput: rn.TextInput, copyText: async () => {}, useToast: () => toast };
 });
@@ -17,6 +17,7 @@ vi.mock("@getpaseo/plugin/client/react-native", async () => {
 const React = await import("react");
 await import("./helpers/quiet-renderer");
 const { default: TestRenderer, act } = await import("react-test-renderer");
+const { StyleSheet } = await import("react-native");
 const { buildThemeTokens } = await import("../../client/components/theme-tokens");
 const { CopyButton } = await import("../../client/ui/copy-button");
 const { ToolbarCopyButton } = await import("../../client/ui/toolbar-button");
@@ -38,6 +39,18 @@ async function pressCopy(element: React.ReactElement) {
 }
 
 describe("copy toast", () => {
+  it("keeps the copy icon above its circular hover background", () => {
+    let renderer!: ReturnType<typeof TestRenderer.create>;
+    act(() => { renderer = TestRenderer.create(React.createElement(CopyButton, { text: "a", tokens })); });
+    const button = renderer.root.find((node) => (node.type as unknown) === "Pressable");
+    act(() => button.props.onHoverIn());
+    const fill = renderer.root.findByProps({ testID: "copy-icon-fill" });
+    expect(fill.findByProps({ name: "Copy" })).toBeDefined();
+    // surface2 stays visible on a code block, whose own fill is surface1.
+    expect(StyleSheet.flatten(fill.props.style).backgroundColor).toBe(tokens.v2.surface2);
+    act(() => renderer.unmount());
+  });
+
   it("names what each button copied, so two copies are told apart", async () => {
     updateEnhancerPreferences({ language: "en" });
     try {

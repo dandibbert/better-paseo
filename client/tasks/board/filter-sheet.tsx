@@ -1,6 +1,10 @@
+import { SHEET_BODY_INSET } from "../../ui/tokens/sheet";
+import { useHomeDirectory } from "../../state/home-directory";
+import { shortenHome } from "../../paths/format-path";
+import { TextUpdateDot } from "../../ui/text-update-dot";
 import React, { useEffect, useRef, useState, type ReactNode } from "react";
 import { Animated, Platform, Pressable, View, type LayoutChangeEvent, type ScrollView as NativeScrollView } from "react-native";
-import { Icon, ScrollView, TextInput } from "@getpaseo/plugin/client/react-native";
+import { Icon, ScrollView, TextInput } from "@getpaseo/plugin/client/ui";
 import type { PluginTheme } from "@getpaseo/plugin";
 import { LANE_WIDTHS, type LaneWidth } from "../../../shared/tasks-settings";
 import { TaskText as Text, HOST_FONT as F, HOST_LINE, useTasksFontScale, taskControlHeight } from "../typography";
@@ -22,12 +26,15 @@ import { sameSort, type BoardSort, type SortKey } from "./sort";
 import { sortOrderLabel } from "./strings";
 import type { BoardController } from "./use-board";
 import { tasksSettingsOpener } from "./enabled";
+import { SETTINGS_STRINGS } from "../../i18n/settings-page-strings";
+import { useTasksLanguage } from "../i18n";
+import { HoverControl } from "../hover-control";
 
 /**
  * The phone's filters (prototype 04 sheet), drawn inside the host's bottom
  * sheet as a bounded body (`Modal.Content scrollable={false}`): the options
  * scroll, Reset and "Show N tasks" stay pinned under them. The short
- * filters follow the desktop order; workspaces sit under a search field. With `board.showEmptyGroups` off, only the options with a
+ * filters follow the desktop order (Agent, Labels, Project, Workspace); workspaces sit under a search field. With `board.showEmptyGroups` off, only the options with a
  * card on the board, including done and archived, or that are picked, are listed.
  */
 export function FilterSheetBody(props: {
@@ -35,6 +42,7 @@ export function FilterSheetBody(props: {
   theme: PluginTheme;
   options: FilterOptions;
   onDone(): void;
+  updateAvailable?: boolean;
   /** Phones keep the subtasks switch in their toolbar. */
   hideSubtasksToggle?: boolean;
   /** Use pill-shaped agent and label options on phones. */
@@ -56,10 +64,12 @@ export function FilterSheetBody(props: {
 }) {
   const { board, theme, options } = props;
   useLaneScrollbar(theme);
+  const inset = props.phone ? SHEET_BODY_INSET : 16;
   const sortFirst = props.focus === "sort";
   const colors = theme.colors;
   const strings = board.strings;
   const openSettings = tasksSettingsOpener();
+  const updateLabel = SETTINGS_STRINGS[useTasksLanguage()].versionBadge;
   const { setParams, defaults } = board;
   const resolved = resolveBoardParams(board.params, defaults);
   const shown = shownFilterOptions(options, board.showEmptyGroups);
@@ -79,7 +89,8 @@ export function FilterSheetBody(props: {
   // The scroller's height.
   const [viewport, setViewport] = useState(0);
   const groups = searchWorkspaceGroups(shown.workspaceGroups, query);
-  const projects = shown.projects.filter((project) => matchesSearch([project.label, project.group.projectPath], searchWords(projectQuery)));
+  const home = useHomeDirectory();
+  const projects = shown.projects.filter((project) => matchesSearch([project.label, project.group.projectPath, project.group.projectPath ? shortenHome(project.group.projectPath, home) : null], searchWords(projectQuery)));
   // While searching, the workspaces fill the scroller at least, so their field
   // can stay at its top above the keyboard however few rows match.
   const holdTop = searching || query.trim() !== "";
@@ -106,7 +117,7 @@ export function FilterSheetBody(props: {
         onLayout={(event: LayoutChangeEvent) => setViewport(event.nativeEvent.layout.height)}
         testID="filter-sheet-scroll"
       >
-        <View onLayout={(event: LayoutChangeEvent) => (projectsY.current = event.nativeEvent.layout.height)} style={{ paddingHorizontal: 16, paddingTop: sortFirst ? 0 : 4 }}>
+        <View onLayout={(event: LayoutChangeEvent) => (projectsY.current = event.nativeEvent.layout.height)} style={{ paddingHorizontal: inset, paddingTop: sortFirst ? 0 : 4 }}>
           {sortFirst ? <View style={{ paddingBottom: 8 }}>{sort}</View> : null}
           {props.hideSubtasksToggle ? null : (
             <ToggleRow
@@ -174,17 +185,32 @@ export function FilterSheetBody(props: {
               ))}
             </ChipWrap>
           </CollapsibleGroup>
+          <CollapsibleGroup title={strings.labels} icon="Tag" theme={theme} testID="filter-sheet-labels">
+            {shown.labels.length === 0 ? <Muted text={strings.noOptions} theme={theme} /> : null}
+            <ChipWrap>
+              {shown.labels.map((label) => (
+                <Chip
+                  key={label.id}
+                  option={label}
+                  theme={theme}
+                  pill={props.phone}
+                  leading={<TagMark size={14} color={label.color ?? colors.foregroundMuted} hole={label.on ? taskTokens(theme).accentSoft : colors.surface0} />}
+                  onPress={() => setParams((p) => ({ ...p, labels: toggleItem(p.labels, label.id) }))}
+                />
+              ))}
+            </ChipWrap>
+          </CollapsibleGroup>
         </View>
-        <View testID="filter-sheet-project-header" style={{ paddingHorizontal: 16, backgroundColor: props.phone ? colors.surface0 : colors.surface1 }}>
+        <View testID="filter-sheet-project-header" style={{ paddingHorizontal: inset, backgroundColor: props.phone ? colors.surface0 : colors.surface1 }}>
           <CollapsibleTitle text={strings.project} icon="FolderKanban" theme={theme} open={projectsOpen} onPress={() => { setProjectSearching(false); setProjectsOpen((value) => !value); }} testID="filter-sheet-projects-toggle" />
           {projectsOpen && shown.projects.length === 0 ? <Muted text={strings.noOptions} theme={theme} /> : null}
           {projectsOpen && shown.projects.length > 0 ? <SheetSearch value={projectQuery} onChange={setProjectQuery} placeholder={strings.sheetSearch} clear={strings.menuSearch.clear} theme={theme} onFocus={() => { setProjectSearching(true); setTimeout(() => scrollRef.current?.scrollTo({ y: projectsY.current, animated: true }), 0); }} onBlur={() => setProjectSearching(false)} /> : null}
         </View>
-        <View testID="filter-sheet-projects" style={{ paddingHorizontal: 16, paddingBottom: projectsOpen ? 8 : 0, ...(projectsOpen && (projectSearching || projectQuery.trim() !== "") && viewport > 0 ? { minHeight: viewport } : null) }}>
+        <View testID="filter-sheet-projects" style={{ paddingHorizontal: inset, paddingBottom: projectsOpen ? 8 : 0, ...(projectsOpen && (projectSearching || projectQuery.trim() !== "") && viewport > 0 ? { minHeight: viewport } : null) }}>
           {projectsOpen && shown.projects.length > 0 && projects.length === 0 ? <Muted text={strings.menuSearch.empty} theme={theme} /> : null}
           {projectsOpen ? <ChipWrap>{projects.map((project) => <Chip key={project.id} option={project} theme={theme} leading={<ProjectIcon location={project.group} size={16} hostId={board.hostId} />} onPress={() => setParams((p) => toggleProject(p, project))} />)}</ChipWrap> : null}
         </View>
-        <View testID="filter-sheet-workspace-header" onLayout={(event: LayoutChangeEvent) => (workspacesY.current = event.nativeEvent.layout.y)} style={{ paddingHorizontal: 16, backgroundColor: props.phone ? colors.surface0 : colors.surface1 }}>
+        <View testID="filter-sheet-workspace-header" onLayout={(event: LayoutChangeEvent) => (workspacesY.current = event.nativeEvent.layout.y)} style={{ paddingHorizontal: inset, backgroundColor: props.phone ? colors.surface0 : colors.surface1 }}>
           <CollapsibleTitle text={strings.workspace} icon="FolderGit2" theme={theme} open={workspacesOpen} onPress={() => { setSearching(false); setWorkspacesOpen((value) => !value); }} testID="filter-sheet-workspaces-toggle" />
           {workspacesOpen && shown.workspaceGroups.length === 0 ? <Muted text={strings.noOptions} theme={theme} /> : null}
           {workspacesOpen && shown.workspaceGroups.length > 0 ? (
@@ -203,7 +229,7 @@ export function FilterSheetBody(props: {
             />
           ) : null}
         </View>
-        <View testID="filter-sheet-workspaces" style={{ paddingHorizontal: 16, paddingBottom: workspacesOpen ? 8 : 0, ...(workspacesOpen && holdTop && viewport > 0 ? { minHeight: viewport } : null) }}>
+        <View testID="filter-sheet-workspaces" style={{ paddingHorizontal: inset, paddingBottom: workspacesOpen ? 8 : 0, ...(workspacesOpen && holdTop && viewport > 0 ? { minHeight: viewport } : null) }}>
           {workspacesOpen && shown.workspaceGroups.length > 0 && groups.length === 0 ? <Muted text={strings.menuSearch.empty} theme={theme} /> : null}
           {workspacesOpen ? groups.map((group, index) => (
             <View key={group.projectId || "missing"}>
@@ -226,52 +252,40 @@ export function FilterSheetBody(props: {
         </View>
         {/* End the workspace sticky header before the following groups. */}
         <View />
-        <View style={{ paddingHorizontal: 16, paddingBottom: 8 }}>
-          <CollapsibleGroup title={strings.labels} icon="Tag" theme={theme} testID="filter-sheet-labels">
-            {shown.labels.length === 0 ? <Muted text={strings.noOptions} theme={theme} /> : null}
-            <ChipWrap>
-              {shown.labels.map((label) => (
-                <Chip
-                  key={label.id}
-                  option={label}
-                  theme={theme}
-                  pill={props.phone}
-                  leading={<TagMark size={14} color={label.color ?? colors.foregroundMuted} hole={label.on ? taskTokens(theme).accentSoft : colors.surface0} />}
-                  onPress={() => setParams((p) => ({ ...p, labels: toggleItem(p.labels, label.id) }))}
-                />
-              ))}
-            </ChipWrap>
-          </CollapsibleGroup>
+        <View style={{ paddingHorizontal: inset, paddingBottom: 8 }}>
           {!props.phone && !props.tablet && !props.laneWidth ? range : null}
           {sortFirst || props.tablet ? null : sort}
         </View>
       </ScrollView>
-      <View testID="filter-sheet-footer" style={{ paddingTop: 12, paddingHorizontal: 16, flexDirection: "row", gap: 10, borderTopWidth: HAIRLINE, borderTopColor: colors.border }}>
-        <Pressable
+      <View testID="filter-sheet-footer" style={{ paddingTop: 12, paddingHorizontal: inset, flexDirection: "row", gap: 10, borderTopWidth: HAIRLINE, borderTopColor: colors.border }}>
+        <HoverControl base={colors.surface0} foreground={colors.foreground}
           accessibilityRole="button"
           onPress={() => setParams(clearedParams)}
           testID="filter-sheet-reset"
           style={{ height: 44, paddingHorizontal: 18, borderRadius: 22, borderWidth: HAIRLINE, borderColor: colors.border, alignItems: "center", justifyContent: "center" }}
         >
           <Text style={{ fontSize: F.base, fontWeight: "500", color: colors.foreground }}>{strings.reset}</Text>
-        </Pressable>
-        <Pressable
+        </HoverControl>
+        <HoverControl base={colors.accent} foreground={colors.foreground} rest={colors.accent}
           accessibilityRole="button"
           onPress={props.onDone}
           style={{ flex: 1, height: 44, borderRadius: 22, backgroundColor: colors.accent, alignItems: "center", justifyContent: "center" }}
         >
           <Text style={{ fontSize: F.base, fontWeight: "600", color: colors.accentForeground, fontVariant: ["tabular-nums"] }}>{strings.show(board.total)}</Text>
-        </Pressable>
+        </HoverControl>
         {openSettings ? (
-          <Pressable
+          <HoverControl base={colors.surface0} foreground={colors.foreground}
             accessibilityRole="button"
-            accessibilityLabel={strings.openSettings}
+            accessibilityLabel={props.updateAvailable ? `${strings.openSettings}, ${updateLabel}` : strings.openSettings}
             onPress={() => { props.onDone(); openSettings(); }}
             testID="filter-sheet-settings"
             style={{ height: 44, paddingHorizontal: 18, borderRadius: 22, borderWidth: HAIRLINE, borderColor: colors.border, alignItems: "center", justifyContent: "center" }}
           >
-            <Text style={{ fontSize: F.base, fontWeight: "500", color: colors.foreground }}>{strings.settings}</Text>
-          </Pressable>
+            <View>
+              <Text testID="filter-sheet-settings-label" style={{ fontSize: F.base, fontWeight: "500", color: colors.foreground }}>{strings.settings}</Text>
+              {props.updateAvailable ? <TextUpdateDot testID="filter-sheet-settings-update-dot" /> : null}
+            </View>
+          </HoverControl>
         ) : null}
       </View>
     </View>
@@ -310,9 +324,9 @@ function SheetSearch(props: { value: string; onChange(text: string): void; place
         }}
       />
       {props.value ? (
-        <Pressable accessibilityRole="button" accessibilityLabel={props.clear} testID="filter-sheet-search-clear" hitSlop={10} onPress={() => props.onChange("")}>
+        <HoverControl base={colors.surface0} foreground={colors.foreground} accessibilityRole="button" accessibilityLabel={props.clear} testID="filter-sheet-search-clear" hitSlop={10} onPress={() => props.onChange("")}>
           <Icon name="X" size={15} color={colors.foregroundMuted} />
-        </Pressable>
+        </HoverControl>
       ) : null}
     </View>
   );
@@ -375,11 +389,11 @@ function CollapsibleContent({ open, children, testID }: { open: boolean; childre
 
 function CollapsibleTitle(props: { text: string; icon: string; theme: PluginTheme; open: boolean; onPress(): void; testID: string; first?: boolean }) {
   return (
-    <Pressable accessibilityRole="button" accessibilityLabel={props.text} accessibilityState={{ expanded: props.open }} onPress={props.onPress} testID={props.testID} style={{ paddingTop: props.first ? 0 : 16, paddingBottom: 8, flexDirection: "row", alignItems: "center", gap: 8 }}>
+    <HoverControl base={props.theme.colors.surface0} foreground={props.theme.colors.foreground} accessibilityRole="button" accessibilityLabel={props.text} accessibilityState={{ expanded: props.open }} onPress={props.onPress} testID={props.testID} style={{ paddingTop: props.first ? 0 : 16, paddingBottom: 8, flexDirection: "row", alignItems: "center", gap: 8 }}>
       <Icon name={props.icon} size={16} color={props.theme.colors.foregroundMuted} />
       <Text style={{ flex: 1, fontSize: F.sm, fontWeight: "500", color: props.theme.colors.foregroundMuted }}>{props.text}</Text>
       <Icon name={props.open ? "ChevronUp" : "ChevronDown"} size={16} color={props.theme.colors.foregroundMuted} />
-    </Pressable>
+    </HoverControl>
   );
 }
 
@@ -396,7 +410,7 @@ function Chip(props: { option: FilterOption; theme: PluginTheme; onPress(): void
   const scale = useTasksFontScale();
   const on = props.option.on;
   return (
-    <Pressable
+    <HoverControl base={on ? taskTokens(props.theme).accentSoft : colors.surface0} foreground={colors.foreground} rest={on ? taskTokens(props.theme).accentSoft : "transparent"}
       accessibilityRole="checkbox"
       accessibilityState={{ checked: on }}
       onPress={props.onPress}
@@ -411,7 +425,7 @@ function Chip(props: { option: FilterOption; theme: PluginTheme; onPress(): void
         backgroundColor: on ? taskTokens(props.theme).accentSoft : "transparent",
         flexDirection: "row",
         alignItems: "center",
-        gap: 6,
+        gap: 4,
       }}
     >
       {props.leading}
@@ -421,7 +435,7 @@ function Chip(props: { option: FilterOption; theme: PluginTheme; onPress(): void
       {props.hideCount ? null : (
         <Text style={{ fontSize: F.sm, color: colors.foregroundMuted, fontVariant: ["tabular-nums"] }}>{props.option.count}</Text>
       )}
-    </Pressable>
+    </HoverControl>
   );
 }
 
@@ -430,7 +444,7 @@ function ToggleRow(props: { icon: string; label: string; hint?: string; on: bool
   const colors = props.theme.colors;
   const spaceKeys = useSwitchSpace(props.onPress);
   return (
-    <Pressable
+    <HoverControl base={colors.surface0} foreground={colors.foreground}
       accessibilityRole="switch"
       accessibilityLabel={props.label}
       aria-checked={props.on}
@@ -438,7 +452,7 @@ function ToggleRow(props: { icon: string; label: string; hint?: string; on: bool
       onPress={props.onPress}
       {...spaceKeys}
       testID={props.testID}
-      style={{ minHeight: 48, flexDirection: "row", alignItems: "center", gap: 12 }}
+      style={{ minHeight: 48, flexDirection: "row", alignItems: "center", gap: 8 }}
     >
       <Icon name={props.icon} size={18} color={colors.foregroundMuted} />
       <View style={{ flex: 1, paddingVertical: 6 }}>
@@ -446,7 +460,7 @@ function ToggleRow(props: { icon: string; label: string; hint?: string; on: bool
         {props.hint ? <Text style={{ fontSize: F.sm, lineHeight: HOST_LINE.sm, color: colors.foregroundMuted }}>{props.hint}</Text> : null}
       </View>
       <SwitchTrack value={props.on} colors={colors} />
-    </Pressable>
+    </HoverControl>
   );
 }
 
@@ -515,17 +529,17 @@ function SortDrillDown({ board, theme }: { board: BoardController; theme: Plugin
 function SortRow(props: { icon: string; label: string; hint?: string; checked?: boolean; drills?: boolean; theme: PluginTheme; onPress(): void }) {
   const colors = props.theme.colors;
   return (
-    <Pressable
+    <HoverControl base={colors.surface0} foreground={colors.foreground}
       accessibilityRole="menuitem"
       accessibilityState={{ checked: props.checked }}
       onPress={props.onPress}
-      style={{ minHeight: 44, flexDirection: "row", alignItems: "center", gap: 12 }}
+      style={{ minHeight: 44, flexDirection: "row", alignItems: "center", gap: 8 }}
     >
       <Icon name={props.icon} size={18} color={colors.foregroundMuted} />
       <Text style={{ flex: 1, fontSize: F.base, color: colors.foreground }}>{props.label}</Text>
       {props.hint ? <Text style={{ fontSize: F.base, color: colors.foregroundMuted }}>{props.hint}</Text> : null}
       {props.checked ? <Icon name="Check" size={18} color={colors.accent} /> : null}
       {props.drills ? <Icon name="ChevronRight" size={16} color={colors.foregroundMuted} /> : null}
-    </Pressable>
+    </HoverControl>
   );
 }

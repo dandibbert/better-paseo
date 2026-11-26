@@ -1,6 +1,8 @@
+import { useHomeDirectory } from "../../state/home-directory";
+import { UPDATE_INDICATOR_COLOR } from "../../ui/update-indicator";
 import React, { memo, useCallback, useContext, useEffect, useRef, useState, type ReactNode, type Ref } from "react";
 import { Animated, Platform, Pressable, View, useWindowDimensions, type LayoutChangeEvent, type TextInput as NativeTextInput } from "react-native";
-import { Icon } from "@getpaseo/plugin/client/react-native";
+import { Icon, ScrollView } from "@getpaseo/plugin/client/ui";
 import type { PluginTheme } from "@getpaseo/plugin";
 import { LANE_WIDTHS } from "../../../shared/tasks-settings";
 import { TaskText as Text, HOST_FONT as F, HOST_LINE, TASK_MONO, useTasksFontScale, taskControlHeight } from "../typography";
@@ -22,6 +24,7 @@ import { useReducedMotion } from "../../ui/use-reduced-motion";
 import { useSwitchSpace } from "../../ui/use-switch-space";
 import { liftStyle, scaleStyle, surfaceLift } from "../cards/surface-lift";
 import { usePressCue } from "../cards/action-pressable";
+import { hoverFill } from "../hover-fill";
 import { FullConversationSwitch, SearchInput } from "./search-loading";
 import { SearchCoverageItems } from "./search-coverage";
 import { tasksSettingsOpener } from "./enabled";
@@ -88,7 +91,7 @@ function MoreActions({ board, theme, items, updateAvailable }: { board: BoardCon
       tip={busy ? `${board.strings.refreshTasks} (⌥R)` : board.strings.more}
       testID="desktop-toolbar-more"
     />
-    {updateAvailable ? <View testID="desktop-more-update-dot" pointerEvents="none" style={{ position: "absolute", top: 0, right: 0, width: 7, height: 7, borderRadius: 4, backgroundColor: taskTokens(theme).danger }} /> : null}
+    {updateAvailable ? <View testID="desktop-more-update-dot" pointerEvents="none" style={{ position: "absolute", bottom: 2, right: 2, width: 4, height: 4, borderRadius: 2, backgroundColor: UPDATE_INDICATOR_COLOR }} /> : null}
     {open ? <CascadeMenu theme={theme} width={menuWidth(200, scale, window.width - MENU_EDGE * 2)} fitContent top={toolbarButtonSize(scale) + 6} align="right" onClose={() => setOpen(false)} testID="desktop-more-menu" sections={[{ key: "more", items: [
       { key: "refresh", label: board.strings.refreshTasks, icon: "RefreshCw", shortcut: "⌥R", disabled: busy, onSelect: press },
       ...items,
@@ -139,16 +142,20 @@ function DesktopToolbarView(props: {
   const window = useWindowDimensions();
   const colors = theme.colors;
   const strings = board.strings;
+  const inlineSearch = props.width >= 960 * Math.max(1, scale);
+  // The query lives in the field whenever one is on screen: inline on a wide
+  // board, or revealed by its button. A chip would repeat it and its clear ×.
+  const fieldVisible = inlineSearch || props.searchOpen;
   const chips = props.filterOptions
-    ? groupChips(activeChips(board.params, board.defaults, props.filterOptions, strings).filter((chip) => !BAR_OWN_CONTROLS.has(chip.key)), strings)
+    ? groupChips(activeChips(board.params, board.defaults, props.filterOptions, strings).filter((chip) => !BAR_OWN_CONTROLS.has(chip.key) && !(fieldVisible && chip.key === "q")), strings)
     : [];
+  const queryInField = fieldVisible && Boolean(board.params.query.trim());
   const chipMenu = props.menu?.startsWith("chips:") ? props.menu : null;
   const groupGone = !!chipMenu && !chips.some((entry) => entry.key === `group:${chipMenu.slice(6)}`);
   useEffect(() => {
     if (groupGone) props.setMenu(null);
   }, [groupGone, props.setMenu]);
   const toggle = (menuId: FilterMenu) => props.setMenu(props.menu === menuId ? null : menuId);
-  const inlineSearch = props.width >= 960 * Math.max(1, scale);
   const [searchFocused, setSearchFocused] = useState(false);
   const [actionWidth, setActionWidth] = useState(0);
   // Equal side slots keep the total centred; the end slot also measures the search's room.
@@ -165,7 +172,7 @@ function DesktopToolbarView(props: {
       { key: "archived", label: strings.archivedLane.row, checked: board.showArchived, onSelect: () => board.setShowArchived(!board.showArchived) },
     ] : []),
     { key: "empty-groups", label: board.showEmptyGroups ? strings.emptyGroups.hide : strings.emptyGroups.show, icon: board.showEmptyGroups ? "EyeOff" : "Eye", shortcut: "G", onSelect: () => board.setShowEmptyGroups(!board.showEmptyGroups) },
-    ...(openSettings ? [{ key: "settings", label: strings.openSettings, accessibilityLabel: updateAvailable ? `${strings.openSettings}, ${updateLabel}` : undefined, icon: "Bolt", shortcut: ",", onSelect: openSettings, trailing: updateAvailable ? <View testID="desktop-settings-update-dot" pointerEvents="none" style={{ width: 7, height: 7, borderRadius: 4, backgroundColor: taskTokens(theme).danger }} /> : undefined }] : []),
+    ...(openSettings ? [{ key: "settings", label: strings.openSettings, accessibilityLabel: updateAvailable ? `${strings.openSettings}, ${updateLabel}` : undefined, icon: "Bolt", shortcut: ",", onSelect: openSettings, trailing: updateAvailable ? <View testID="desktop-settings-update-dot" pointerEvents="none" style={{ width: 4, height: 4, borderRadius: 2, alignSelf: "center", backgroundColor: UPDATE_INDICATOR_COLOR }} /> : undefined }] : []),
     ...(compactActions && props.sidebar ? [{ key: "sidebar", label: props.sidebar.open ? strings.sidebar.hide : strings.sidebar.show, onSelect: props.sidebar.onToggle }] : []),
   ];
   const search = (
@@ -187,7 +194,7 @@ function DesktopToolbarView(props: {
           borderRadius: 6,
         }}
       >
-        <SearchInput theme={theme} hideSearchIcon iconSize={13} iconColor={colors.foregroundMuted}
+        <SearchInput theme={theme} hideSearchIcon={!inlineSearch} staticIcon={inlineSearch} iconSize={13} iconColor={colors.foregroundMuted}
           ref={props.searchRef}
           autoFocus={!inlineSearch}
           value={board.params.query}
@@ -197,6 +204,7 @@ function DesktopToolbarView(props: {
           placeholder={strings.search}
           placeholderTextColor={colors.foregroundMuted}
           accessibilityLabel={strings.search}
+          beforeCancel={<SearchCoverageItems theme={theme} part="badge" />}
           style={{ flex: 1, minWidth: 0, padding: 0, fontSize: Math.round(F.base * scale), color: colors.foreground, ...(Platform.OS === "web" ? ({ outlineStyle: "none" } as object) : null) }}
         />
         {board.params.query.length > 0 ? (
@@ -220,7 +228,7 @@ function DesktopToolbarView(props: {
       {!inlineSearch && searchFits ? <ToolbarSearchReveal visible={props.searchOpen} width={searchWidth}>
         {search}
       </ToolbarSearchReveal> : null}
-      {chips.length ? (
+      {chips.length || queryInField ? (
         <View testID="desktop-toolbar-search-summary" style={{ flexDirection: "row", alignItems: "center", minWidth: 0, maxWidth: "100%", flexShrink: 1, gap: 10, overflow: !inlineSearch && searchFits ? "hidden" : undefined }}>
           {chips.map((entry) =>
             isChipGroup(entry) ? (
@@ -246,12 +254,13 @@ function DesktopToolbarView(props: {
             ) : (
               entry.key === "q" ? (
                 <View key={entry.key} style={{ flexDirection: "row", alignItems: "center", minWidth: 0, maxWidth: "100%", flexShrink: 1, gap: 10 }}>
-                  <Chip chip={entry} onClear={() => board.setParams(entry.clear)} clearLabel={`${strings.clear} ${entry.value}`} theme={theme} />
+                  <SearchQueryChip board={board} theme={theme} />
                   <SearchCoverageItems theme={theme} />
                 </View>
               ) : <Chip key={entry.key} chip={entry} onClear={() => board.setParams(entry.clear)} clearLabel={`${strings.clear} ${entry.value}`} theme={theme} />
             ),
           )}
+          {queryInField ? <SearchCoverageItems theme={theme} part="notice" /> : null}
           <ClearAllButton board={board} theme={theme} />
         </View>
       ) : null}
@@ -373,16 +382,14 @@ function EmptyLanesButton({ emptyLanes, strings, theme }: { emptyLanes: EmptyLan
   );
 }
 
-/** A round outlined button, filled grey while the sidebar shows. */
+/** A round outlined button whose panel mark shows the sidebar state. */
 function SidebarSwitch(props: { open: boolean; sheet: boolean; onToggle(): void; theme: PluginTheme; label: string }) {
   const colors = props.theme.colors;
   const scale = useTasksFontScale();
   const size = toolbarButtonSize(scale);
   const [hovered, setHovered] = useState(false);
   const press = usePressCue(hovered);
-  const reduced = useReducedMotion();
-  const lift = surfaceLift(hovered, press.pressed, reduced, "control", press.input);
-  const line = Platform.OS === "web" && !hovered ? "transparent" : colors.border;
+  const line = Platform.OS === "web" ? "transparent" : colors.border;
   return (
     <Pressable
       accessibilityRole="button"
@@ -403,11 +410,10 @@ function SidebarSwitch(props: { open: boolean; sheet: boolean; onToggle(): void;
       style={{
         width: size,
         height: size,
-        borderRadius: Platform.OS === "web" ? 7 : size / 2,
+        borderRadius: size / 2,
         borderWidth: HAIRLINE,
-        backgroundColor: props.open ? colors.surface2 : colors.surface0,
-        ...liftStyle(() => taskTokens(props.theme), lift, { border: line }),
-        ...scaleStyle(lift.scale),
+        backgroundColor: hoverFill(colors.surface0, colors.foreground, hovered, press.pressed),
+        borderColor: line,
         alignItems: "center",
         justifyContent: "center",
       }}
@@ -431,11 +437,9 @@ function BarSwitch(props: { icon: string; on: boolean; onPress(): void; label: s
   const icon = actionIconSize(scale);
   const [hovered, setHovered] = useState(false);
   const press = usePressCue(hovered);
-  const reduced = useReducedMotion();
-  const lift = surfaceLift(hovered, press.pressed, reduced, "control", press.input);
-  const line = Platform.OS === "web" && !hovered ? "transparent" : colors.border;
-  // The slash cuts a hole in the resting fill. Hover and press do not change that fill.
-  const background = colors.surface0;
+  const line = Platform.OS === "web" ? "transparent" : colors.border;
+  const background = hoverFill(colors.surface0, colors.foreground, hovered, press.pressed);
+  const iconColor = colors.foreground;
   return (
     <Pressable
       accessibilityRole="switch"
@@ -460,18 +464,17 @@ function BarSwitch(props: { icon: string; on: boolean; onPress(): void; label: s
         width: size,
         height: size,
         flexShrink: 0,
-        borderRadius: Platform.OS === "web" ? 7 : size / 2,
+        borderRadius: size / 2,
         borderWidth: HAIRLINE,
         backgroundColor: background,
-        ...liftStyle(() => taskTokens(props.theme), lift, { border: line }),
-        ...scaleStyle(lift.scale),
+        borderColor: line,
         alignItems: "center",
         justifyContent: "center",
       }}
     >
-      <Icon name={props.icon} size={icon} color={colors.foreground} />
-      {props.slashed ? <SlashMark size={icon} color={colors.foreground} gap={background} /> : null}
-      <CornerBadge count={props.badge ?? 0} theme={props.theme} style={{ bottom: -1, right: -1 }} testID={`${props.testID}-count`} />
+      <Icon name={props.icon} size={icon} color={iconColor} />
+      {props.slashed ? <SlashMark size={icon} color={iconColor} gap={background} /> : null}
+      <CornerBadge count={props.badge ?? 0} theme={props.theme} ringColor={background} style={{ bottom: -1, right: -1 }} testID={`${props.testID}-count`} />
     </Pressable>
   );
 }
@@ -542,6 +545,7 @@ function DesktopFilterBarView(props: {
   emptyLanes?: EmptyLanes;
 }) {
   const { board, theme, options, menu, setMenu } = props;
+  const home = useHomeDirectory();
   const tablet = Platform.OS !== "web";
   const scale = useTasksFontScale();
   const window = useWindowDimensions();
@@ -564,9 +568,9 @@ function DesktopFilterBarView(props: {
   // Every word the buttons drop when icon-only: the toggles' only while they show.
   const fit = useLabelFit([
     words.agent,
+    words.label,
     words.project,
     words.workspace,
-    words.label,
     { text: words.sort, maxWidth: SORT_LABEL_MAX_WIDTH },
   ], !tablet, strings.laneWidth.label);
   const compact = tablet || fit.compact;
@@ -641,9 +645,19 @@ function DesktopFilterBarView(props: {
               onClose={() => setMenu(null)}
             />
           </MenuButton>
+          <MenuButton icon={FILTER_ICONS.label} label={words.label} compact={compact} tip={tip(words.label, strings.tips.labels)} open={menu === "label"} onPress={() => toggle("label")} theme={theme}>
+            <CascadeMenu
+              sections={labelMenuSections(shown, theme, strings, (id) => setParams((p) => ({ ...p, labels: toggleItem(p.labels, id) })))}
+              theme={theme}
+              width={menuWidth(200, scale, window.width - MENU_EDGE * 2)}
+              top={toolbarButtonSize(scale) + 6}
+              align="left"
+              onClose={() => setMenu(null)}
+            />
+          </MenuButton>
           <MenuButton icon={FILTER_ICONS.project} label={words.project} compact={compact} tip={tip(words.project, strings.tips.project)} open={menu === "project"} onPress={() => toggle("project")} theme={theme}>
             <CascadeMenu
-              sections={withEmptyGroups(projectMenuSections(shown, strings, board.hostId, (project) => setParams((p) => toggleProject(p, project))))}
+              sections={withEmptyGroups(projectMenuSections(shown, strings, board.hostId, (project) => setParams((p) => toggleProject(p, project)), home))}
               theme={theme}
               width={menuWidth(PROJECT_MENU_WIDTH, scale, window.width - MENU_EDGE * 2)}
               top={toolbarButtonSize(scale) + 6}
@@ -660,16 +674,6 @@ function DesktopFilterBarView(props: {
               top={toolbarButtonSize(scale) + 6}
               align="left"
               search={strings.menuSearch}
-              onClose={() => setMenu(null)}
-            />
-          </MenuButton>
-          <MenuButton icon={FILTER_ICONS.label} label={words.label} compact={compact} tip={tip(words.label, strings.tips.labels)} open={menu === "label"} onPress={() => toggle("label")} theme={theme}>
-            <CascadeMenu
-              sections={labelMenuSections(shown, theme, strings, (id) => setParams((p) => ({ ...p, labels: toggleItem(p.labels, id) })))}
-              theme={theme}
-              width={menuWidth(200, scale, window.width - MENU_EDGE * 2)}
-              top={toolbarButtonSize(scale) + 6}
-              align="left"
               onClose={() => setMenu(null)}
             />
           </MenuButton>
@@ -885,11 +889,21 @@ function useLabelFit(dropped: readonly DroppedWord[], enabled: boolean, laneWidt
  * label's is its own solid tag in its colour. The rest ("Title has", "Done")
  * keep the muted word.
  */
-function Chip(props: { chip: ActiveChip; onClear(): void; clearLabel: string; theme: PluginTheme }) {
+function Chip(props: { chip: ActiveChip; onClear(): void; clearLabel: string; theme: PluginTheme; onEdit?: { label: string; hint?: string; press(): void }; lead?: ReactNode; shrink?: boolean }) {
   const { chip, theme } = props;
   const colors = theme.colors;
   const scale = useTasksFontScale();
   const unit = chip.unit ?? chip.group;
+  if (chip.key === "q") return (
+    <View testID="search-query-chip" style={{ height: taskControlHeight(Platform.OS === "web" ? 24 : 36, scale), maxWidth: "100%", flexShrink: props.shrink === false ? 0 : 1, flexDirection: "row", alignItems: "center", gap: 4, paddingLeft: 9, paddingRight: 4 }}>
+      <View pointerEvents="none" testID="search-query-chip-fill" style={{ position: "absolute", left: 0, right: 0, height: taskControlHeight(24, scale), borderRadius: taskControlHeight(12, scale), backgroundColor: taskTokens(theme).card.pillFill, borderWidth: HAIRLINE, borderColor: taskTokens(theme).card.pillBorder }} />
+      {props.onEdit ? <HoverPressable hoverTheme={props.theme} accessibilityRole="button" accessibilityLabel={props.onEdit.label} accessibilityHint={props.onEdit.hint} onPress={props.onEdit.press} testID="search-query-edit" style={() => ({ minWidth: 0, flexShrink: 1, height: "100%", flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 4 })}>
+        {props.lead}
+        <Text numberOfLines={1} style={{ fontSize: F.sm, color: colors.foregroundMuted, maxWidth: 220, flexShrink: 1 }}>{chip.value}</Text>
+      </HoverPressable> : <Text numberOfLines={1} style={{ fontSize: F.sm, color: colors.foregroundMuted, maxWidth: 220, flexShrink: 1 }}>{chip.value}</Text>}
+      <ClearButton label={props.clearLabel} onPress={props.onClear} theme={theme} touch={Platform.OS !== "web"} />
+    </View>
+  );
   return (
     <View style={{ height: toolbarButtonSize(scale), maxWidth: "100%", flexShrink: 1, flexDirection: "row", alignItems: "center", gap: 4, paddingLeft: 10, paddingRight: 4, borderWidth: HAIRLINE, borderColor: colors.border, borderRadius: 6 }}>
       {unit ? (
@@ -935,7 +949,7 @@ function GroupChip(props: { group: ChipGroup; open: boolean; onPress(): void; on
           backgroundColor: props.open ? colors.surface1 : "transparent",
         }}
       >
-        <HoverPressable
+        <HoverPressable hoverTheme={props.theme}
           accessibilityRole="button"
           accessibilityState={{ expanded: props.open }}
           accessibilityLabel={props.group.label}
@@ -971,15 +985,16 @@ function GroupChip(props: { group: ChipGroup; open: boolean; onPress(): void; on
   );
 }
 
-function ClearButton(props: { label: string; onPress(): void; theme: PluginTheme }) {
+function ClearButton(props: { label: string; onPress(): void; theme: PluginTheme; touch?: boolean }) {
   const colors = props.theme.colors;
   return (
-    <HoverPressable
+    <HoverPressable hoverTheme={props.theme}
       accessibilityRole="button"
       accessibilityLabel={props.label}
       {...tipProps(props.label)}
       onPress={props.onPress}
-      style={(hovered, pressed) => ({ width: 20, height: 20, borderRadius: 4, alignItems: "center", justifyContent: "center", backgroundColor: "transparent", ...liftStyle(() => taskTokens(props.theme), surfaceLift(hovered, pressed)) })}
+      hitSlop={props.touch ? { top: 8, bottom: 8, left: 4, right: 4 } : undefined}
+      style={(hovered, pressed) => ({ width: 20, height: 20, borderRadius: 10, alignItems: "center", justifyContent: "center", backgroundColor: "transparent", ...liftStyle(() => taskTokens(props.theme), surfaceLift(hovered, pressed)) })}
     >
       <Icon name="X" size={12} color={colors.foregroundMuted} />
     </HoverPressable>
@@ -989,7 +1004,7 @@ function ClearButton(props: { label: string; onPress(): void; theme: PluginTheme
 function ClearAllButton(props: { board: BoardController; theme: PluginTheme }) {
   const scale = useTasksFontScale();
   return (
-    <HoverPressable
+    <HoverPressable hoverTheme={props.theme}
       accessibilityRole="button"
       onPress={() => props.board.setParams(clearedParams)}
       style={(hovered, pressed) => ({
@@ -1024,7 +1039,7 @@ function MenuButton(props: { icon: string | React.ReactElement; label: string; c
   const size = iconOnly ? roundButtonSize(scale) : toolbarButtonSize(scale);
   return (
     <View pointerEvents="box-none" style={{ zIndex: props.open ? 20 : 0, maxWidth: Platform.OS === "web" ? "100%" : undefined, flexShrink: Platform.OS === "web" ? 1 : 0 }}>
-      <HoverPressable
+      <HoverPressable hoverTheme={props.theme}
         accessibilityRole="button"
         accessibilityLabel={props.accessibilityLabel ?? (props.compact ? props.label : undefined)}
         accessibilityState={{ expanded: props.open }}
@@ -1058,8 +1073,19 @@ function MenuButton(props: { icon: string | React.ReactElement; label: string; c
 }
 
 
-/** The same Contains chip beside compact search fields. */
-export function SearchQueryChip({ board, theme }: { board: BoardController; theme: PluginTheme }) {
-  if (!board.params.query.trim()) return null;
-  return <Chip chip={{ key: "q", kind: board.strings.searchContains, value: `「${board.params.query.trim()}」`, clear: (params) => ({ ...params, query: "" }) }} onClear={() => board.setParams((params) => ({ ...params, query: "" }))} clearLabel={`${board.strings.clear} ${board.strings.searchContains}`} theme={theme} />;
+/** Each whitespace-separated search term can be removed independently. */
+export function SearchQueryChip({ board, theme, onEdit, editHint, lead, scrollable = true }: { board: BoardController; theme: PluginTheme; onEdit?(): void; editHint?: string; lead?: ReactNode; scrollable?: boolean }) {
+  const scale = useTasksFontScale();
+  const words = board.params.query.trim().split(/\s+/).filter(Boolean);
+  if (!words.length) return null;
+  const chips = words.map((word, index) => {
+    const clear = (params: BoardController["params"]) => ({ ...params, query: params.query.trim().split(/\s+/).filter((_, position) => position !== index).join(" ") });
+    return <Chip key={`${index}:${word}`} chip={{ key: "q", kind: board.strings.searchContains, value: `「${word}」`, clear }} onClear={() => board.setParams(clear)} clearLabel={`${board.strings.clear} ${word}`} theme={theme} lead={index === 0 ? lead : undefined} shrink={words.length === 1} onEdit={onEdit ? { label: `${board.strings.editSearch}: ${word}`, hint: editHint, press: onEdit } : undefined} />;
+  });
+  if (words.length === 1) return chips[0];
+  const rowStyle = { flexDirection: "row" as const, alignItems: "center" as const, gap: 6 };
+  if (!scrollable) return <View testID="search-query-chips" style={rowStyle}>{chips}</View>;
+  return <ScrollView testID="search-query-chips" horizontal showsHorizontalScrollIndicator={false} keyboardShouldPersistTaps="handled" style={{ minWidth: 0, maxWidth: "100%", flexGrow: 0, flexShrink: 1, height: taskControlHeight(Platform.OS === "web" ? 24 : 36, scale) }} contentContainerStyle={rowStyle}>
+    {chips}
+  </ScrollView>;
 }

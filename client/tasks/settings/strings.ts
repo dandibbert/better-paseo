@@ -35,12 +35,14 @@ export interface TasksSettingsStrings {
   densities: Record<Density, string>;
   cardTitle: string;
   fieldsTitle: string;
+  fieldPreviewTitle: string;
+  fieldPreviewHint: string;
+  fieldPreviewHidden: string;
+  fieldPreviewOffHint: string;
   fieldsHint: string;
   fields: Record<CardField, string>;
   moduleReset: (module: string) => string;
   moduleResetHint: string;
-  moduleResetAction: (module: string) => string;
-  moduleResetConfirm: (module: string) => string;
   moduleResetConfirmHint: string;
   labelLimit: string;
   labelLimits: Record<LabelLimit, string>;
@@ -70,8 +72,6 @@ export interface TasksSettingsStrings {
   resetTitle: string;
   reset: string;
   resetHint: string;
-  resetAction: string;
-  resetConfirm: string;
   resetConfirmHint: string;
   resetCancel: string;
   /** The cancel row's own label, so it does not repeat its button's "Cancel". */
@@ -109,11 +109,13 @@ export const TASKS_SETTINGS_STRINGS: Readonly<Record<TasksLanguage, TasksSetting
     densities: { minimal: "Minimal", standard: "Standard", full: "Full", custom: "Custom" },
     cardTitle: "Cards",
     fieldsTitle: "Fields",
+    fieldPreviewTitle: "Card preview",
+    fieldPreviewHint: "Follows the switches above; click the capsule for the list",
+    fieldPreviewHidden: "Hidden",
+    fieldPreviewOffHint: "Plan capsule is off",
     fieldsHint: "What each card shows. Phones keep the essentials whatever is picked here.",
     moduleReset: (module) => `Reset ${module} settings`,
     moduleResetHint: "Only settings in this section will be restored.",
-    moduleResetAction: (module) => `Reset ${module}`,
-    moduleResetConfirm: (module) => `Confirm reset ${module}`,
     moduleResetConfirmHint: "This restores only this section's settings to their defaults.",
     fields: {
       provider: "Agent brand mark",
@@ -130,6 +132,7 @@ export const TASKS_SETTINGS_STRINGS: Readonly<Record<TasksLanguage, TasksSetting
       pullRequest: "Linked PR",
       timer: "Timer / finished at",
       context: "Context usage ring",
+      plan: "Plan capsule",
       subtasks: "Subtask summary",
     },
     labelLimit: "Labels shown",
@@ -148,8 +151,8 @@ export const TASKS_SETTINGS_STRINGS: Readonly<Record<TasksLanguage, TasksSetting
     showArchived: "Show the archived lane",
     showArchivedHint: "Saved on this device only. A lane after Done with archived tasks and those of archived workspaces, in the same time window.",
     showEmptyGroups: "Show all",
-    showEmptyGroupsTips: [{ label: "Visibility", text: "The filters and the sidebar list every Agent, project, workspace and label in Paseo, with 0 where the board has none, including Done and Archived." }, { label: "Storage", text: "Saved on this device only." }],
-    showEmptyGroupsHint: "The filters and the sidebar list every Agent, project, workspace and label in Paseo, with 0 where the board has none, including Done and Archived. Saved on this device only.",
+    showEmptyGroupsTips: [{ label: "Visibility", text: "The filters and the sidebar list every Agent, label, project and workspace in Paseo, with 0 where the board has none, including Done and Archived." }, { label: "Storage", text: "Saved on this device only." }],
+    showEmptyGroupsHint: "The filters and the sidebar list every Agent, label, project and workspace in Paseo, with 0 where the board has none, including Done and Archived. Saved on this device only.",
     laneWidth: "Lane width",
     laneWidthHint: "Saved on this device only. On desktop, web and tablets. Phones show one lane at a time.",
     laneWidths: { narrow: "Narrow", default: "Default", wide: "Wide" },
@@ -159,8 +162,6 @@ export const TASKS_SETTINGS_STRINGS: Readonly<Record<TasksLanguage, TasksSetting
     resetTitle: "Reset",
     reset: "Restore the Tasks defaults",
     resetHint: "Restore card, board and sidebar options. The board switch and automatic titles are unchanged.",
-    resetAction: "Restore",
-    resetConfirm: "Restore now",
     resetConfirmHint: "This restores card, board and sidebar options to their defaults.",
     resetCancel: "Cancel",
     resetKeep: "Keep the current options",
@@ -195,11 +196,13 @@ export const TASKS_SETTINGS_STRINGS: Readonly<Record<TasksLanguage, TasksSetting
     densities: { minimal: "精简", standard: "标准", full: "完整", custom: "自定义" },
     cardTitle: "卡片",
     fieldsTitle: "显示字段",
+    fieldPreviewTitle: "卡片预览",
+    fieldPreviewHint: "随上面的开关变化；点胶囊查看清单",
+    fieldPreviewHidden: "已隐藏",
+    fieldPreviewOffHint: "计划胶囊已关闭",
     fieldsHint: "每张卡片显示哪些信息。手机上始终保留最关键的几项。",
     moduleReset: (module) => `恢复「${module}」默认设置`,
     moduleResetHint: "只恢复本组设置，不影响其他组。",
-    moduleResetAction: (module) => `恢复${module}`,
-    moduleResetConfirm: (module) => `确认恢复${module}`,
     moduleResetConfirmHint: "这只会把本组设置恢复为默认值。",
     fields: {
       provider: "Agent 品牌标识",
@@ -216,6 +219,7 @@ export const TASKS_SETTINGS_STRINGS: Readonly<Record<TasksLanguage, TasksSetting
       pullRequest: "关联 PR",
       timer: "计时 / 完成于",
       context: "上下文占用环",
+      plan: "计划胶囊",
       subtasks: "子任务摘要",
     },
     labelLimit: "标签数量",
@@ -234,8 +238,8 @@ export const TASKS_SETTINGS_STRINGS: Readonly<Record<TasksLanguage, TasksSetting
     showArchived: "显示已归档泳道",
     showArchivedHint: "在已完成之后显示归档任务，时间窗口与已完成相同。仅保存在当前设备。",
     showEmptyGroups: "显示全部",
-    showEmptyGroupsTips: [{ label: "显示范围", text: "筛选菜单和侧栏也显示看板上没有任务的 Agent、项目、工作区和标签，已完成和已归档计入。" }, { label: "保存位置", text: "仅保存在当前设备。" }],
-    showEmptyGroupsHint: "筛选菜单和侧栏也显示看板上没有任务的 Agent、项目、工作区和标签，已完成和已归档计入。仅保存在当前设备。",
+    showEmptyGroupsTips: [{ label: "显示范围", text: "筛选菜单和侧栏也显示看板上没有任务的 Agent、标签、项目和工作区，已完成和已归档计入。" }, { label: "保存位置", text: "仅保存在当前设备。" }],
+    showEmptyGroupsHint: "筛选菜单和侧栏也显示看板上没有任务的 Agent、标签、项目和工作区，已完成和已归档计入。仅保存在当前设备。",
     laneWidth: "泳道宽度",
     laneWidthHint: "用于桌面和非手机布局；仅保存在当前设备。",
     laneWidths: { narrow: "紧凑", default: "默认", wide: "宽松" },
@@ -245,8 +249,6 @@ export const TASKS_SETTINGS_STRINGS: Readonly<Record<TasksLanguage, TasksSetting
     resetTitle: "恢复",
     reset: "恢复任务看板默认设置",
     resetHint: "恢复卡片、看板和侧栏选项；看板开关和自动标题设置不变。",
-    resetAction: "恢复",
-    resetConfirm: "确认恢复",
     resetConfirmHint: "这会把卡片、看板和侧栏选项恢复为默认值。",
     resetCancel: "取消",
     resetKeep: "保留当前选项",

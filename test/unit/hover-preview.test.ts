@@ -4,7 +4,7 @@ import TestRenderer, { act } from "react-test-renderer";
 import "./helpers/quiet-renderer";
 
 vi.mock("react-native", () => import("./helpers/rn-mock"));
-vi.mock("@getpaseo/plugin/client/react-native", () => ({ Icon: "Icon" }));
+vi.mock("@getpaseo/plugin/client/ui", () => ({ Icon: "Icon" }));
 const state = vi.hoisted(() => ({
   hover: true,
   anchors: [] as unknown[],
@@ -29,6 +29,7 @@ vi.mock("../../client/web", () => ({
   bindRowHover: state.bindRowHover,
   bindPreviewMaximize: state.bindPreviewMaximize,
   dropSelectionIn: state.dropSelectionIn,
+  pinTooltipLayer: () => () => {},
   bindPreviewPointer: () => () => {},
   watchNextPointerMove: (_anchor: unknown, moved: () => void) => {
     state.moves.push(moved);

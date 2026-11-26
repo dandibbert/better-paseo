@@ -18,14 +18,14 @@ vi.mock("../../client/details/details-store", () => ({
   useMarkerPhase: () => state.marker,
 }));
 vi.mock("../../client/ui/use-reduced-motion", () => ({ useReducedMotion: vi.fn(() => state.reduced) }));
-vi.mock("../../client/ui/use-input-capabilities", () => ({ useInputCapabilities: () => {
+vi.mock("../../client/ui/use-input-capabilities", () => ({ noteHover: () => {}, useInputCapabilities: () => {
   const native = (globalThis as { __rnMockOS?: string }).__rnMockOS !== "web";
   return { native, hover: !native, touch: native, compact: native };
 } }));
-vi.mock("@getpaseo/plugin/client/react-native", async () => {
+vi.mock("@getpaseo/plugin/client/ui", async () => {
   const rn = await import("./helpers/rn-mock");
   return { Icon: rn.View, ScrollView: rn.ScrollView, TextInput: rn.TextInput,
-    copyText: state.copy, useToast: () => ({ show() {}, error() {} }), useRevealedText: (text: string) => text };
+    copyText: state.copy, useToast: () => ({ show() {}, error() {} }) };
 });
 vi.mock("@getpaseo/plugin/client", () => ({
   useAgent: () => undefined, useWorkspace: () => undefined,
@@ -41,7 +41,7 @@ import { PathText } from "../../client/ui/path-text";
 import { CurrentMarker } from "../../client/details/current-marker";
 import { useReducedMotion } from "../../client/ui/use-reduced-motion";
 import { BlockPlacementContext, type BlockEntry } from "../../client/details/contracts";
-import { buildThemeTokens } from "../../client/components/theme-tokens";
+import { buildThemeTokens, radiusV2 } from "../../client/components/theme-tokens";
 import { ToolCallout, toolRowCopyItems } from "../../client/components/tool-callouts";
 import { ReasoningCard } from "../../client/components/reasoning-trace";
 import { TaskActivityRow } from "../../client/components/task-activity-row";
@@ -50,6 +50,7 @@ import { MarkdownView } from "../../client/components/markdown/markdown-view";
 import { classifyTool, type ToolCallView } from "../../client/tools/classify";
 import { resetEnhancerPreferences, updateEnhancerPreferences } from "../../client/preferences";
 import { Animated, StyleSheet } from "./helpers/rn-mock";
+import { ToolbarCopyButton } from "../../client/ui/toolbar-button";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -94,6 +95,38 @@ afterEach(() => {
 });
 
 describe("details row press zones and registration", () => {
+  it.each([
+    { surface: "#ffffff", foreground: "#111111", alpha: 0.06 },
+    { surface: "#181818", foreground: "#eeeeee", alpha: 0.08 },
+  ])("uses a translucent highlight over plain and striped $surface backgrounds", ({ surface, foreground, alpha }) => {
+    const themed = buildThemeTokens({ surface0: surface, surface1: surface, surface2: surface, border: surface,
+      foreground, foregroundMuted: foreground, accent: "#0000ff", accentForeground: "#ffffff",
+      statusSuccess: "#198754", statusWarning: "#a36a00", statusDanger: "#d92d20" });
+    render(header({ tokens: themed }));
+    act(() => row().props.onHoverIn());
+    const fill = StyleSheet.flatten(row().props.style).backgroundColor as string;
+    const match = /^rgba\((\d+), (\d+), (\d+), ([\d.]+)\)$/.exec(fill);
+    expect(match).not.toBeNull();
+    expect(Number(match![4])).toBe(alpha);
+    const background = parseInt(surface.slice(1, 3), 16);
+    const ink = Number(match![1]);
+    const stripe = background * (1 - 0.04) + ink * 0.04;
+    const composite = (base: number) => base * (1 - alpha) + ink * alpha;
+    expect(Math.abs(composite(background) - background)).toBeGreaterThan(5);
+    expect(Math.abs(composite(stripe) - stripe)).toBeGreaterThan(5);
+    expect(composite(stripe)).not.toBe(composite(background));
+  });
+  it.each([false, true])("uses the footer button radius for row highlights (compact=%s)", (compact) => {
+    const toggle = vi.fn();
+    render(header({ compact, onToggle: toggle }));
+    const expectedHeight = compact ? tokens.typography.block.rowHeight.compact : tokens.typography.block.rowHeight.desktop;
+    expect(StyleSheet.flatten(row().props.style)).toMatchObject({ height: expectedHeight, borderRadius: radiusV2.block });
+    act(() => row().props.onHoverIn());
+    expect(StyleSheet.flatten(row().props.style)).toMatchObject({ borderRadius: radiusV2.block, backgroundColor: tokens.row.hover });
+    act(() => row().props.onPressIn());
+    expect(StyleSheet.flatten(row().props.style)).toMatchObject({ borderRadius: radiusV2.block, backgroundColor: tokens.row.hover });
+    act(() => row().props.onPressOut());
+  });
   it("registers, updates the render thunk and releases only on unmount", () => {
     render(header());
     expect(state.register).toHaveBeenCalledTimes(1);
@@ -133,7 +166,7 @@ describe("details row press zones and registration", () => {
     expect(buttons().some((node) => node.props.testID === "details-chevron")).toBe(false);
     act(() => row().props.onPress());
     expect(state.open).not.toHaveBeenCalled(); expect(toggle).not.toHaveBeenCalled();
-    expect(StyleSheet.flatten(row().props.style).backgroundColor).toBe(tokens.v2.surface2);
+    expect(StyleSheet.flatten(row().props.style).backgroundColor).toBe(tokens.row.hover);
     act(() => { vi.advanceTimersByTime(120); }); expect(StyleSheet.flatten(row().props.style).backgroundColor).toBeUndefined();
     expect(state.register.mock.calls[0]![0]).toMatchObject({ hasBody: false, navigable: false });
     act(() => row().props.onLongPress()); expect(menuLabels()).toEqual(["Copy title"]);
@@ -141,11 +174,13 @@ describe("details row press zones and registration", () => {
   it("expands on every pointer click, Cmd/Ctrl and the panel's current row included", () => {
     (globalThis as { __rnMockOS?: string }).__rnMockOS = "web";
     const toggle = vi.fn(); render(header({ onToggle: toggle }));
+    expect(row().props.dataSet).toEqual({ bcworkdetails: "call:preview" });
     act(() => row().props.onPress({ nativeEvent: { metaKey: true } })); expect(toggle).toHaveBeenCalledOnce();
     act(() => row().props.onPress({ nativeEvent: { ctrlKey: true } })); expect(toggle).toHaveBeenCalledTimes(2);
     // Opened on purpose from the menu, the panel marks this row; a click on it expands, the panel stays.
     act(() => row().props.onLongPress()); act(() => buttons("Open details")[0]!.props.onPress());
-    expect(state.open).toHaveBeenCalledWith("agent", "call:preview");
+    // Under a pointer the menu docks the panel at the side, as the hover's "Open in panel" does.
+    expect(state.open).toHaveBeenCalledWith("agent", "call:preview", { form: "side" });
     act(() => { state.current = "call:preview"; renderer!.update(wrap(header({ onToggle: toggle }))); });
     act(() => row().props.onPress()); expect(toggle).toHaveBeenCalledTimes(3);
     expect(state.close).not.toHaveBeenCalled(); expect(state.open).toHaveBeenCalledOnce();
@@ -164,7 +199,12 @@ describe("details row press zones and registration", () => {
     act(() => row().props.onLongPress()); expect(menuLabels()).toEqual([]);
     act(() => row().props.onTouchStart({ nativeEvent: { pageX: 50, pageY: 200 } }));
     act(() => row().props.onLongPress()); expect(menuLabels()).toHaveLength(3);
-    expect(StyleSheet.flatten(row().props.style).backgroundColor).toBe(tokens.v2.surface2);
+    const item = buttons("Copy command")[0]!;
+    const itemStyle = StyleSheet.flatten(item.props.style);
+    expect(itemStyle.borderRadius).toBe(Number(itemStyle.height) / 2);
+    act(() => item.props.onHoverIn());
+    expect(StyleSheet.flatten(buttons("Copy command")[0]!.props.style).backgroundColor).toBe(tokens.v2.surface2);
+    expect(StyleSheet.flatten(row().props.style).backgroundColor).toBe(tokens.row.hover);
     expect(renderer!.root.findByType("Modal" as never).props.animationType).toBe("none");
     act(() => buttons("Close menu")[0]!.props.onPress());
     expect(menuLabels()).toEqual([]);
@@ -208,6 +248,19 @@ const fixtures: Array<[string, ToolCallView, string[]]> = [
   } }), ["Copy result", "Copy arguments"]],
 ];
 describe("tool menu copy order", () => {
+  it("keeps a step number in the same hover and press area as the tool row", () => {
+    const data = fixtures[0]![1];
+    render(<ToolCallout data={data} tokens={tokens} leading={{ width: 24, content: <React.Fragment>12</React.Fragment> }} />, false);
+    expect(textOf(row())).toContain("12");
+    expect(StyleSheet.flatten(row().props.style)).toMatchObject({ marginHorizontal: -12, paddingHorizontal: 12 });
+    act(() => row().props.onHoverIn());
+    expect(StyleSheet.flatten(row().props.style).backgroundColor).toBe(tokens.row.hover);
+    act(() => row().props.onPress());
+    expect(row().props.accessibilityState).toEqual({ expanded: true });
+    expect(textOf(row())).toContain("12");
+    act(() => row().props.onPress());
+    expect(row().props.accessibilityState).toEqual({ expanded: false });
+  });
   it.each(fixtures)("renders %s copies in design order", (_name, data, expected) => {
     render(<ToolCallout data={data} tokens={tokens} previewKey="tool:preview" />);
     act(() => row().props.onLongPress());
@@ -331,7 +384,7 @@ describe("other detail callers", () => {
     expect(title.props.delayLongPress).toBe(500);
     act(() => title.props.onLongPress());
     expect(menuLabels()).toEqual(["Copy", "Open details", "Collapse in timeline"]);
-    expect(StyleSheet.flatten(row().props.style).backgroundColor).toBe(tokens.v2.surface2);
+    expect(StyleSheet.flatten(row().props.style).backgroundColor).toBe(tokens.row.hover);
     expect(renderer!.root.findAll((node) => node.props.testID === "hover-preview")).toHaveLength(0);
   });
   it("keeps a task activity key stable across data updates", () => {
@@ -360,6 +413,23 @@ describe("other detail callers", () => {
 });
 
 describe("current marker", () => {
+  it("keeps a highlighted row's action centered on a translucent hover fill", () => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = "web";
+    state.current = "call:preview"; state.marker = "on";
+    render(header({ actionsActive: true, actions: <ToolbarCopyButton text="npm test" label="Copy command" tokens={tokens} /> }));
+    const button = buttons("Copy command")[0]!;
+    let overlay = button.parent;
+    while (overlay && StyleSheet.flatten(overlay.props.style).flexDirection !== "row") overlay = overlay.parent;
+    expect(overlay).not.toBeNull();
+    expect(StyleSheet.flatten(overlay!.props.style)).toMatchObject({ flexDirection: "row", alignItems: "center" });
+    expect(StyleSheet.flatten(overlay!.props.style).backgroundColor).toBeUndefined();
+    act(() => button.props.onHoverIn());
+    const look = StyleSheet.flatten(button.props.style);
+    expect(look).toMatchObject({ width: 24, height: 24, alignItems: "center", justifyContent: "center" });
+    const fill = StyleSheet.flatten(button.findByProps({ testID: "toolbar-icon-fill" }).props.style);
+    expect(fill).toMatchObject({ width: 24, height: 24, borderRadius: 12, backgroundColor: tokens.surface2 });
+    expect(fill.backgroundColor).toMatch(/^rgba\(/);
+  });
   it.each([[false, 200], [true, 120]] as const)("mounts only on selection and preserves close, fade and reopening (reduced=%s)", (reduced, duration) => {
     vi.useFakeTimers(); state.reduced = reduced;
     const timing = vi.spyOn(Animated, "timing");
@@ -371,6 +441,7 @@ describe("current marker", () => {
     expect(instances()).toHaveLength(1);
     const instance = instances()[0];
     expect(painted()).toHaveLength(1);
+    expect(StyleSheet.flatten(painted()[0]!.props.style).borderRadius).toBe(radiusV2.block);
     act(() => { state.current = null; state.linger = "call:preview"; state.marker = "linger"; renderer!.update(wrap(header())); });
     expect(painted()).toHaveLength(1);
     expect(timing).not.toHaveBeenCalled();
@@ -391,10 +462,10 @@ describe("current marker", () => {
   });
 
   it("does not initialize animation preferences until the row is selected", () => {
-    render(<CurrentMarker agentId="agent" id="row" tokens={tokens} />);
+    render(<CurrentMarker agentId="agent" id="row" tokens={tokens} radius={14} />);
     expect(renderer!.toJSON()).toBeNull();
     expect(useReducedMotion).not.toHaveBeenCalled();
-    act(() => { state.marker = "on"; renderer!.update(wrap(<CurrentMarker agentId="agent" id="row" tokens={tokens} />)); });
+    act(() => { state.marker = "on"; renderer!.update(wrap(<CurrentMarker agentId="agent" id="row" tokens={tokens} radius={14} />)); });
     expect(renderer!.root.findAllByProps({ testID: "details-current-marker" })).not.toHaveLength(0);
     expect(useReducedMotion).toHaveBeenCalled();
   });
@@ -402,12 +473,12 @@ describe("current marker", () => {
   it("keeps on and linger, then fades for 200 ms on off", () => {
     vi.useFakeTimers(); state.marker = "on";
     const timing = vi.spyOn(Animated, "timing");
-    render(<CurrentMarker agentId="agent" id="row" tokens={tokens} />);
+    render(<CurrentMarker agentId="agent" id="row" tokens={tokens} radius={14} />);
     const marker = () => renderer!.root.findAll((node) => String(node.type) === "Animated.View" && node.props.testID === "details-current-marker");
-    expect(marker()).toHaveLength(1); expect(StyleSheet.flatten(marker()[0]!.props.style)).toMatchObject({ backgroundColor: "#e6e6ff", borderRadius: 6 });
-    act(() => { state.marker = "linger"; renderer!.update(wrap(<CurrentMarker agentId="agent" id="row" tokens={tokens} />)); });
+    expect(marker()).toHaveLength(1); expect(StyleSheet.flatten(marker()[0]!.props.style)).toMatchObject({ backgroundColor: "#e6e6ff", borderRadius: 14 });
+    act(() => { state.marker = "linger"; renderer!.update(wrap(<CurrentMarker agentId="agent" id="row" tokens={tokens} radius={14} />)); });
     expect(marker()).toHaveLength(1); expect(timing).not.toHaveBeenCalled();
-    act(() => { state.marker = "off"; renderer!.update(wrap(<CurrentMarker agentId="agent" id="row" tokens={tokens} />)); });
+    act(() => { state.marker = "off"; renderer!.update(wrap(<CurrentMarker agentId="agent" id="row" tokens={tokens} radius={14} />)); });
     expect(timing).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ duration: 200, toValue: 0 }));
     act(() => { vi.advanceTimersByTime(199); }); expect(marker()).toHaveLength(1);
     act(() => { vi.advanceTimersByTime(1); }); expect(marker()).toHaveLength(0); timing.mockRestore();

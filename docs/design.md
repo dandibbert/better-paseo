@@ -51,16 +51,40 @@ outside scrolling clips and within the viewport.
 - Chat, details and settings space on `space` (4, 8, 12, 16; 24 only between settings sections)
   and round on `radiusV2`: chip 4, block 6, card 8, overlay 12, bubble 16 with a 2 tail, pill full
   (`client/components/theme-tokens.ts`).
-- The board keeps its own constants and does not read `space` or `radiusV2`: card 8
+- The board uses its own card and lane geometry: card 8
   (`CARD_RADIUS`), lane panel 5 (`PANEL_RADIUS`), detail card 12 (`DETAIL_CARD`), menu 12
-  (`MENU.radius`), control rows 6, tablet toolbar buttons 7.
+  (`MENU.radius`), control rows 6, and circular icon-only toolbar buttons.
 - Lines: borders, dividers and pills are a hairline (`HAIRLINE`); action buttons are 0.5
   (`BUTTON_LINE`, see [Buttons](#look)); a dashed subagent card and a card's inner block divider
   are 1. `devicePixel()` gives one device pixel on the web.
 
+### Mobile bottom sheet spacing
+
+Use the shared values in `client/ui/tokens/sheet.ts` for horizontal spacing inside
+plugin-controlled bottom sheets. Measure from the sheet's content edges after safe area
+handling.
+
+| Region | Left and right inset |
+| --- | --- |
+| Toolbar action groups and the phone task stepper | 4 pt (`SHEET_TOOLBAR_INSET`) |
+| Body and body-aligned footers | 8 pt (`SHEET_BODY_INSET`) |
+
+- Conversation drawers use both values in the shared details toolbar and scroller. Keep the
+  wrap button next to the size controls without an extra group gap. Use the same insets when
+  calculating how many copy actions fit or when folding the size controls.
+- In Work details, align the filters, intent and step rows to the body inset. Row stripes and
+  the pinned step background reach both sheet edges. The step number column reserves space
+  for the largest step number at its rendered font size.
+- Task sheets use the body inset for cards, filter sections and dialog content. The native
+  task scrollbar borrows the right inset and restores it as content padding so cards keep
+  symmetric margins. Translation sheets and settings editors use the same body inset.
+- Component padding inside fields, buttons and cards follows each component's own rules.
+  Host-owned headers use the host layout. Anchored menus and desktop panels use their
+  existing geometry.
+
 ### Surfaces and states
 
-A resting, hover or selection state is a mix into the surface under it (`mix(from, to, t)`),
+A Tasks resting, hover or selection state is a mix into the surface under it (`mix(from, to, t)`),
 so it reads the same on any card. The transient lane/reply flash uses an animated accent overlay
 (`useFlash`), and text-edge fades use bands of the underlying fill. The board's card surface is `surface0` on a light theme and
 `surface2` on a dark one (`cardTokens`, `client/tasks/cards/tokens.ts`).
@@ -68,29 +92,32 @@ so it reads the same on any card. The transient lane/reply flash uses an animate
 | Token | Mix | Light / dark | Used for |
 | --- | --- | --- | --- |
 | `hoverBackground` | card → foreground | 4% | kept; a card does not paint it on hover or with its menu open |
-| `controlHover` | card → foreground | 7% / 10% | kept for contrast and subtask rows; buttons do not paint it on hover or press |
+| `controlHover` | card → foreground | 7% / 10% | kept for card action contrast; subtask rows use the shared 5% / 8% fill |
 | `current`, `currentBorder` | card → accent; border → accent | 7% / 10%; 45% | the card shown in the details |
 | `highlight` | card → accent | 8% / 12% | a card the board just pointed at, for 1 s, with an accent border |
 | `failed`, `failedHover`, `failedBorder` | card → danger; border → danger | 5% / 8%; 8% / 12%; 35% / 40% | a failed card stays `failed`; `failedHover` is kept |
 | `pillFill`, `pillBorder`, `buttonBorder` | card → foreground; border → foreground | 3.5% / 6%; 5% / 8%; 5% / 20% | neutral pills, outlines |
-| `rowHover`, `rowPress`, `sunk`, `track` (`detailColors`) | card → foreground | 5%, 8%, 2.5%, 9% | detail rows, hero blocks, bars |
+| `rowHover`, `rowPress`, `sunk`, `track` (`detailColors`) | card → foreground | 5%, 8%, 2.5%, 9% | detail rows, hero blocks, bars; the detail back row shares `rowHover` |
 | Lane panel (`boardPalette`) | `surface1` dark; halfway `surface1` → `surface2` light | `panelHover` is `surface2`, unused as a fill | lanes |
 
 - When states stack on a card, the first applies: highlighted, current, failed, rest. Hover and an open menu do not change the fill.
-- Card shadow: `0 1 2` at 6% (18% dark) at rest, `0 2 6` at 14% (38% dark) while a desktop card is hovered or its menu is open, and while a phone or iPad card is pressed. Buttons and capsules use that same deeper shadow (`buttonShadowHover`).
+- Card shadow: `0 1 2` at 6% (18% dark) at rest, `0 2 6` at 14% (38% dark) while a desktop card is hovered or its menu is open, and while a phone or iPad card is pressed. Buttons inside lane cards use that same deeper shadow (`buttonShadowHover`).
 
 ### Lift
 
-Cards, the sidebar's capsules, and the board's buttons share one treatment (`surfaceLift` in `client/tasks/cards/surface-lift.ts`). It adds no colour fill.
+Tasks has two hover treatments:
 
-- On desktop web, a fine pointer (`(hover: hover) and (pointer: fine)`) deepens the shadow while hovered. Nothing scales.
-- On a phone, a touch browser, and an iPad (the app, trackpad included), the deeper shadow and a scale of 1.03 happen only while pressed. Hover, including an iPad pointer, does not.
-- Reduced motion skips the scale and keeps the shadow. Action buttons animate the scale over 100 ms; the other controls snap.
-- A selected, open, current, expanded, or on fill stays where the control has one. The tablet toolbar's Subtasks switch has no selected fill. The stop chevron keeps its danger wash while its menu is open. An expanded pill keeps its 6% wash. Chat rows, menu rows, detail property rows, subtask rows, and the lane panel are outside this treatment.
-- Menu chrome (`menuChrome`): `surface0`, hairline border, hover foreground 5.5% (8% dark),
+- Lane cards and their action buttons keep `surfaceLift` in `client/tasks/cards/surface-lift.ts`: a fine pointer deepens the shadow, and a phone or iPad press deepens the shadow and scales to 1.03. Reduced motion omits the scale. The subtask cell and error-dismiss button are exceptions and use the shared fill below.
+- Other interactive Tasks controls, including toolbar controls on desktop, phone and iPad, details, filters, menus and subtask cells, mix their actual underlying or selected surface toward the theme foreground by 5% on hover and 8% on press (`hoverFill` in `client/tasks/hover-fill.ts`). They do not add a hover shadow or scale. Selection, semantic colours and disabled state remain visible; disabled controls do not receive the fill. Badge rings and slash cutouts follow the resulting background.
+- A pointer on an iPad can show hover; touch shows the press state. The colour mix follows the active theme, including dark themes.
+- Menu chrome (`menuChrome`): `surface0`, hairline border, hover foreground 5%,
   shadow `0 4 24` and `0 1 3` at 8% and 4% (45% and 30% dark). `panelChrome` reuses it.
-- Chat rows have no surface at rest: `surface1` hovered, `surface2` pressed or held. The chat's
-  `surface1` and `surface2` are the foreground at 2.5% and 4.5% (3% and 6% dark) over the page.
+- Chat disclosure rows have no fill of their own at rest. Hover, press, held long-press and an
+  open row menu use `row.hover`: the theme foreground at 6% opacity in light themes and 8% in
+  dark themes (`client/components/theme-tokens.ts`). This translucent overlay preserves the
+  actual surface beneath it, including the alternating backgrounds in the work-details sidebar.
+  The work file rows use the same highlight. The chat's separate `surface1` and `surface2` tokens
+  remain foreground at 2.5% and 4.5% opacity (3% and 6% dark).
 
 ### Motion
 
@@ -135,7 +162,7 @@ rule: put its movement behind `motionDuration` and keep at most a short fade.
 - Reading content is selectable (`selectableSurface` overrides the host timeline's
   `user-select: none`); chrome is not: icons, control labels and row verbs use `unselectable`.
   Native has no inheritance, so each text there takes `selectableTextStyle`.
-- On the web a scroller hides its scrollbar while idle. A lane or details column shows a 6 pt
+- On the web a lane or details column hides its scrollbar while idle and shows a 6 pt
   thumb (radius 3) while it scrolls and fades it out 800 ms after the last scroll (in 100, out
   400); its gutter stays reserved so nothing shifts. A horizontal track (`h-scroll.tsx`) is 2 pt
   and holds for 1 s. Native draws the platform indicator.
@@ -145,8 +172,7 @@ rule: put its movement behind `motionDuration` and keep at most a short fade.
 - Hover comes from capability, not screen size: `useInputCapabilities` reports hover from
   `(hover: hover) and (pointer: fine)` on the web and from a real hover on native (an iPad
   pointer); touch is a coarse pointer or no hover. Every hover affordance has a touch equivalent:
-  a persistent button, a long press or a tap. The [lift](#lift) is separate: an iPad pointer still
-  lifts on press, not on hover.
+  a persistent button, a long press or a tap. The [hover treatment](#lift) follows the pointer capability and the control context.
 - The board picks its touch sizes by platform: any native client is touch (`TOUCH`,
   `Platform.OS !== "web"`), so an iPad draws desktop lanes with touch targets. The phone layout
   (`compact`) is a separate switch.
@@ -154,10 +180,58 @@ rule: put its movement behind `motionDuration` and keep at most a short fade.
   and 36 on native; tablet toolbar buttons and detail header menu/close buttons are 32 on touch,
   with 28 targets for the detail header on desktop. Detail rows, headings and buttons are 32,
   44 on touch; chips 22, 28;
-  sidebar group rows 36, 44; card buttons 28, at least 32 on a phone; copy buttons 24 with a 32
+  sidebar group rows 36, 44; card buttons 26 on desktop web, 28 on native tablets, at least 32 on a phone; copy buttons 24 with a 32
   hit area. A long press is 450 ms on a card and 500 ms on a chat row.
 
+### Update reminder dots
+
+Use one small red dot for an available plugin or agent update across the Tasks board and
+settings. The dot is a solid 4 × 4 pt circle (radius 2) in `#da4738`, from
+`UPDATE_INDICATOR_COLOR` in `client/ui/update-indicator.ts`. Keep its size and colour the
+same on light and dark surfaces; do not substitute a theme's danger colour. This reminder
+is distinct from task-status marks, notification counts and other semantic indicators.
+
+- On an icon-only More button, place the dot close to the icon's bottom-right corner, not
+  at the edge of its touch target. Keep any filter-count badge visible and separate. The
+  phone More button uses `bottom: 10, right: 11` in its 44 pt target; desktop More uses
+  `bottom: 2, right: 2` in its toolbar target.
+- Beside text, vertically centre the dot against the label's text box, 4 pt after the label;
+  only icon-only controls place it at the bottom right. Use `TextUpdateDot` for overlaid text
+  reminders so the dot is centred by the label-height container rather than a percentage offset.
+  Keep inline reminders centred on their text row. The filter sheet's Settings
+  button and the settings Version segment centre the label independently of the dot, keeping
+  the control's width and the label's position stable as the reminder appears. Agent-version
+  rows and the version check button keep the same 4 pt separation; the desktop More menu places
+  its Settings reminder immediately after the label, before the shortcut.
+- Keep the dot decorative and non-interactive. The associated control or status must convey
+  the available update to assistive technology; the dot must not intercept presses or obscure
+  text, icons, counts or neighbouring controls.
+- Check the shown and hidden states on desktop and phone, in English and Chinese, with larger
+  interface text and narrow widths. Cover the phone More/filter-count combination and the
+  filter sheet's Settings label spacing with `test/unit/tasks-board-render.test.ts`; verify
+  the settings indicators in `test/unit/tasks-settings-page.test.ts`. Native visual acceptance
+  remains separate from simulated layout tests.
+
 ## Icons
+
+### Icon and label consistency
+
+These rules apply to the named controls across desktop, tablet and phone, web and native, in light and dark themes. Other surfaces remain subject to their existing rules until audited. Touch targets and icon sizes may vary by platform. All values are logical points at the default text size; fixed gaps do not scale with larger text.
+
+| Scope | Icon-to-label gap | State |
+| --- | --- | --- |
+| Three message section headings | 4 pt from the 14 pt `Icon` layout box to the text layout box | No icon backing; all three icons use `foregroundMuted`, including the last reply. The heading stays `foreground`, weight 600; keep the existing icon shapes. |
+| Named card and detail action buttons, filter menu buttons, filter chips and the phone sort pill | 4 pt between the leading icon box and label | Keep each action's semantic colours and each chip's existing accent border, fill, text and brand marks. Tail arrows and hints retain their separate layout and require individual review. |
+| Named phone card-menu, sort and filter-switch rows | 8 pt between leading icon box and label | Menu leading icons use `foregroundMuted`, danger actions keep danger, checked choices keep the `accent` check. Switch state stays on its track. |
+| Named persistent Subtasks and Archived icon-only switches on desktop, tablet and phone, web and native | No label gap | Use `foreground` in both states, with no state-dependent control fill. Distinguish states by the icon shape or archive slash; keep the badge and accessibility semantics. |
+
+A message heading positions the 14 pt icon 5 pt inside its wrapper, with 4 pt from the icon box to the text. Keep its existing left alignment and hit area; do not add a gap outside a centered 24 pt wrapper.
+
+For these icon-only switches, the archive slash and hidden-subtask badge appear when off: match the slash cutout and badge ring to the control's actual background (`surface0` on these toolbars). Keep the shared `CornerBadge` default unchanged; a caller supplies its own ring colour when needed. Search, sidebar, filter/menu expansion, chips, lane-status icons, copy-success feedback, errors, warnings, brand marks and primary actions keep their own semantics and are not covered by this switch state. The message headings are not toggles and never gain a selection background or green reply icon. Distinguish hover, press, focus, selection, expansion and disabled states.
+
+Audit the remaining chat, settings and detail controls separately rather than treating them as automatic changes. Reconcile each implemented control's description here in the same change. Measure the actual icon box and wrappers; update fitting calculations with visual gaps. Check `en` and `zh`, large system text, dark and light themes, and desktop, tablet and phone. Mockups are not native-client verification.
+
+### Timeline icon family
 
 Every icon in the timeline is one line family: the host's Lucide set, drawn at the host's stroke.
 A tool row, a preview header, a hub or agent card all draw from it. Where a call belongs to a
@@ -291,7 +365,7 @@ Every tool call, notice and grouped call is one disclosure row (`DISCLOSURE_HEAD
 | Part | Rule |
 | --- | --- |
 | Height | 26 desktop, 28 touch; a 44 hit area on touch |
-| Bleed | 8 into the gutter on each side, padded 8 back; radius 6 |
+| Bleed | 8 into the gutter on each side, padded 8 back; radius 6 (`radiusV2.block`) |
 | Icon slot | 16 wide plus a 2 trailing pad around a 14 icon; text starts at 24 (`textColumn`) |
 | Verb | 13/18, weight 500 |
 | Target | 12/18 mono, cut in the middle at 72 characters (40 compact) |
@@ -311,11 +385,14 @@ Every tool call, notice and grouped call is one disclosure row (`DISCLOSURE_HEAD
 - **Status in the slot**: a running row draws the accent running dot; a failed row draws its icon
   and its failure meta (`exit N`, `failed`, `timed out`) in `danger`, and while collapsed adds one
   selectable error line under the text. Exit 0 reads `✓`, any other exit `✗ N`.
-- **States**: no frame or fill at rest, `surface1` hovered, `surface2` pressed or held. With a
-  pointer the chevron replaces the icon while the row is hovered; an open row keeps a down chevron
-  unless its icon reports status. A row with nothing to open is inert: it does not light up and
+- **States**: no frame or fill of its own at rest; hover, press and held states use the translucent
+  `row.hover` overlay described in [Lift](#lift), including rows in work details. The highlight is
+  a rounded rectangle with a fixed 6 pt radius on all four corners (`radiusV2.block`), covering
+  the row rather than a pill with half-height corners. The work file header and file rows use the
+  same 6 pt corners. With a pointer the chevron replaces the icon while the row is hovered; an open
+  row keeps a down chevron unless its icon reports status. A row with nothing to open is inert: it does not light up and
   its text is selectable. `rowLabelStyle` may hide the verb or the icon; the slot stays, so the
-  text column never moves.
+  text column never moves. The current-row marker uses the same 6 pt radius.
 - **Expanding**: tools start collapsed. A failure opens when the reader chose to expand failures,
   and a child agent that needs permission always opens. The body is a `surface1` slab, radius 6,
   padded 8 × 12, 2 above and 6 below, with no frame; a permission or warning body adds a 1 pt
@@ -325,7 +402,8 @@ Every tool call, notice and grouped call is one disclosure row (`DISCLOSURE_HEAD
 - **Row actions**: with a pointer, copy buttons overlay the end of the target on the row's hover
   fill, so the meta never moves, and their tips open above. On touch the actions show at the row's
   end only while it is open; a collapsed row opens its menu on a long press (500 ms; a 10 pt move
-  cancels), which the web's context menu also opens.
+  cancels), which the web's context menu also opens. Menu rows use a half-height radius for
+  hover and press feedback.
 
 ### Thoughts, todos and messages
 
@@ -344,9 +422,20 @@ Every tool call, notice and grouped call is one disclosure row (`DISCLOSURE_HEAD
   trailing line holds Copy, the rewind menu, the time and the usage.
 - **Notice**: a row. Info is a muted `Info`, warning `TriangleAlert`, error `CircleX`, fatal
   `OctagonX` at weight 500; error and fatal add a 2 pt left rule. Long or technical text opens in
-  a mono block on `surfaceCode`.
-- **Turn footer**: one line 24 high, 8 above and 16 below: Copy, the model with its provider logo,
-  the clock, the duration. On a phone it drops the clock, then the model, rather than wrap.
+  a mono block on `surfaceCode`. The host's own background-job notice and error item both transform
+  into this row; nothing about a notice is drawn as a tinted card.
+- The **reply block translation** control (`InlineReplyBlock`) is an icon-only 24 × 24 pt button
+  in a reserved 32 pt right gutter. The button's right edge is flush with the reply content
+  column's right edge. Its centre follows the first visible line of the original or translated
+  block, including the header of a code block. The gutter keeps the control clear of the text
+  without adding a row or changing the gap between blocks. Show it on hover with a pointer,
+  on touch, and while translation is active. Translate and Show original share the same button
+  box and right alignment, with their own icons and action hints. Image-only reply blocks
+  have no inline translation control or gutter.
+- The **turn footer** fits on one line 24 high, with 8 above and 16 below. It holds Copy,
+  Translate when available, the model with its provider logo, the clock and the duration.
+  The footer's Translate opens a preview of the whole reply. On a phone the footer drops the
+  clock, then the model, to stay on one line.
 - Rows take back 12 of the host's 16 between timeline items (`ROW_GAP_COMPENSATION`).
 
 ### Markdown
@@ -364,10 +453,15 @@ Every tool call, notice and grouped call is one disclosure row (`DISCLOSURE_HEAD
 - Code blocks: `surfaceCode`, radius 6, no border. A 30 header (32 native) carries the language,
   Wrap and Copy (24 buttons; Copy shows a check for 1.2 s). Blocks start wrapped and fold after 12
   lines; the document variant numbers blocks of 4 or more lines.
+- Timeline block header actions whose icons already distinguish two states, including Wrap, use
+  the same resting background in both states, without a persistent selected fill. Keep normal
+  hover, press and keyboard focus feedback and the control's accessibility state. Copy retains
+  its temporary success icon.
 - Tables: a 1 pt frame, radius 6; the header row on `surface2` with muted weight-500 text;
   all-numeric columns right-aligned; sideways scroll with the indicator shown only while
-  scrolling. The copy control is a 30 square at the top left (radius 12); on the web it opens to
-  Copy as Markdown and Copy as image.
+  scrolling. The copy control sits at the top left: on the web the expandable 30 pt frame
+  has radius 12 and opens to Copy as Markdown and Copy as image; the standalone 30 pt
+  control is circular. Their action feedback follows the icon and row rules below.
 - Paths (`PathText`): a pointer press reveals the file, and hovering shows the full path after
   400 ms with an underline; a tap copies the absolute path with a toast.
 - Images: a `surfaceCode` card with a 28 header and a show/hide toggle, the canvas on `surface0`,
@@ -375,6 +469,14 @@ Every tool call, notice and grouped call is one disclosure row (`DISCLOSURE_HEAD
   zoom 0.25 to 8; a double tap resets, and a 96 pt drag, a flick, Escape or back closes it.
 - Selected text on the web raises a floating Copy / Add to chat bar; native uses the platform
   menu.
+- The desktop web translation popup uses the same floating bar for timeline selections and Tasks
+  message translations (`client/components/selection-actions.ts`). Its scrollable translation body
+  has a 4 px vertical scrollbar with a 2 px radius, a transparent track and a thumb in
+  `--bc-bar-subtle` at 40% opacity. The body extends 8 px into the panel's right padding
+  (`margin-right: -8px`) and keeps 10 px of right content padding. This places the scrollbar at
+  the frame's 2 px inner inset, close to the right edge, while leaving space after the text.
+  Keep the scrollbar draggable above the right resize target, and preserve the popup's resize
+  interaction. Native translation sheets use the platform scroll indicator.
 
 ### Block details and previews
 
@@ -394,14 +496,26 @@ Every tool call, notice and grouped call is one disclosure row (`DISCLOSURE_HEAD
 - Header 44 pointer, 52 touch: a 28 `surface1` icon tile (radius 7, 16 icon), the title 14/20
   weight 600, a subtitle with `i / n`, then previous, next and close. Toolbar 36, 44 on touch. The
   current row in the timeline takes an `accentSoft` fill and a 2 pt accent bar.
-- Text size: on native a pinch sets an absolute size from 12 to 26 (default 14), and the Text size
-  badge, with − / + and Reset, stays 2 s after the fingers lift. The web has no pinch.
+- Text size: on native a pinch sets an absolute size from 9 to 26 (default 14), and the Text size
+  badge, with − / + and Reset, stays 2 s after the fingers lift. The web has no pinch. The toolbar
+  carries − / size / + after line wrap, as on the desktop; pressing the size resets it. Where the
+  three would leave the copies no room for one button, a phone folds them into one Text size button
+  that raises the badge.
+- An opened work step in the details panel pins its row under the toolbar while its output scrolls
+  past, however short the output, and the step's end pushes it out. Closing the row while it is
+  pinned brings the list back to the row; switching blocks or closing the panel leaves the scroll.
+  On the web the browser pins it (`position: sticky`), so it holds at any scroll speed; with lines
+  unwrapped the steps list scrolls sideways in the panel body itself, under the body's own
+  scrollbar, rather than in a scroller with its own track.
 - Hover preview: on the web it opens after the reader's hover delay (default 1 s) and closes
   150 ms after the pointer leaves; it spans the content column 6 below the row, above it when
   below has no room, at most 360 tall. Native opens it pinned on a long press. Its toolbar ends
   with Maximize and Open in panel.
-- Copy buttons are a 24 box with a 14 icon and a 32 hit area, and show a plain check for 1.2 s.
-  Toolbar buttons are 24 with 14 icons and a tip after 400 ms.
+- Icon-only buttons in timeline blocks, expanded content, previews and details use a circular
+  hover and press fill with diameter `round(icon size × 1.7)`, centered within the unchanged
+  target. This includes copy and toolbar actions; their labelled menu rows use pill-shaped feedback.
+  The default copy button has a 14 icon in a 24 box and a 32 hit area, and shows a plain check
+  for 1.2 s. Toolbar hints appear after 400 ms.
 
 ## Colour
 
@@ -465,9 +579,29 @@ control row is rounded at 6. An icon in a pill or row is the size of the Lucide 
 | Phone filter sheet chip | `filter-sheet.tsx` | 32 | 4 | none; `accentSoft` when on | 14 | `base` |
 | Menu row | `menu.tsx`, `MENU` | 32 | 6 | none; `chrome.hover` hovered | 16 | `base` |
 | Sidebar group row | `details-sidebar.tsx` | 36 (44 touch) | 6 | none; `surface2` when on | 16 in a 20 slot | `base`, count `sm` |
-| Card button | `CardButton` in `action-buttons.tsx` | 28 (at least 32 phone) | 6 (7 phone) | none; shadow per [Lift](#lift) | 13 (14 phone) | `sm`, weight 500 |
+| Card button | `CardButton` in `action-buttons.tsx` | 26 desktop web, 28 native tablet (at least 32 phone) | 6 (7 phone) | none; shadow per [Lift](#lift) | 13 (14 phone) | `sm`, weight 500 |
 
 All heights grow with the host's interface text size through `taskControlHeight`.
+
+### Timeline level pill
+
+The composer pill and its popover are registered in `client/timeline-level-control.ts`;
+`client/timeline-level-menu.tsx` draws the popover contents. The host owns the pill,
+the outer surface and its placement. Keep the popover's title and option labels at
+14/18 pt, normal weight, matching the primary text in Paseo's subagent popover.
+The title is Agent steps / 工作过程, with a 16 pt Settings icon on the right; a
+hairline separates it from the three choices. The header and option rows are 28 pt
+on wide layouts and 44 pt on compact layouts. On wide layouts the content pulls back
+8 pt of the host's 12 pt popover padding, leaving a 4 pt inset. The settings target
+is square and matches the row height.
+
+Simple, Standard and Detailed use 16 pt `Minus`, `Equal` and `Menu` icons in
+`foregroundMuted`, an 8 pt gap, and a trailing 16 pt `Check` in `foreground` for
+the current level. Rows have 8 pt horizontal padding, radius 6, and use `surface2`
+on hover or press. Selecting a level closes the popover, updates the shared preference
+and shows the existing confirmation toast. Settings closes the popover and opens
+Better Paseo on its Chat settings tab. Keep the labels and accessibility state in
+sync with the selected preference in both languages.
 
 ### Thinking level labels
 
@@ -524,8 +658,7 @@ Unarchive, Open tab. None is ever filled with its hue.
 
 - **At rest** only the border, the label and the icon carry the button's colour. The fill is
   the surface under it: transparent on the card, the card colour in the sidebar and the bar.
-- **Hovered or pressed** follows [Lift](#lift): the shadow deepens, and a phone or iPad also
-  grows to 1.03 while pressed. The fill does not change. A desktop hover does not scale.
+- **Hovered or pressed** follows [Lift](#lift): lane-card buttons keep their shadow treatment; sidebar and action-bar buttons use the shared 5% hover / 8% press fill.
 - **Armed**, "Confirm stop" keeps Stop's colours exactly; its words change and its icon turns from
   Lucide's `Power` to `OctagonAlert` (`CONFIRM_STOP_ICON`), the stop sign asking for the second
   press. It keeps that icon when its label folds on a narrow row.
@@ -552,6 +685,22 @@ Unarchive, Open tab. None is ever filled with its hue.
 `CardButton`, `ReadControl`, `StopControl`, `OutlineButton`, `RequestButton` and `BarButton` all
 take them from it, and `requestLook(button)` picks a permission button's look in every place.
 A new action button takes a look from the table rather than its own colours.
+
+Center the visible label and icon together inside a centered action button, not just their layout
+boxes: account for empty space inside the icon, especially a trailing arrow. Preserve the intended
+icon-to-label gap, button size and hit area; icon-only controls stay centered in their full box.
+Check the result in each affected surface, language and icon-only state, including native layout.
+
+### Dialog footers
+
+A dialog footer's action is not a card action. It takes the rename dialog's shape
+(`client/tasks/cards/rename-dialog.tsx`): 44 high with radius 22 and the theme hairline on
+touch, 32 high with radius 12 filled `surface2` and no border on the web. Do not reuse the
+card's outline look (`CardButton`) or hand-draw a pill: a dialog is not a card, and a footer
+action that matches neither the card row nor the dialog reads as a different product. The
+hidden task dialog's "Clear filters" is the first of these; its label is `status.warning`,
+because the action changes which tasks the board shows. Keep one footer action per dialog
+unless the dialog also has a primary; then the primary takes the accent.
 
 ### Same buttons on the card and in its details
 
@@ -587,7 +736,7 @@ Default. Wide stays at 300 pt when the board is below 632 pt; wider boards retai
 existing preset ranges.
 
 An icon-only button keeps its outline, colour, height, action and full accessibility label.
-Its width is its base target height (28/32 pt on cards, 48 pt in the sheet bar); its height
+Its width is its base target height (26 desktop web, 28 native tablet, 32 phone on cards; 48 pt in the sheet bar); its height
 still grows with large type. A split Stop button additionally reserves its menu segment.
 Keep confirmation (`OctagonAlert`), working spinner and disabled semantics in icon-only mode.
 A spinner replaces the action icon, so a folded working button never draws a second arrow.
@@ -858,6 +1007,41 @@ apply to all three.
   a phone they fill a row at the card's bottom with Open tab last. A desktop permission card puts
   its answer buttons and footer on one row.
 
+### Request section
+
+A card that waits on a request names the request, then gives its answers.
+
+- The request's text starts at the card's edge, at most 2 lines: its kind in weight 600, a muted
+  ` · `, then its summary, in the card's block text. A tool shows its command or file; a plan
+  shows its title.
+- A plan's title is the first line of its Markdown, without a heading's `#`, a list marker or
+  emphasis (`planTitle` in `client/tasks/data/index.ts`). Claude's ExitPlanMode and Codex's plan
+  approval both carry the plan in `input.plan`, with `metadata.planText` as the fallback. Never show
+  the request's fixed description ("Review the proposed plan…") in place of the plan's title.
+- "View plan" (`查看计划`) ends the title's row: `FileText` 13 and the `sm` label in weight 500,
+  muted, `foreground` on hover, with no outline. On cards it has no hover fill; in details it uses the shared fill. It is a link to read the plan, not an
+  answer, so it never joins the answer row or takes an answer's look. It does not shrink; the
+  title gives up width first. Touch layouts widen its target with `hitSlop`, so the row does not
+  get taller.
+- "View plan" opens the whole plan as Markdown in the host's `Modal`, titled "Plan". The plan's
+  own first heading already repeats the title, so the dialog does not. On the card, the dialog
+  mounts outside the card's pressable, and the button stops its press, so neither selects the card.
+  The dialog belongs to the request it opened on: an answered plan or a newer one closes it.
+- The details' request block uses the same row: the request's icon, its kind, then "View plan". A
+  plan's title sits in the summary box as text in weight 500. Commands and files keep the code
+  face.
+- In phone and tablet details, a question keeps one `sunk` request card: the question text sits
+  directly in it, followed by the elapsed time at the left and a single "View questions" action
+  at the right. The action opens the existing question dialog; the details do not repeat the
+  inline answer form. Desktop details also show question text directly inside the request card,
+  while keeping their existing quick answers and question-dialog action. Board cards and other
+  request kinds keep their existing actions and layout. On touch, if no question-dialog action is
+  available, retain the existing request UI.
+- Changes to this row must still pass the Yoga layout case in
+  `test/unit/tasks-card-action-layout.test.ts`: "View plan" keeps its whole label inside the phone
+  card, the desktop card and the details at 240 to 387 pt and text scale 1 to 1.8, in Chinese and
+  English.
+
 ### Lanes
 
 - Widths follow the lane width presets in [tasks-board.md](tasks-board.md) (`LANE_SIZES`), with 8 between lanes and 12 at
@@ -880,7 +1064,7 @@ apply to all three.
 | Toolbar | Height | Targets | Contents |
 | --- | --- | --- | --- |
 | Desktop (`DesktopToolbar`, `DesktopFilterBar`) | 48, then a wrapping filter bar of at least 44 | 28 | search 320 wide (radius 6, 13 icon), the centred total at base weight 600, round switches; filter menu buttons and chips of radius 6 |
-| Tablet (`TabletToolbar`) | 40 | 32 | see [tasks-board.md](tasks-board.md); buttons radius 7, `surface1` when selected or expanded, except the Subtasks switch |
+| Tablet (`TabletToolbar`) | 40 | 32 | see [tasks-board.md](tasks-board.md); icon buttons are circular, with no selected fill for two-state icons and `surface1` for expanded menus |
 | Phone header (`phone-board.tsx`) | at least 52 | round buttons | the total at lg weight 600, a 28 sort pill, then Search, Subtasks, Archived, Filters |
 
 - Board toolbar actions and detail header menu/close buttons share `TASK_TOOLBAR_METRICS`
@@ -889,6 +1073,9 @@ apply to all three.
   icons in 32 pt targets, with only targets growing through `taskControlHeight`. Keep adjacent
   detail header controls in one group with the tablet toolbar's 0 pt extra gap; target padding
   separates the glyphs. Do not assign larger, independent sizes to the detail header icons.
+- The tablet toolbar's right-hand action group sits 6 pt closer to the board edge. All its
+  buttons keep the same spacing and full touch targets. With a 32 pt target the sidebar's
+  16 pt panel mark ends 14 pt from the board edge; targets grow with larger interface text.
 - Search width is fixed at 320, independent of filter-label measurements, task counts and
   active filters. At board widths below `960 * max(1, scale)`, desktop and tablet show only
   the Search button; pressing it opens a separate row below the toolbar with autofocus,
@@ -899,8 +1086,10 @@ apply to all three.
   Phones keep their existing Search button and expandable pill below the header.
 - Wide desktop: the top row ends with Show groups with no tasks, then the sidebar
   switch. The filter bar's right side orders Collapse empty lanes, Subtasks, Archived, Lane
-  width, Time range, then Sort. Agent, Project and Workspace menus also offer the empty-groups
-  switch at their foot; Labels does not. When the filter bar folds into the header, keep
+  width, Time range, then Sort. The filter buttons order Agent, Labels, Project, then Workspace,
+  and the sidebar tabs, filter sheet and card filter menu use that same order. Agent, Project
+  and Workspace menus also offer the empty-groups switch at their foot; Labels does not. When
+  the filter bar folds into the header, keep
   Collapse empty lanes, Archived, Filters and the sidebar switch in that order; the filter
   panel owns the remaining choices. If the header's measured action slot cannot fit, fold its
   view actions into View while keeping Filters separately reachable.
@@ -924,12 +1113,16 @@ apply to all three.
   search is not empty. Switching the time range does not show the circle. The subtask switch,
   archived lane, empty groups, lane width and sort already show their own state and do not add
   to it. Zero draws nothing.
-- The tablet Subtasks switch stays transparent in both states; its icon and hidden-card badge
-  communicate the state. Keep its accessibility selected state and the normal press lift.
+- Across phone, Pad, web and desktop, toolbar action icons that already distinguish two states
+  by their glyph, slash or panel mark never add a persistent selected fill. This includes
+  Subtasks, Archived, the details sidebar, empty-lane folding and search scope. Keep the
+  same resting background in both states, accessibility selected/checked state, hidden-card
+  badges and normal hover/press feedback. Badge rings and slash cutouts match the resting
+  surface. Menu expansion, menu selections and segmented controls retain their own treatment.
 - Round buttons (`RoundButton`) are a 36 circle in a 44 target with a hairline, an accent border
-  when active, and a badge at least 20 high on the accent with a 2 pt `surface0` ring.
-- Desktop toolbar icon buttons with `quietOutline` use radius 7 and a transparent hairline at
-  rest; hovering reveals the theme border and the shared button shadow without a fill.
+  when active, and a badge at least 20 high on the accent with a 2 pt `surface0` ring. The persistent Subtasks and Archived switches use the icon-only selection treatment above.
+- Desktop toolbar icon buttons with `quietOutline` are circular with a transparent hairline at
+  rest; hover and press use the shared fill while retaining the transparent outline.
 - An on/off switch in a toolbar is a round button whose icon tells the state; Archived is struck
   through while the lane is hidden. Segmented controls (`Segments`) are 28 high on the desktop
   (radius 6, inner 4), 32 and fully round on a phone, the chosen cell on `surface2`.
@@ -951,16 +1144,16 @@ apply to all three.
   | --- | --- | --- |
   | More actions | 200 maximum, fitted to content on web | Action labels and shortcuts; fitted rows retain `round(32 * max(1, scale))` after the label |
   | Agent | 240 | Provider mark, name, count and selection check |
+  | Label | 200 | Tag mark, name, count and check |
   | Project | 280 | Project name and folded path, count and check; `PROJECT_PATH_COLUMNS` uses this same base width |
   | Workspace | 260 | Project heading, workspace names, counts and checks |
-  | Label | 200 | Tag mark, name, count and check |
   | Lane width | 180 | Width mark, translated name and check |
   | Sort fields | 220 | Field icon, translated name, active direction and submenu chevron |
   | Sort directions | 190 | Direction icon, translated direction and check |
   | Selected-filter group | 280 | Selected values, optional kind hints, checks and Clear filters |
   | Tablet View and its drill-down pages | 220 | Translated actions and layout choices in one touch panel |
 
-  Keep the existing row gutters (6 pt), horizontal padding (8 pt) and column gaps (8 pt).
+  Keep the existing row gutters (6 pt), horizontal padding (8 pt) and column gaps (8 pt). Phone card-menu, sort and filter-switch rows also use an 8 pt icon-to-label gap.
   Ordinary dropdowns use the full calculated width instead of hugging short labels; long
   labels keep their existing one-line ellipsis and cannot displace counts, checks or
   chevrons. Project and workspace search fields share their panel width. Verify both
@@ -978,14 +1171,20 @@ apply to all three.
   Native menus omit shortcut hints.
 - On touch every row is at least 44 and submenus become a drill-down in the same panel, with a
   `›` hint and a Back row (`touchSections`).
+- A host `Modal`'s card sizes to its content only through `Modal.Content`'s own scroll, the
+  default (`scrollable`). `scrollable={false}` tells the host to pin the desktop card at
+  `height: 85%` (`packages/app/src/plugins/react-native/modal.tsx`), so a dialog with one row
+  floats in a mostly empty panel. Keep the host scroll and put an action row after the content:
+  the plugin `Modal` exposes no footer of its own.
 - The card menu opens at the pointer on the web, flipping at the edges. A tablet long press opens
   a popover at the touch point with its submenus flattened and rows at least 44 high. Its width is
   `menuWidth(240, scale, window.width - 16)`, with 8 pt at each screen edge. A phone long press
   opens the host `Modal` titled with the card, with flattened submenus and 18 pt icons.
 - The filter sheet opens in the host `Modal` on phones and narrow web boards. Tablets use a toolbar
   popover with width `menuWidth(320, scale, board.width - 24)` and height `max(0, board.height - 18)`,
-  leaving room around the popover while using the available board height. Sections have 16 pt padding and
-  muted `sm` titles; chips are 32 high (radius 4, accent border and `accentSoft` when on), toggle
+  leaving room around the popover while using the available board height. Phone sections and the
+  footer use the shared 8 pt body inset. The tablet popover and narrow desktop panel use 16 pt.
+  Sections have muted `sm` titles. Chips are 32 high (radius 4, accent border and `accentSoft` when on), toggle
   rows 48, sort rows 44, and the footer pins Reset and an accent Show pill, both 44.
 - While the desktop/tablet filter panel is open, its controls update immediately and lane
   rendering waits 180 ms (`SWITCH_MS + 40`) so the switch's 140 ms slide can finish. Closing the
@@ -1016,7 +1215,8 @@ apply to all three.
 - The inline surface uses `surface0`, with a left shadow cast over the lanes:
   `-8px 0px 16px -8px`, black at 20% light / 50% dark. Floating uses the same shadow.
   It sits 12 from the right edge, padded 10 left and 4 right on web so the cards end 16 from the
-  board edge, aligned with the toolbar; native keeps 10 on both sides. Top/bottom padding is 4/12.
+  board edge, aligned with the toolbar; native uses 14 left and 2 right, making both card
+  insets 14 when the outer margin is included. Top/bottom padding is 4/12.
 - Web inline and floating sidebars share `SidebarColumn` and its resize handle, including the
   temporary floating panel opened by clicking a card while the sidebar is hidden. The resize
   target is 8 wide inside the surface's left edge, inset 4 at the top and 12 at the bottom.
@@ -1026,7 +1226,12 @@ apply to all three.
   the width without changing the sidebar's remembered open preference; double click restores
   380. Keep this handle available after dismissing and reopening the same card's details.
 - The board sheet has a 58% half detent; full height leaves 8 of the lanes showing; radius 16 on
-  top, a 36 × 5 handle.
+  top, a 36 × 5 handle. Its bottom pad is 4. On Android that pad is the window's system bottom
+  inset (navigation or gesture bar) when the inset is larger, read from the safe-area module.
+  iOS, including iPad, stays at 4.
+- On a phone or tablet sheet, on iOS and Android, place the vertical scroll indicator outside the cards.
+  Keep the cards' existing width and alignment; moving the indicator must not narrow the cards or
+  add space between them and the sheet edge. Check the placement while scrolling.
 
 | Metric (`DETAIL_CARD`, `TOUCH_CARD`) | Pointer | Touch |
 | --- | --- | --- |
@@ -1040,14 +1245,21 @@ apply to all three.
   cards and 12 × 6 inside. The header is padded 12: the status row (icon 14, the status, card menu, close),
   the title at base weight 600, chips and labels, and the actions 12 below. Open tab leads on the
   desktop and comes last on touch.
-- On web, the card menu and close icons use the toolbar's radius-7 quiet outline and hover
-  shadow. Native keeps round icon buttons and follows the touch press treatment.
+- A title longer than five lines folds under the same fade and "Show all · N lines" row as the
+  message bodies below it, and opens folded. The fold measures the laid-out title, so a title that
+  fits stays whole and a narrow column folds sooner; the title's line height is the scaled base step.
+- The detail menu and close icon buttons keep their circular targets; hover and press use a
+  centered circle of diameter `round(icon size × 1.7)`. Web keeps the transparent hairline.
 - Hero blocks (the running turn, a permission request, an error, the last turn's summary) are
   `sunk` boxes of radius 10 with a 1 pt border; an error box is the danger at 6% with a border at
   28%. Values are 2xl in the turn hero and lg in summary tiles.
 - Sections are divided by a hairline inset 12; a heading is a radius-6 row whose chevron turns −90°
   when closed and whose muted text turns `foreground` on hover. A message heading ends with the
-  message's own time, and its tip gives the full timestamp.
+  message's own time, and its tip gives the full timestamp. Its Translate and Copy buttons share
+  a 32 pt target, a 14 pt icon and a centered circular hover and press fill sized to
+  `round(icon size × 1.7)` (24 pt). Mix the fill against the actual card surface, including
+  in dark themes, and keep the larger target independent of the visible fill. Apply this rule
+  to all three message headings and preserve each action's tooltip and behaviour.
 - Message bodies sit in a `sunk` box of radius 8 and fold after 4 lines or 240 characters under a
   fade; while the timeline is read they breathe as a skeleton instead of saying Loading.
 - While a visible, open agent is running, assistant-message events and subscription recovery
@@ -1065,8 +1277,8 @@ apply to all three.
 - With no card chosen, the sidebar shows stat cells (at least 56, 64 on touch, radius 8, the count
   at xl; needs input with a warning border and count) and the group card: round 28 segments (36 on
   touch) over group rows of 36 (44), radius 6, `surface2` when on.
-- A phone's details sheet has a 40 stepper and an action bar of 48 buttons (radius 12) over a
-  hairline.
+- A phone's details sheet has a 40 pt stepper inset 4 pt and an action bar inset 8 pt with
+  48 pt buttons (radius 12) over a hairline.
 
 ### Host sidebar counts
 
@@ -1075,6 +1287,15 @@ board's remembered filters for that host and this device's Subtasks preference, 
 provider subagent cards. Its counts match the filtered lane headers. Search reads already-loaded
 first prompts and follows their updates; the entry does not load timelines just to count.
 Keep counts hidden until their required lists are ready, and honour the configured count mode.
+
+The count opens the hidden task dialog (`board/hidden-count.tsx`), which sizes to its content
+(see [Menus and sheets](#menus-and-sheets)) and ends with "Clear filters". That action has to
+reach a board that is already open, and an open screen keeps the params it was opened with.
+Cleared params encode to `{}`, which the board reads as "no route" and ignores, so `openScreen`
+alone leaves the board untouched. The sidebar remembers the cleared params for the next open and
+bumps `requestBoardClear(hostId)` (`board/params.ts`), which the board subscribes to
+(`subscribeBoardParams`) and applies once with its own `clearedParams`, leaving the Subtasks
+preference alone; the route is opened only when the board is not the current screen.
 
 ### Status marks
 
@@ -1137,6 +1358,11 @@ with a Chat and a Tasks tab.
 | --- | --- |
 | `Toggle` | the 40 × 24 `SwitchTrack` with an 18 knob, a 10 hit slop; see [Switches](#switches) |
 | `Segmented` | a `surface2` track padded 2, radius 6, 28 high (32 on touch, equal widths); the chosen segment on `surface0` with a border, weight 500 |
+| Select | Every settings dropdown builds on `client/settings-select.tsx`: `SelectTrigger`, `selectMenuSurface` and `SelectOption`. Closed: a bordered button (radius `radiusV2.block`, 36 high, 44 on touch, `surface0`, `surface2` hovered or pressed) with an optional logo, the value in weight 500, and the host Lucide `ChevronDown` at 14 in `foregroundMuted` (`SELECT_CHEVRON`), pushed to the far end and turned to `ChevronUp` while open; the border turns `accent` while open. It shrinks beside neighbours and truncates the value. Do not draw a chevron by hand: the host Lucide icon carries the host's 1.5 stroke. The menu card is `surface0`, radius `radiusV2.overlay` (12), a hairline border and a `0 8 32` shadow at 12% (50% dark). Rows are 32 high (44 on touch), inset 6, padded 8, radius `radiusV2.block`, logo and name 8 apart, `accessibilityRole="radio"`; the chosen row takes `surface2` and weight 500, the others are muted and take `surface2` on hover or press. There is no check mark and no accent text; an optional trailing detail (a language code) sits at the far end in 11 mono `foregroundMuted` |
+| Choice menu | `ChoiceMenuSelect` (`client/settings-choice-menu.tsx`), a select for a short list. Open: the menu is anchored 4 below the button (above it when there is no room), at least 220 wide, padded 6 top and bottom. A press outside, Escape (web, via a manual popover) or the system back (a transparent native `Modal`) closes it. Use it for every short list choice on the settings page instead of a host `Modal` |
+| Language select | `SearchableLanguageSelect` (`client/translation/language-picker.tsx`), the translation target language: a select at least 168 wide whose menu adds a search box over the list. On the web the menu is a fixed popover beside the control, at least 280 wide, padded 8 top and bottom (`placeLanguageMenu`); the search box and rows share the choice menu's 6 side inset, and each row trails its language code (`auto` for following the interface language). Native opens the list in a host `Modal` |
+| Automatic title model | Provider, Model and Thinking level are choice menus. Provider rows draw the 20pt `ProviderLogo` (monochrome marks in `foreground`) and the host's own provider label from `tasks.title-models` (`providerLabels`, the same names as the Agent versions list, so a custom provider reads "Codex (NewAPI)"), falling back to the brand name; Cursor sorts last with its warning. Model and Thinking level rows have no logo; the model refresh button stays to the left of the menu |
+| File open | a choice menu (`client/settings-file-open.tsx`). Closed, it shows the current editor's 20pt colour logo, its name and a chevron. The menu lists System app plus the editors this host can launch (`file.editors`, the same lookup that opens a file). While that scan has not returned, the menu offers System app and the saved choice; if the scan fails, every supported editor is listed. Logos are the colour rasters `editor:*`: each editor's own macOS app icon, taken from its official app bundle, at 60px (`assets/editor-marks`, `node scripts/build-editor-marks.mjs`), not the monochrome tool marks. The list keeps fifteen common editors; Windsurf is listed as Devin (Windsurf), its current name |
 | `PlainButton` | at least 32 high, 1 pt border, radius 6, 13 weight 500 muted; `surface2` pressed, 0.4 opacity disabled |
 | Section | a muted 13 weight-500 title over a `surface1` card of radius 8, bordered on the desktop, a grouped list on touch |
 | Setting row | at least 44 on touch, padded 11, rules inset 16; padded 14 × 16 on the desktop, its control wrapping under the text when narrow; 0.45 opacity disabled |

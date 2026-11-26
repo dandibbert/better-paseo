@@ -5,7 +5,7 @@ import "./helpers/quiet-renderer";
 
 type Run = { value: { setValue(value: number): void; __value: number }; to: number; stop: ReturnType<typeof vi.fn>; finish(): void };
 const motion = vi.hoisted(() => ({ reduced: false, runs: [] as Run[], layouts: vi.fn() }));
-vi.mock("../../client/ui/use-reduced-motion", () => ({ useReducedMotion: () => motion.reduced }));
+vi.mock("../../client/ui/use-reduced-motion", () => ({ useReducedMotion: () => motion.reduced, getReducedMotion: () => motion.reduced }));
 vi.mock("react-native", async () => {
   const rn = await import("./helpers/rn-mock");
   return { ...rn, LayoutAnimation: { configureNext: motion.layouts }, Animated: { ...rn.Animated,
@@ -26,7 +26,7 @@ vi.mock("react-native", async () => {
     },
   } };
 });
-vi.mock("@getpaseo/plugin/client/react-native", async () => {
+vi.mock("@getpaseo/plugin/client/ui", async () => {
   const rn = await import("./helpers/rn-mock");
   return { Icon: rn.View, TextInput: rn.TextInput };
 });

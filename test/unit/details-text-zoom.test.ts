@@ -7,7 +7,7 @@ import { describe, expect, it, vi } from "vitest";
 import React from "react";
 
 vi.mock("react-native", () => import("./helpers/rn-mock"));
-vi.mock("@getpaseo/plugin/client/react-native", async () => {
+vi.mock("@getpaseo/plugin/client/ui", async () => {
   const rn = await import("./helpers/rn-mock");
   return {
     Icon: (props: Record<string, unknown>) => React.createElement("Icon", props),
@@ -16,7 +16,6 @@ vi.mock("@getpaseo/plugin/client/react-native", async () => {
     Modal: rn.View,
     copyText: () => Promise.resolve(true),
     useToast: () => ({ show() {}, error() {}, success() {} }),
-    useRevealedText: (text: string) => text,
   };
 });
 vi.mock("@getpaseo/plugin/client", () => ({
@@ -32,7 +31,7 @@ const TestRenderer = (await import("react-test-renderer")).default;
 const { act } = await import("react-test-renderer");
 const { buildThemeTokens, useThemeTokens } = await import("../../client/components/theme-tokens");
 const { DEFAULT_PREFERENCES, parsePreferences } = await import("../../client/preferences");
-const { TextZoomContext, isZoomed, pinchZoom, zoomTextStyle, zoomTokens } = await import("../../client/ui/text-zoom");
+const { TextZoomContext, isZoomed, pinchZoom, zoomBlockMetrics, zoomTextStyle, zoomTokens } = await import("../../client/ui/text-zoom");
 const { PreviewLines } = await import("../../client/ui/preview-lines");
 const { MarkdownView } = await import("../../client/components/markdown/markdown-view");
 
@@ -65,10 +64,11 @@ function inDrawer(zoom: number, child: React.ReactElement) {
 }
 
 describe("pinchZoom", () => {
-  it("scales an absolute size to whole points within 12–26", () => {
+  it("scales an absolute size to whole points within 9–26", () => {
     expect(pinchZoom(14, 1)).toBe(14);
     expect(pinchZoom(14, 1.5)).toBe(21);
-    expect(pinchZoom(18, 0.5)).toBe(12);
+    expect(pinchZoom(18, 0.5)).toBe(9);
+    expect(pinchZoom(14, 0.5)).toBe(9);
     expect(pinchZoom(16, 3)).toBe(26);
     expect(pinchZoom(20, 1.03)).toBe(21);
     expect(pinchZoom(19, 0)).toBe(19);
@@ -76,6 +76,14 @@ describe("pinchZoom", () => {
 });
 
 describe("zoomTokens", () => {
+  it("scales desktop prose and code from their own sizes", () => {
+    const scaled = zoomTokens(tokens, { scale: 1.5 });
+    expect(scaled.typography.content.size).toBe(Math.round(tokens.typography.content.size * 1.5));
+    expect(scaled.typography.mono.size).toBe(Math.round(tokens.typography.mono.size * 1.5));
+    expect(zoomTokens(tokens, { scale: 1.5 })).toBe(scaled);
+    expect(zoomTextStyle({ fontSize: 12, lineHeight: 18 }, { scale: 1.5 }))
+      .toEqual([{ fontSize: 12, lineHeight: 18 }, { fontSize: 18, lineHeight: 27 }]);
+  });
   it("sets body and code to one independent size, and returns stable tokens", () => {
     const up = zoomTokens(tokens, 18);
     expect(up.typography.content.size).toBe(18);
@@ -101,6 +109,25 @@ describe("zoomTokens", () => {
     expect(fixed.typography.content).toEqual({ size: 14, lineHeight: 21 });
     expect(fixed.typography.mono.size).toBe(14);
     expect(fixed.typography.block.delta).toBe(0);
+  });
+});
+
+describe("zoomBlockMetrics", () => {
+  const block = tokens.typography.block;
+  it("leaves the block sizes alone outside the details", () => {
+    expect(zoomBlockMetrics(block, 0)).toBe(block);
+  });
+  it("sets the label to the absolute size and keeps the other steps' share", () => {
+    const up = zoomBlockMetrics(block, 20);
+    expect(up.label.size).toBe(20);
+    expect(up.meta.size).toBe(Math.round(block.meta.size * 20 / block.label.size));
+    expect(up.delta).toBe(0);
+    expect(up.rowHeight.desktop - up.label.lineHeight).toBe(block.rowHeight.desktop - block.label.lineHeight);
+  });
+  it("scales every step on the web", () => {
+    const up = zoomBlockMetrics(block, { scale: 1.5 });
+    expect(up.label.size).toBe(Math.round(block.label.size * 1.5));
+    expect(up.caption.lineHeight).toBe(Math.round(block.caption.lineHeight * 1.5));
   });
 });
 
@@ -140,11 +167,11 @@ describe("in the drawer", () => {
 });
 
 describe("detailsFontSize", () => {
-  it("defaults to 14 and stores a whole absolute size within 12–26", () => {
+  it("defaults to 14 and stores a whole absolute size within 9–26", () => {
     expect(DEFAULT_PREFERENCES.detailsFontSize).toBe(14);
     expect(parsePreferences({ detailsFontSize: 17.4 }).detailsFontSize).toBe(17);
     expect(parsePreferences({ detailsFontSize: 40 }).detailsFontSize).toBe(26);
-    expect(parsePreferences({ detailsFontSize: -9 }).detailsFontSize).toBe(12);
+    expect(parsePreferences({ detailsFontSize: -9 }).detailsFontSize).toBe(9);
     expect(parsePreferences({ detailsFontSize: "big" }).detailsFontSize).toBe(14);
     expect(parsePreferences({ detailsTextZoom: 3 })).not.toHaveProperty("detailsTextZoom");
   });
@@ -328,8 +355,8 @@ describe("text size step buttons", () => {
       for (let index = 0; index < 11; index++) press("details-zoom-increase");
       expect(current).toBe(26);
       expect(button("details-zoom-increase").props.disabled).toBe(true);
-      for (let index = 0; index < 14; index++) press("details-zoom-decrease");
-      expect(current).toBe(12);
+      for (let index = 0; index < 17; index++) press("details-zoom-decrease");
+      expect(current).toBe(9);
       expect(button("details-zoom-decrease").props.disabled).toBe(true);
       press("details-zoom-reset");
       expect(current).toBe(14);

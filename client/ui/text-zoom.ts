@@ -10,7 +10,7 @@
 import { createContext, useContext } from "react";
 import { StyleSheet, type StyleProp, type TextStyle } from "react-native";
 import type { ExtendedThemeTokens } from "../components/theme-tokens";
-import type { Typography } from "./tokens/typography";
+import type { BlockMetrics, Typography } from "./tokens/typography";
 import { clampDetailsFontSize } from "../../shared/preferences-settings";
 
 /**
@@ -21,8 +21,17 @@ export function pinchZoom(startSize: number, scale: number): number {
   return clampDetailsFontSize(Math.round(startSize * scale));
 }
 
-export function zoomTypography(typography: Typography, zoom: number): Typography {
+export type TextZoom = number | { scale: number };
+
+export function zoomTypography(typography: Typography, zoom: TextZoom): Typography {
   if (zoom === 0) return typography;
+  if (typeof zoom !== "number") {
+    const scale = (size: number) => Math.round(size * zoom.scale);
+    return { ...typography,
+      content: { size: scale(typography.content.size), lineHeight: scale(typography.content.lineHeight) },
+      mono: { ...typography.mono, size: scale(typography.mono.size), lineHeight: scale(typography.mono.lineHeight) },
+    };
+  }
   const size = Math.round(zoom);
   return {
     ...typography,
@@ -33,14 +42,14 @@ export function zoomTypography(typography: Typography, zoom: number): Typography
 }
 
 /** The native details' resolved size; 0 leaves timeline typography unchanged. */
-export const TextZoomContext = createContext(0);
+export const TextZoomContext = createContext<TextZoom>(0);
 
 // One object per tokens and zoom, so memoised children see the same tokens
 // again; and what each zoomed object was made from, so zooming twice is once.
-const zoomed = new WeakMap<ExtendedThemeTokens, Map<number, ExtendedThemeTokens>>();
+const zoomed = new WeakMap<ExtendedThemeTokens, Map<string | number, ExtendedThemeTokens>>();
 const origin = new WeakMap<ExtendedThemeTokens, ExtendedThemeTokens>();
 
-export function zoomTokens(tokens: ExtendedThemeTokens, zoom: number): ExtendedThemeTokens {
+export function zoomTokens(tokens: ExtendedThemeTokens, zoom: TextZoom): ExtendedThemeTokens {
   const base = origin.get(tokens) ?? tokens;
   if (zoom === 0) return base;
   let byZoom = zoomed.get(base);
@@ -48,10 +57,11 @@ export function zoomTokens(tokens: ExtendedThemeTokens, zoom: number): ExtendedT
     byZoom = new Map();
     zoomed.set(base, byZoom);
   }
-  let next = byZoom.get(zoom);
+  const key = typeof zoom === "number" ? zoom : `scale:${zoom.scale}`;
+  let next = byZoom.get(key);
   if (!next) {
     next = { ...base, typography: zoomTypography(base.typography, zoom) };
-    byZoom.set(zoom, next);
+    byZoom.set(key, next);
     origin.set(next, base);
   }
   return next;
@@ -70,12 +80,35 @@ export function useZoomedTokens(tokens: ExtendedThemeTokens): ExtendedThemeToken
 /**
  * A text style built from timeline tokens, set to the details' absolute size.
  */
-export function zoomTextStyle(style: StyleProp<TextStyle>, zoom: number): StyleProp<TextStyle> {
+export function zoomTextStyle(style: StyleProp<TextStyle>, zoom: TextZoom): StyleProp<TextStyle> {
   if (zoom === 0) return style;
   const flat = StyleSheet.flatten(style);
   const size = flat?.fontSize;
   if (typeof size !== "number" || size <= 0) return style;
-  const next = Math.round(zoom);
-  const lineHeight = typeof flat?.lineHeight === "number" ? Math.round(next * 1.5) : undefined;
+  const next = Math.round(typeof zoom === "number" ? zoom : size * zoom.scale);
+  const lineHeight = typeof flat?.lineHeight === "number" ? Math.round(typeof zoom === "number" ? next * 1.5 : flat.lineHeight * zoom.scale) : undefined;
   return [style, lineHeight === undefined ? { fontSize: next } : { fontSize: next, lineHeight }];
+}
+
+/**
+ * Block sizes (a question, a checklist) under the details' zoom. Native zoom
+ * is the absolute body size: the label takes it and every other step keeps
+ * its share of the label. The web's scale moves each step by itself.
+ */
+export function zoomBlockMetrics(block: BlockMetrics, zoom: TextZoom): BlockMetrics {
+  if (zoom === 0) return block;
+  const ratio = typeof zoom === "number" ? Math.round(zoom) / block.label.size : zoom.scale;
+  const step = (from: { size: number; lineHeight: number }) => ({ size: Math.round(from.size * ratio), lineHeight: Math.round(from.lineHeight * ratio) });
+  const label = step(block.label);
+  const grow = label.lineHeight - block.label.lineHeight;
+  return {
+    size: label.size,
+    delta: typeof zoom === "number" ? 0 : block.delta,
+    label,
+    target: step(block.target),
+    meta: step(block.meta),
+    caption: step(block.caption),
+    button: step(block.button),
+    rowHeight: { desktop: block.rowHeight.desktop + grow, compact: block.rowHeight.compact + grow },
+  };
 }

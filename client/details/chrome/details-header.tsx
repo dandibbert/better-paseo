@@ -1,12 +1,12 @@
 /**
- * The details panel's header (docs/prototypes/block-details-sheet.md, "头部";
- * table 5.2): the block's icon in a 28 tile, its full title and a subtitle of
+ * The details panel's header (https://github.com/RoundRedDot/better-paseo/blob/f2ab453297c4ccb88a08e2129af0cb3528c4e628/docs/prototypes/block-details-sheet.md, "头部";
+ * table 5.2): the block's icon in a compact tile, its full title and a subtitle of
  * status, duration and place, then ‹ › × at the right. 52 tall on touch, 44
  * with a pointer. The shell's header handlers ride on it: a vertical drag
  * moves the drawer, a horizontal swipe steps.
  */
-import { useState, type ReactNode } from "react";
-import { Pressable, StyleSheet, Text, View } from "react-native";
+import { type ReactNode } from "react";
+import { Platform, StyleSheet, Text, View } from "react-native";
 import type { ExtendedThemeTokens } from "../../components/theme-tokens";
 import { space } from "../../components/theme-tokens";
 import { unselectable } from "../../components/selection";
@@ -24,9 +24,8 @@ export const HEADER_BUTTONS: Readonly<Record<"touch" | "pointer", ToolbarMetrics
   touch: { button: 36, icon: 18 },
   pointer: { button: 28, icon: 16 },
 };
-const ICON_TILE = 28;
+const ICON_TILE = 20;
 const TILE_ICON = 16;
-const TITLE_LINES = 4;
 
 export function DetailsHeader({ shell, tokens, icon, titleText, title, meta, streaming = false }: {
   shell: DetailsShellValue;
@@ -44,12 +43,10 @@ export function DetailsHeader({ shell, tokens, icon, titleText, title, meta, str
   const { entry, pointer } = shell;
   const { language } = useEnhancerPreferences();
   const metrics = HEADER_BUTTONS[pointer ? "pointer" : "touch"];
-  // A tap shows up to four lines; another block starts on one again.
-  const [expandedId, setExpandedId] = useState<string | null>(null);
-  const expanded = expandedId === entry.id;
   const text = entry.title || titleText || "";
   const navigable = shell.index > 0 && shell.count > 0;
   const subtitle = subtitleParts(entry, navigable ? `${shell.index} / ${shell.count}` : null);
+  const desktopSide = Platform.OS === "web" && pointer && shell.form === "side";
   const titleStyle = [
     styles.title,
     unselectable,
@@ -57,29 +54,23 @@ export function DetailsHeader({ shell, tokens, icon, titleText, title, meta, str
       ? { fontFamily: tokens.fontMono, fontSize: 13, lineHeight: 18 }
       : { fontFamily: tokens.fontUi, fontSize: 14, lineHeight: 20 },
     { color: tokens.foreground },
+    desktopSide && { lineHeight: 18 },
   ];
   return (
     <View
       testID="details-header"
       {...(shell.headerHandlers ?? {})}
-      style={[styles.header, { minHeight: DETAILS_HEADER[pointer ? "pointer" : "touch"] }]}
+      style={[styles.header, { minHeight: desktopSide ? 36 : DETAILS_HEADER[pointer ? "pointer" : "touch"] },
+        desktopSide && { paddingVertical: 0, borderBottomWidth: 1, borderBottomColor: tokens.border }]}
     >
-      <View testID="details-header-icon" style={[styles.tile, { backgroundColor: tokens.v2.surface1 }]}>
+      <View testID="details-header-icon" style={styles.tile}>
         {entry.icon ? <TileIcon name={entry.icon} color={entry.iconColor ?? tokens.foregroundMuted} />
           : typeof icon === "string" ? <TileIcon name={icon} color={tokens.foregroundMuted} /> : icon}
       </View>
       <View style={styles.text}>
-        {text ? (
-          <Pressable
-            testID="details-header-title"
-            accessibilityRole="button"
-            accessibilityLabel={text}
-            accessibilityState={{ expanded }}
-            onPress={() => setExpandedId(expanded ? null : entry.id)}
-          >
-            <Text selectable={false} numberOfLines={expanded ? TITLE_LINES : 1} style={titleStyle}>{text}</Text>
-          </Pressable>
-        ) : title ?? null}
+        <View testID="details-header-title" accessibilityLabel={text || undefined} style={styles.titleContainer}>
+          {text ? <Text selectable={false} numberOfLines={1} style={titleStyle}>{text}</Text> : title ?? null}
+        </View>
         {streaming || subtitle.length > 0 || meta ? (
           <View testID="details-header-subtitle" style={styles.subtitle}>
             {streaming ? (
@@ -152,15 +143,16 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     gap: 10,
-    paddingLeft: space.lg,
+    paddingLeft: space.sm,
     paddingRight: space.sm,
     paddingVertical: space.xs,
     flexShrink: 0,
   },
-  tile: { width: ICON_TILE, height: ICON_TILE, borderRadius: 7, alignItems: "center", justifyContent: "center", flexShrink: 0 },
-  text: { flex: 1, minWidth: 0, gap: 1 },
+  tile: { width: ICON_TILE, height: ICON_TILE, marginRight: -4, alignItems: "center", justifyContent: "center", flexShrink: 0 },
+  text: { flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 10 },
+  titleContainer: { flex: 1, minWidth: 0 },
   title: { fontWeight: "600" },
-  subtitle: { flexDirection: "row", alignItems: "center", gap: space.xs, minWidth: 0 },
+  subtitle: { flexDirection: "row", alignItems: "center", gap: space.xs, minWidth: 0, flexShrink: 1 },
   subtitleText: { flexShrink: 1, fontSize: 12, lineHeight: 16 },
   dot: { width: 8, alignItems: "center", justifyContent: "center" },
   meta: { flexShrink: 0 },

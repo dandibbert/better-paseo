@@ -1,6 +1,6 @@
 import React, { useCallback, useContext, useEffect, useState, useMemo, useRef } from "react";
 import { View, Text, Pressable, StyleSheet, Platform, type GestureResponderEvent } from "react-native";
-import { Icon } from "@getpaseo/plugin/client/react-native";
+import { Icon } from "@getpaseo/plugin/client/ui";
 import { space } from "./theme-tokens";
 import { selectableSurface, unselectable } from "./selection";
 import { selectionSurface } from "./selection-actions";
@@ -17,12 +17,14 @@ import { ProgressRing } from "../ui/progress-ring";
 import { FadeIn } from "../ui/fade-in";
 import { DISCLOSURE_HEADER, DisclosureHeader, RowIcon } from "../ui/disclosure-header";
 import { HoverPreview, HoverPreviewBody, HoverPreviewHeader, useHoverPreview, usePreviewWraps } from "../ui/hover-preview";
+import { TextZoomContext, zoomBlockMetrics } from "../ui/text-zoom";
 import { ToolbarCopyButton, ToolbarButton, TooltipAlignContext, TooltipSideContext } from "../ui/toolbar-button";
 import { bindPreviewPointer } from "../web";
 import { BlockPlacementContext } from "../details/contracts";
 import { useEnhancerPreferences } from "../preferences";
 import { detailsApi } from "../details/details-store";
 import { RowMenu, type RowMenuAnchor } from "../details/row-menu";
+import { selectionColorProps } from "./text-selection";
 
 /** The checklist's floating panel: the row preview's own (`useHoverPreview`). */
 export type TaskListPanelControl = ReturnType<typeof useHoverPreview>;
@@ -122,8 +124,10 @@ export function TaskList({ data, tokens, compact = false, onToggleTask, panel: s
   const completedCount = tasks.filter((t) => t.status === "completed").length;
   const totalCount = tasks.length;
   const allDone = totalCount > 0 && completedCount === totalCount;
-  const rowHeight = compact ? tokens.typography.block.rowHeight.compact : tokens.typography.block.rowHeight.desktop;
-  const block = tokens.typography.block;
+  // In the details panel the list follows its text size (pinch, toolbar, badge).
+  const zoom = useContext(TextZoomContext);
+  const block = useMemo(() => zoomBlockMetrics(tokens.typography.block, zoom), [tokens.typography.block, zoom]);
+  const rowHeight = compact ? block.rowHeight.compact : block.rowHeight.desktop;
 
   const styles = useMemo(
     () =>
@@ -151,6 +155,7 @@ export function TaskList({ data, tokens, compact = false, onToggleTask, panel: s
         slot: {
           width: DISCLOSURE_HEADER.iconSlot,
           paddingRight: DISCLOSURE_HEADER.iconSlotPad,
+          marginRight: DISCLOSURE_HEADER.slotTrim,
           alignSelf: "stretch",
           alignItems: "center",
           justifyContent: "center",
@@ -261,7 +266,7 @@ export function TaskList({ data, tokens, compact = false, onToggleTask, panel: s
           color: tokens.foregroundMuted,
         },
       }),
-    [tokens, rowHeight],
+    [tokens, block, rowHeight],
   );
 
   const toggleStatus = (task: TaskItemData) => {
@@ -399,7 +404,7 @@ export function TaskList({ data, tokens, compact = false, onToggleTask, panel: s
               )}
               <Text
                 // A long press opens the panel, where the titles are selectable.
-                selectable={!longPress}
+                selectable={!longPress} {...selectionColorProps()}
                 numberOfLines={isOpen ? 0 : 1}
                 {...(full
                   ? null
@@ -428,14 +433,14 @@ export function TaskList({ data, tokens, compact = false, onToggleTask, panel: s
                 </Text>
               ) : null}
               {task.duration ? (
-                <Text selectable style={[styles.meta, isOpen && styles.firstLine]}>
+                <Text selectable {...selectionColorProps()} style={[styles.meta, isOpen && styles.firstLine]}>
                   {task.duration}
                 </Text>
               ) : null}
             </View>
             {isBlocked && isBlockedOpen && task.blockerReason ? (
               <FadeIn style={styles.reason}>
-                <Text selectable style={styles.reasonText}>
+                <Text selectable {...selectionColorProps()} style={styles.reasonText}>
                   {task.blockerReason}
                 </Text>
               </FadeIn>
@@ -445,7 +450,7 @@ export function TaskList({ data, tokens, compact = false, onToggleTask, panel: s
       })}
       {detailsEnabled && menuAnchor ? <RowMenu anchor={menuAnchor} title="Tasks" hasBody
         copyItems={[{ id: "text", label: "Copy", icon: "Copy", text: taskListCopyText(data) }]}
-        expanded={listExpanded} tokens={tokens} onOpen={() => detailsApi.open(placement!.agentId, detailsKey)}
+        expanded={listExpanded} tokens={tokens} onOpen={(form) => detailsApi.open(placement!.agentId, detailsKey, { form })}
         onToggle={() => setListExpanded((value) => !value)} onClose={closeMenu} /> : null}
       {shared || full ? null : <TaskListPanel panel={own} data={data} tokens={tokens} compact={compact} />}
     </View>

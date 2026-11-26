@@ -1,8 +1,8 @@
 import type { PluginClientContext, PluginTimelineTransformerContribution } from "@getpaseo/plugin/client";
 import { z } from "zod";
 import { contributeSettingsScreen } from "./client/settings-screen";
+import { PluginUpdateIndicator } from "./client/plugin-update-indicator";
 import { removeEmbeddedFonts, setEmbeddedFontLoader } from "./client/components/embed-fonts";
-import { installHostNoticeStyle } from "./client/components/host-notice";
 import { installChatFind } from "./client/components/chat-find";
 import { installPointerFocusRing } from "./client/components/focus-ring";
 import { extractPromptImages } from "./client/prompt-images";
@@ -10,11 +10,14 @@ import { getEnhancerPreferences } from "./client/preferences";
 import { followPreference } from "./client/state/follow-preference";
 import { readPreferencesAtStartup, watchPreferenceChanges } from "./client/state/preference-sync-slot";
 import { perfSlashCommand } from "./client/debug/perf-command";
+import { installTimelineLevelControl } from "./client/timeline-level-control";
 import { loadMark } from "./client/debug/load-marks";
 import { scheduleLoadTraceDump } from "./client/debug/load-trace";
-import { transformCompaction, transformToolCall } from "./client/tools/transform";
+import { transformCompaction, transformToolCallAt } from "./client/tools/transform";
+import { standardFoldActive } from "./client/tools/standard-fold";
+import { transformNotification } from "./client/notice-transform";
 import { agentMessageSchema } from "./client/tools/agent-message";
-import { assistantRows } from "./client/assistant-transform";
+import { assistantRows, hasBrowserPromptFence, hasUiFence } from "./client/assistant-transform";
 import { externalHistoryRows } from "./client/external-history";
 import { embeddedFontsRpc } from "./shared/font-rpc";
 import { markBitmapsRpc } from "./shared/mark-rpc";
@@ -64,8 +67,6 @@ export default function contribute(client: PluginClientContext) {
   };
   // Brand marks are read from the daemon by id, batched per tick, as rows draw them.
   setMarkLoader((ids) => client.rpc(markBitmapsRpc, { ids }).then((result) => result.bitmaps));
-  // The host draws  rows itself; this only re-chromes them.
-  const removeNoticeStyle = followChat(installHostNoticeStyle);
   // Paseo's Ctrl+F cannot reveal rows this plugin draws; this bar can.
   const removeChatFind = followChat(installChatFind);
   // A clicked row, chip or button keeps no focus ring; Tab focus does.
@@ -74,20 +75,32 @@ export default function contribute(client: PluginClientContext) {
   // Configuration lives in the host Settings area: one page, with the chat
   // options and the Tasks board's as its two halves.
   const removeSettings = contributeSettingsScreen(client);
+  // Older hosts do not offer an installed-plugin update indicator.
+  const indicatorHost = client as PluginClientContext & { addUpdateIndicator?: (component: typeof PluginUpdateIndicator) => () => void };
+  const removeUpdateIndicator = indicatorHost.addUpdateIndicator?.(PluginUpdateIndicator);
 
   // Live chat timeline interception: render real tool calls, reasoning, and todos with enhanced UI.
-  const removeToolTransformer = addChatTransformer({
+  // Standard folds successful edits into the assistant reply's work card
+  // while the plugin draws that reply (`standardFoldActive`).
+  const removeToolTransformer = followPreference(
+    (preferences) => `${preferences.timelineLevel}|${standardFoldActive(preferences)}`,
+    () => addChatTransformer({
     id: "omp-enhanced-tool-call",
     query: { itemType: "tool_call" },
-    transform: transformToolCall,
-  });
+    transform(input) {
+      return transformToolCallAt(input, getEnhancerPreferences());
+    },
+  }));
 
   // Drawn by the tool row renderer, as a row like a call's.
-  const removeCompactionTransformer = addChatTransformer({
+  const removeCompactionTransformer = followPreference("timelineLevel", () => addChatTransformer({
     id: "omp-enhanced-compaction",
     query: { itemType: "compaction" },
-    transform: transformCompaction,
-  });
+    transform(input) {
+      if (getEnhancerPreferences().timelineLevel === "simple") return { items: [] };
+      return transformCompaction(input);
+    },
+  }));
 
   const removeToolRenderer = client.addTimelineRenderer({
     kind: "omp-tool-call",
@@ -107,11 +120,12 @@ export default function contribute(client: PluginClientContext) {
     Component: LiveToolCallRenderer,
   });
 
-  const removeReasoningTransformer = addChatTransformer({
+  const removeReasoningTransformer = followPreference("timelineLevel", () => addChatTransformer({
     id: "omp-enhanced-reasoning",
     query: { itemType: "reasoning" },
     transform({ item, phase }) {
       if (item.type !== "reasoning") return undefined;
+      if (getEnhancerPreferences().timelineLevel !== "detailed") return { items: [] };
       return {
         items: [
           {
@@ -126,7 +140,7 @@ export default function contribute(client: PluginClientContext) {
         ],
       };
     },
-  });
+  }));
 
   const removeReasoningRenderer = client.addTimelineRenderer({
     kind: "omp-reasoning",
@@ -138,11 +152,12 @@ export default function contribute(client: PluginClientContext) {
     Component: LiveReasoningRenderer,
   });
 
-  const removeTodoTransformer = addChatTransformer({
+  const removeTodoTransformer = followPreference("timelineLevel", () => addChatTransformer({
     id: "omp-enhanced-todo",
     query: { itemType: "todo" },
     transform({ item, phase }) {
       if (item.type !== "todo") return undefined;
+      if (getEnhancerPreferences().timelineLevel === "simple") return { items: [] };
       return {
         items: [
           {
@@ -157,7 +172,7 @@ export default function contribute(client: PluginClientContext) {
         ],
       };
     },
-  });
+  }));
 
   const removeTodoRenderer = client.addTimelineRenderer({
     kind: "omp-todo",
@@ -221,18 +236,24 @@ export default function contribute(client: PluginClientContext) {
 
   // The assistant's reply. The preference is read inside `transform`, and the
   // transformer is registered again when it changes, so replies already shown
-  // follow it too; a reply the plugin should not own is left to the host.
-  const removeAssistantTransformer = followPreference("assistantMarkdown", () =>
-    addChatTransformer({
-      id: "omp-enhanced-assistant",
-      query: { itemType: "assistant_message" },
-      transform({ item, phase }) {
-        if (item.type !== "assistant_message") return undefined;
-        if (!getEnhancerPreferences().assistantMarkdown) return undefined;
-        if (!item.text.trim()) return undefined;
-        return { items: externalHistoryRows(item.text, phase, item.messageId) ?? assistantRows(item.text, phase) };
-      },
-    }),
+  // follow it too; a reply the plugin should not own is left to the host or,
+  // for ```ui/```app fences, to a plugin further down the chain that renders
+  // them live.
+  const removeAssistantTransformer = followPreference(
+    (preferences) => !preferences.assistantMarkdown ? "host" : preferences.liveUiReplies ? "live-ui" : "markdown",
+    () =>
+      addChatTransformer({
+        id: "omp-enhanced-assistant",
+        query: { itemType: "assistant_message" },
+        transform({ item, phase }) {
+          if (item.type !== "assistant_message") return undefined;
+          if (!getEnhancerPreferences().assistantMarkdown) return undefined;
+          if (!item.text.trim()) return undefined;
+          if (getEnhancerPreferences().liveUiReplies && hasUiFence(item.text, phase)) return undefined;
+          if (hasBrowserPromptFence(item.text)) return undefined;
+          return { items: externalHistoryRows(item.text, phase, item.messageId) ?? assistantRows(item.text, phase) };
+        },
+      }),
   );
 
   const removeAssistantRenderer = client.addTimelineRenderer({
@@ -244,13 +265,17 @@ export default function contribute(client: PluginClientContext) {
     Component: LiveAssistantRenderer,
   });
 
-  // Only `error` is intercepted here. Paseo 0.8 accepts transformers for
-  // user_message, assistant_message, reasoning, tool_call, todo, error, and
-  // compaction; `notification` — the ⓘ row a finished background job produces —
-  // is not on that list, and registering it throws. Every contribution in this
-  // function shares one call frame, so that throw drops every renderer the
-  // plugin installs and the whole chat falls back to native styling. Add the
-  // notification transformer the day the host accepts the type, not before.
+  // A host notice — the ⓘ row a finished background job produces — is the
+  // same row the host draws for `error`: a level and a message, in its own
+  // tinted rectangle. Paseo 0.14 lists `notification` among the transformable
+  // item types, so both now go through `omp-notice` and read as the rest of
+  // the timeline.
+
+  const removeNotificationTransformer = addChatTransformer({
+    id: "omp-enhanced-notification",
+    query: { itemType: "notification" },
+    transform: transformNotification,
+  });
 
   const removeErrorTransformer = addChatTransformer({
     id: "omp-enhanced-error",
@@ -281,8 +306,12 @@ export default function contribute(client: PluginClientContext) {
     Component: LiveNoticeRenderer,
   });
 
-  // Debug only: `/bc-perf on|off|reset|dump [label]` for hosts without a console.
+  // Debug only: `/bp-perf on|off|reset|dump [label]` for hosts without a console.
   const removePerfCommand = client.addSlashCommand(perfSlashCommand);
+
+  // General → Agent steps from the chat: a composer pill per agent, up before
+  // its chat opens, and `/bp-timeline` for any agent.
+  const removeTimelineLevelControl = installTimelineLevelControl(client);
 
   // The Tasks board: a screen, its sidebar entry and a Command Center item;
   // its options are the Tasks half of the settings page (docs/tasks-board.md).
@@ -298,12 +327,14 @@ export default function contribute(client: PluginClientContext) {
     stopPreferenceWatch();
     removeTasks();
     removeSettings();
+    removeUpdateIndicator?.();
     removePerfCommand();
+    removeTimelineLevelControl();
     removeFonts();
     setMarkLoader(null);
     removeFocusRing();
-    removeNoticeStyle();
     removeChatFind();
+    removeNotificationTransformer();
     removeToolTransformer();
     removeCompactionTransformer();
     removeToolRenderer();

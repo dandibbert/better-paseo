@@ -3,20 +3,27 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import TestRenderer, { act, type ReactTestInstance } from "react-test-renderer";
 import "./helpers/quiet-renderer";
 
-const state = vi.hoisted(() => ({ pointer: true }));
+const state = vi.hoisted(() => ({ pointer: true, sync: "ready" as "ready" | "invalid" }));
 vi.mock("react-native", () => import("./helpers/rn-mock"));
 vi.mock("@getpaseo/plugin/client", async (original) => {
-  const rpc = async () => ({ state: "idle" });
-  return { ...await original<object>(), useRpc: () => rpc };
+  const rpc = async () => ({ state: "idle", entries: [], error: null });
+  // Every plugin surface renders under its installation's Paseo client.
+  const paseo = {};
+  return {
+    ...await original<object>(),
+    usePaseo: () => paseo,
+    useRpc: () => rpc,
+    useSettings: () => ({ status: "loading", saving: false, saveError: null, save: async () => true, reset: async () => true }),
+  };
 });
-vi.mock("@getpaseo/plugin/client/react-native", async () => {
+vi.mock("@getpaseo/plugin/client/ui", async () => {
   const rn = await import("./helpers/rn-mock");
-  return { TextInput: rn.TextInput, useToast: () => ({ show() {}, error() {} }) };
+  return { Icon: rn.View, TextInput: rn.TextInput, useToast: () => ({ show() {}, error() {} }) };
 });
 vi.mock("../../client/ui/use-input-capabilities", () => ({
   useInputCapabilities: (compact = false) => ({ hover: state.pointer, touch: !state.pointer, compact, native: false }),
 }));
-vi.mock("../../client/state/preference-sync-slot", () => ({ usePreferenceSettings: () => ({ status: "ready", failed: false }) }));
+vi.mock("../../client/state/preference-sync-slot", () => ({ usePreferenceSettings: () => ({ status: state.sync, failed: false, error: state.sync === "invalid" ? "invalid" : null }) }));
 vi.mock("../../client/ui/host-appearance-shim", () => ({ useHostAppearance: () => null }));
 vi.mock("../../client/i18n/host-language", async (original) => ({
   ...await original<object>(),
@@ -32,6 +39,7 @@ import { DEFAULT_PREFERENCES, getEnhancerPreferences, resetEnhancerPreferences, 
 import { BetterPaseoSettingsPage } from "../../client/settings-page";
 import { toolbarLabel } from "../../client/i18n/toolbar-strings";
 import { preferencesSchema } from "../../shared/preferences-settings";
+import { FILE_OPEN_APPS, FILE_OPEN_LABELS } from "../../shared/file-open-apps";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -49,14 +57,21 @@ const textOf = (node: ReactTestInstance): string => node.children.map((child) =>
   typeof child === "string" ? child : textOf(child as ReactTestInstance),
 ).join("");
 
-function renderPage(): Renderer {
+async function renderPage(): Promise<Renderer> {
   let renderer!: Renderer;
-  act(() => {
+  await act(async () => {
     renderer = TestRenderer.create(React.createElement(BetterPaseoSettingsPage, {
       theme: theme as never,
       layout: { platform: "web", compact: false } as never,
       host: {} as never,
     }));
+  });
+  // The installed-editor scan resolves after the first paint. Wait for it so a
+  // later setState does not land outside act, and so a missing list falls back
+  // to the full catalog before an assertion.
+  await act(async () => {
+    await Promise.resolve();
+    await Promise.resolve();
   });
   return renderer;
 }
@@ -77,10 +92,91 @@ afterEach(() => {
 beforeEach(() => {
   (globalThis as { __rnMockOS?: string }).__rnMockOS = "web";
   state.pointer = true;
+  state.sync = "ready";
   resetEnhancerPreferences();
 });
 
+function fileOpenButton(root: Node): ReactTestInstance {
+  return root.find((node) => typeof node.type === "string" && node.props.accessibilityRole === "button" && node.props.accessibilityLabel === "Open files with");
+}
+
+describe("file open setting", () => {
+  it.each([{ chatEnabled: false }, { timelineLevel: "simple" as const }])("remains available independently of chat and timeline settings: %o", async (setting) => {
+    updateEnhancerPreferences({ language: "en", ...setting });
+    const renderer = await renderPage();
+    expect(fileOpenButton(renderer.root).props.accessibilityValue.text).toBe("System app");
+    expect(choiceGroup(renderer.root, "Open files with")).toBeUndefined();
+    act(() => renderer.unmount());
+  });
+
+  it("opens a menu of the supported editors and tracks the selection", async () => {
+    updateEnhancerPreferences({ language: "en" });
+    const renderer = await renderPage();
+    const button = () => fileOpenButton(renderer.root);
+    expect(button().props.accessibilityState.expanded).toBe(false);
+    expect(button().props.accessibilityValue.text).toBe("System app");
+    act(() => button().props.onPress());
+    const groups = renderer.root.findAll((node) => typeof node.type === "string" && node.props.accessibilityRole === "radiogroup" && node.props.accessibilityLabel === "Open files with");
+    expect(groups).toHaveLength(1);
+    const radios = groups[0]!.findAll((node) => typeof node.type === "string" && node.props.accessibilityRole === "radio");
+    expect(radios.map((node) => node.props.accessibilityLabel)).toEqual(
+      FILE_OPEN_APPS.map((app) => app === "system" ? "System app" : FILE_OPEN_LABELS[app]),
+    );
+    act(() => radios.find((node) => node.props.accessibilityLabel === "Zed")!.props.onPress());
+    expect(getEnhancerPreferences().fileOpenApp).toBe("zed");
+    expect(choiceGroup(renderer.root, "Open files with")).toBeUndefined();
+    expect(button().props.accessibilityValue.text).toBe("Zed");
+    act(() => renderer.unmount());
+  });
+
+  it("does not present a default as active while the stored settings are invalid", async () => {
+    updateEnhancerPreferences({ language: "en" });
+    state.sync = "invalid";
+    const renderer = await renderPage();
+    expect(choiceGroup(renderer.root, "Open files with")).toBeUndefined();
+    expect(renderer.root.findAll((node) => node.props.accessibilityRole === "alert").some((node) => textOf(node).includes("File open setting unavailable"))).toBe(true);
+    act(() => renderer.unmount());
+  });
+});
+
 describe("block details settings", () => {
+  it("keeps the timeline modes selectable after changing their illustrations", async () => {
+    updateEnhancerPreferences({ language: "en" });
+    const renderer = await renderPage();
+    const group = choiceGroup(renderer.root, "Agent steps")!;
+    const radios = group.findAll((node) => typeof node.type === "string" && node.props.accessibilityRole === "radio");
+    expect(radios.map((radio) => radio.props.accessibilityState.checked)).toEqual([false, true, false]);
+    act(() => radios[2]!.props.onPress());
+    expect(getEnhancerPreferences().timelineLevel).toBe("detailed");
+    expect(radios.map((radio) => radio.props.accessibilityState.checked)).toEqual([false, false, true]);
+    act(() => radios[0]!.props.onPress());
+    expect(getEnhancerPreferences().timelineLevel).toBe("simple");
+    act(() => renderer.unmount());
+  });
+
+  it("enables interactive reply handoff from the messages setting", async () => {
+    updateEnhancerPreferences({ language: "en" });
+    const renderer = await renderPage();
+    const label = "Let genui render interactive replies";
+    expect(switchControl(renderer.root, label).props["aria-checked"]).toBe(false);
+    act(() => switchControl(renderer.root, label).props.onPress());
+    expect(getEnhancerPreferences().liveUiReplies).toBe(true);
+    act(() => renderer.unmount());
+  });
+
+  it("disables interactive reply handoff when plugin Markdown is off", async () => {
+    updateEnhancerPreferences({ language: "en", assistantMarkdown: false });
+    const renderer = await renderPage();
+    const control = switchControl(renderer.root, "Let genui render interactive replies");
+    expect(control.props.disabled).toBe(true);
+    expect(control.props.accessibilityState.disabled).toBe(true);
+    expect(control.props.onKeyDown).toBeUndefined();
+    expect(control.props.onKeyUp).toBeUndefined();
+    act(() => control.props.onPress());
+    expect(getEnhancerPreferences().liveUiReplies).toBe(false);
+    act(() => renderer.unmount());
+  });
+
   it("turns details on by default and drops a stored row-click choice", () => {
     expect(DEFAULT_PREFERENCES).toMatchObject({ blockDetails: true });
     expect(DEFAULT_PREFERENCES).not.toHaveProperty("rowClick");
@@ -93,9 +189,9 @@ describe("block details settings", () => {
     }
   });
 
-  it("shows the toggle, and no row-click choice with a pointer or without", () => {
+  it("shows the toggle, and no row-click choice with a pointer or without", async () => {
     updateEnhancerPreferences({ blockDetails: false });
-    const renderer = renderPage();
+    const renderer = await renderPage();
     expect(switchControl(renderer.root, "Block details panel (preview)").props["aria-checked"]).toBe(false);
     act(() => switchControl(renderer.root, "Block details panel (preview)").props.onPress());
     expect(getEnhancerPreferences().blockDetails).toBe(true);
@@ -111,9 +207,9 @@ describe("block details settings", () => {
     act(() => renderer.unmount());
   });
 
-  it("renders the new labels in Chinese", () => {
+  it("renders the new labels in Chinese", async () => {
     updateEnhancerPreferences({ language: "zh", blockDetails: true });
-    const renderer = renderPage();
+    const renderer = await renderPage();
     const text = renderer.root.findAll((node) => typeof node.type === "string" && (node.type as unknown) === "Text").map(textOf).join("\n");
     expect(text).toContain("区块详情面板（预览）");
     expect(text).toContain("移动端点按区块打开详情，长按显示菜单；桌面端从预览或右键菜单打开详情。");
@@ -121,13 +217,13 @@ describe("block details settings", () => {
     act(() => renderer.unmount());
   });
 
-  it("hides the chat-only options, keyboard included, while the chat switch is off", () => {
+  it("hides the chat-only options, keyboard included, while the chat switch is off", async () => {
     updateEnhancerPreferences({ chatEnabled: false });
-    const renderer = renderPage();
+    const renderer = await renderPage();
     const switches = () => renderer.root.findAll((node) => typeof node.type === "string" && node.props.accessibilityRole === "switch");
     const chatOnly = () => switches().filter((node) => ["Block details panel (preview)", "Enhanced prompt bubble", "Tight rows"].includes(node.props.accessibilityLabel));
     expect(chatOnly()).toEqual([]);
-    act(() => switchControl(renderer.root, "Enable Better Paseo chat").props.onPress());
+    act(() => switchControl(renderer.root, "Enhance conversation timeline").props.onPress());
     expect(getEnhancerPreferences().chatEnabled).toBe(true);
     expect(chatOnly()).toHaveLength(3);
     act(() => renderer.unmount());

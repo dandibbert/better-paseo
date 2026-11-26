@@ -1,6 +1,6 @@
-import React, { useCallback, useMemo, useState } from "react";
+import React, { useCallback, useContext, useMemo, useState } from "react";
 import { Image, Platform, Pressable, StyleSheet, Text, View } from "react-native";
-import { Icon } from "@getpaseo/plugin/client/react-native";
+import { Icon } from "@getpaseo/plugin/client/ui";
 import { radiusV2, space } from "./theme-tokens";
 import { useCopy } from "../ui/use-copy";
 import { useInputCapabilities } from "../ui/use-input-capabilities";
@@ -12,6 +12,9 @@ import { unselectable } from "./selection";
 import type { ExtendedThemeTokens } from "./theme-tokens";
 import { selectableSurface } from "./selection";
 import { selectionSurface } from "./selection-actions";
+import { surfaceProps } from "./view-props";
+import { bindSelectionScopeElement, selectionScopeDataSet, SelectionTranslationContext } from "../translation/selection";
+import { selectionColorProps } from "./text-selection";
 
 export interface TurnUsage {
   inputTokens?: number;
@@ -89,6 +92,13 @@ export function UserMessage({
   const { copied, copy } = useCopy();
   const handleCopy = useCallback(() => void copy(text, { label: "Copy prompt" }), [copy, text]);
   const capabilities = useInputCapabilities(compact);
+  const scope = useContext(SelectionTranslationContext);
+  const scopeData = Platform.OS === "web" ? selectionScopeDataSet(scope) : null;
+  const bindScope = useCallback((node: Text | null) => {
+    if (!node || !scope) return;
+    bindSelectionScopeElement(node, scope);
+    return () => bindSelectionScopeElement(node, null);
+  }, [scope]);
 
   const styles = useMemo(() => {
     const size = tokens.typography.content.size;
@@ -162,7 +172,7 @@ export function UserMessage({
       style={styles.column}
     >
       <View style={styles.bubble}>
-        <Text selectable {...contentTextProps()} style={[styles.text, contentTextStyle()]}>
+        <Text ref={scopeData ? bindScope : undefined} selectable {...selectionColorProps()} {...contentTextProps()} {...(scopeData ? surfaceProps(selectionSurface, { dataSet: scopeData } as never) : {})} style={[styles.text, contentTextStyle()]}>
           {text}
         </Text>
         {images?.length ? (
@@ -297,7 +307,7 @@ export function TurnUsageRow({
               typeof value === "number" ? (
                 <View key={label} style={styles.figureRow}>
                   <Text style={styles.figureLabel}>{label}</Text>
-                  <Text selectable style={styles.figureValue}>
+                  <Text selectable {...selectionColorProps()} style={styles.figureValue}>
                     {formatTokens(value)}
                   </Text>
                 </View>

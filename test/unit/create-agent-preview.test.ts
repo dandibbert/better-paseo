@@ -6,21 +6,22 @@ import "./helpers/quiet-renderer";
 
 vi.mock("react-native", () => import("./helpers/rn-mock"));
 const clipboard = vi.hoisted(() => ({ copyText: vi.fn(async (_text: string) => {}), show: vi.fn(), error: vi.fn() }));
-vi.mock("@getpaseo/plugin/client/react-native", async () => {
+vi.mock("@getpaseo/plugin/client/ui", async () => {
   const rn = await import("./helpers/rn-mock");
   return { Icon: rn.View, ScrollView: rn.ScrollView, TextInput: rn.TextInput,
-    copyText: clipboard.copyText, useToast: () => ({ show: clipboard.show, error: clipboard.error }), useRevealedText: (text: string) => text };
+    copyText: clipboard.copyText, useToast: () => ({ show: clipboard.show, error: clipboard.error }) };
 });
 const host = vi.hoisted(() => {
   const respondToPermission = vi.fn(async (_options: unknown) => {});
-  return { cwd: null as string | null, agent: null as Record<string, unknown> | null, respondToPermission,
+  const rpc = vi.fn(async (_input: unknown) => ({ state: "done", translation: "译文\n\n完整内容", targetLanguageCode: "zh-CN", origin: "https://example.test", model: "test" }));
+  return { rpc, cwd: null as string | null, agent: null as Record<string, unknown> | null, respondToPermission,
     providers: { listModels: vi.fn(), listModes: vi.fn() }, agents: { ref: vi.fn((_id: string) => ({ respondToPermission })) } };
 });
 vi.mock("@getpaseo/plugin/client", () => ({
   useAgent: (_id: string, select: (agent: Record<string, unknown>) => unknown) =>
     host.agent ? select(host.agent) : host.cwd === null ? null : select({ cwd: host.cwd }),
   useWorkspace: () => undefined,
-  useRpc: () => () => Promise.resolve(null), usePaseo: () => host,
+  useRpc: () => host.rpc, usePaseo: () => host,
   useSettings: () => ({ status: "loading" }),
 }));
 import { buildThemeTokens, withAlpha } from "../../client/components/theme-tokens";
@@ -42,6 +43,8 @@ import { PREVIEW_OPEN_MS } from "../../client/ui/hover-preview";
 import { summarizeTool } from "../../client/tools/summarize";
 import type { AgentMessage } from "../../client/tools/agent-message";
 
+import { publishTranslationSettings, resetTranslationSettingsStoreForTests } from "../../client/translation/settings-store";
+import { resetTranslationStoreForTests } from "../../client/translation/store";
 import { StyleSheet } from "react-native";
 import { Dimensions } from "./helpers/rn-mock";
 import { seedMarkBitmaps } from "../../client/components/marks";
@@ -79,6 +82,8 @@ beforeEach(() => {
   vi.clearAllMocks();
   host.cwd = null;
   host.agent = null;
+  resetTranslationSettingsStoreForTests();
+  resetTranslationStoreForTests();
   seedMarkBitmaps({ "provider:cursor": "data:image/png;base64,cursor", "lobe:grok": "data:image/png;base64,grok" });
 });
 afterEach(() => {
@@ -91,10 +96,30 @@ afterEach(() => {
 });
 
 describe("create_agent preview", () => {
+  it.each(["web", "ios", "android"])("translates the full create prompt and restores the original on %s", async (os) => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = os;
+    publishTranslationSettings({ enabled: true, mode: "openai", endpoint: "https://example.test/v1", endpointModel: "test" }, "translation-test");
+    const data = classifyTool({ callId: "create", name: "paseo.create_agent", status: "completed", detail: {
+      type: "unknown", input: { title: "Review", provider: "cursor", initialPrompt: prompt }, output: agentId,
+    } });
+    await act(async () => { renderer = TestRenderer.create(React.createElement(PreviewPanelSample, { tokens,
+      children: React.createElement(ToolPreviewContent, { data, tokens, compact: false, resolvePath: (path) => path, translationAgentId: "parent-agent" }),
+    })); });
+    expect(host.rpc).not.toHaveBeenCalled();
+    const button = () => renderer!.root.find((node) => String(node.type) === "Pressable" && node.props.testID === "create-agent-prompt-translate");
+    await act(async () => { button().props.onPress({ stopPropagation() {} }); });
+    expect(host.rpc).toHaveBeenCalledWith(expect.objectContaining({ action: "start", agentId: "parent-agent", text: prompt, sourceKind: "user_message" }));
+    expect(renderer!.root.findByType(MarkdownView).props.text).toBe("译文\n\n完整内容");
+    await act(async () => { button().props.onPress({ stopPropagation() {} }); });
+    expect(renderer!.root.findByType(MarkdownView).props.text).toBe(prompt);
+    expect(host.rpc).toHaveBeenCalledTimes(1);
+  });
+
   it.each(["web", "ios", "android"])("shows the full prompt, toggles once, and copies source and ID on %s", async (os) => {
     (globalThis as { __rnMockOS?: string }).__rnMockOS = os;
     act(() => { renderer = TestRenderer.create(agentView()); });
     const root = renderer!.root;
+    expect(root.findByProps({ accessibilityLabel: "Copy prompt" }).findByProps({ name: "FileText" })).toBeDefined();
     expect(root.findByType(MarkdownView).props.text).toBe(prompt);
     expect(root.findByType(HoverPreviewHeader).props.fitControls).toBe(true);
     expect(textOf(renderer!.toJSON())).toContain(agentId.slice(0, 8));
@@ -559,6 +584,8 @@ describe("unified agent tool card layout", () => {
     expect(renderer!.root.findByProps({ testID: "send-agent-prompt-state" }).props.accessibilityLabel).toBe("running");
     expect(textOf(renderer!.toJSON())).toContain(receipt.guidance);
     expect(renderer!.root.findByType(MarkdownView).props.text).toBe(statusBody);
+    expect(renderer!.root.findByProps({ accessibilityLabel: "Copy prompt" }).findByProps({ name: "FileText" })).toBeDefined();
+    expect(renderer!.root.findByProps({ accessibilityLabel: "Copy result" }).findByProps({ name: "Copy" })).toBeDefined();
     await press("Copy prompt");
     expect(clipboard.copyText).toHaveBeenLastCalledWith(statusBody);
     await press(`Copy agent ID ${agentId}`);
@@ -625,5 +652,174 @@ describe("unified agent tool card layout", () => {
     expect(textOf(renderer!.toJSON())).toContain("Explore");
     await press("Show raw text");
     expect(JSON.parse(renderer!.root.findByType(PreviewLines).props.text).description).toBe("Explore the code");
+  });
+});
+
+describe("whole detail translations", () => {
+  function draw(data: ReturnType<typeof classifyTool>) {
+    return React.createElement(PreviewPanelSample, { tokens, children: React.createElement(ToolPreviewContent, {
+      data, tokens, compact: false, resolvePath: (path) => path, translationAgentId: "parent-agent",
+    }) });
+  }
+  function translateButton(id = "detail-translate") {
+    return renderer!.root.find((node) => String(node.type) === "Pressable" && node.props.testID === id);
+  }
+  function configured() {
+    publishTranslationSettings({ enabled: true, mode: "openai", endpoint: "https://example.test/v1", endpointModel: "test" }, "detail-test");
+  }
+  it.each(["web", "ios", "android"])("translates the sent prompt but copies the original on %s", async (os) => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = os;
+    configured();
+    await act(async () => { renderer = TestRenderer.create(draw(agentTool("send_agent_prompt", { success: true }))); });
+    expect(renderer!.root.findByProps({ testID: "hover-preview-start" }).findAllByProps({ testID: "detail-translate" }).length).toBeGreaterThan(0);
+    await act(async () => translateButton().props.onPress({ stopPropagation() {} }));
+    expect(host.rpc).toHaveBeenCalledWith(expect.objectContaining({ action: "start", text: statusBody, sourceKind: "user_message" }));
+    expect(renderer!.root.findByType(MarkdownView).props.text).toBe("译文\n\n完整内容");
+    await press("Copy prompt");
+    expect(clipboard.copyText).toHaveBeenLastCalledWith(statusBody);
+    await act(async () => translateButton().props.onPress({ stopPropagation() {} }));
+    expect(renderer!.root.findByType(MarkdownView).props.text).toBe(statusBody);
+  });
+
+  it("keeps subagent prompt and result separate through translation", async () => {
+    configured();
+    const data = classifyTool({ name: "Task", status: "completed", detail: { type: "sub_agent",
+      description: "Explore", prompt: "Read the project", log: "Found the result" } });
+    await act(async () => { renderer = TestRenderer.create(draw(data)); });
+    await act(async () => translateButton().props.onPress({ stopPropagation() {} }));
+    expect(host.rpc.mock.calls.map(([input]) => input)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ text: "Read the project", sourceKind: "user_message" }),
+      expect.objectContaining({ text: "Found the result", sourceKind: "assistant_message" }),
+    ]));
+    expect(renderer!.root.findAllByType(MarkdownView).map((view) => view.props.text)).toEqual(["译文\n\n完整内容", "译文\n\n完整内容"]);
+    await act(async () => translateButton().props.onPress({ stopPropagation() {} }));
+    expect(renderer!.root.findAllByType(MarkdownView).map((view) => view.props.text)).toEqual(["Read the project", "Found the result"]);
+  });
+
+  it("asks again when one subagent field changes without retranslating the other", async () => {
+    configured();
+    const task = (log: string) => classifyTool({ callId: "subagent", name: "Task", status: "completed", detail: {
+      type: "sub_agent", description: "Explore", prompt: "Inspect this", log,
+    } });
+    await act(async () => { renderer = TestRenderer.create(draw(task("First result"))); });
+    await act(async () => translateButton().props.onPress({ stopPropagation() {} }));
+    expect(host.rpc).toHaveBeenCalledTimes(2);
+    await act(async () => { renderer!.update(draw(task("Updated result"))); });
+    expect(translateButton().props.accessibilityLabel).toBe("Translate");
+    const before = renderer!.root.findAllByType(MarkdownView).map((view) => view.props.text);
+    expect(before).toEqual(["译文\n\n完整内容", "Updated result"]);
+    await act(async () => translateButton().props.onPress({ stopPropagation() {} }));
+    expect(host.rpc).toHaveBeenCalledTimes(3);
+    expect(host.rpc.mock.calls[2]![0]).toEqual(expect.objectContaining({ text: "Updated result" }));
+  });
+
+  it("keeps the original raw text after translating a create prompt", async () => {
+    configured();
+    const data = classifyTool({ callId: "create-raw", name: "paseo.create_agent", status: "completed", detail: {
+      type: "unknown", input: { title: "Review", provider: "cursor", initialPrompt: prompt }, output: agentId,
+    } });
+    await act(async () => { renderer = TestRenderer.create(draw(data)); });
+    await act(async () => translateButton("create-agent-prompt-translate").props.onPress({ stopPropagation() {} }));
+    await press("Show raw text");
+    expect(renderer!.root.findByType(PreviewLines).props.text).toBe(prompt);
+    expect(renderer!.root.findAllByProps({ testID: "create-agent-prompt-translate" })).toHaveLength(0);
+  });
+
+  it.each([
+    ["plan", classifyTool({ name: "ExitPlanMode", status: "completed", detail: { type: "plan", text: "# Plan\nDo work" } }), "# Plan\nDo work"],
+    ["fetch", classifyTool({ name: "WebFetch", status: "completed", detail: { type: "fetch", url: "https://example.test/path", result: "Fetched article" } }), "Fetched article"],
+    ["search", classifyTool({ name: "WebSearch", status: "completed", detail: { type: "search", query: "search terms", toolName: "web_search", annotations: ["First", "Second"] } }), "First\n\nSecond"],
+    ["reply", statusView(), statusBody],
+  ])("translates only the %s prose", async (_kind, data, source) => {
+    configured();
+    await act(async () => { renderer = TestRenderer.create(draw(data)); });
+    await act(async () => translateButton().props.onPress({ stopPropagation() {} }));
+    expect(host.rpc).toHaveBeenCalledWith(expect.objectContaining({ text: source }));
+    expect(renderer!.root.findAllByType(MarkdownView).some((view) => view.props.text === "译文\n\n完整内容")).toBe(true);
+    if (data.fetch) expect(textOf(renderer!.toJSON())).toContain("https://example.test/path");
+  });
+
+  it("translates question fields separately while preserving selected options and raw data", async () => {
+    configured();
+    const input = { questions: [{ question: "Pick a platform", options: [{ label: "Phone", description: "Mobile device" }, { label: "Web" }] }], answers: { "Pick a platform": "Phone" } };
+    const data = classifyTool({ name: "AskUserQuestion", callId: "question", status: "completed", detail: { type: "unknown", input } });
+    await act(async () => { renderer = TestRenderer.create(draw(data)); });
+    await act(async () => translateButton("question-translate").props.onPress({ stopPropagation() {} }));
+    const sent = host.rpc.mock.calls.map(([arg]) => (arg as { text: string }).text);
+    expect(sent).toEqual(expect.arrayContaining(["Pick a platform", "Phone", "Mobile device", "Web"]));
+    const options = renderer!.root.findAll((node) => String(node.type) === "View" && node.props.testID === "user-question-option");
+    expect(options.map((node) => [node.props.accessibilityLabel, node.props.accessibilityState.selected])).toEqual([["Phone", true], ["Web", false]]);
+    await press("Show raw data");
+    expect(textOf(renderer!.toJSON())).toContain("Pick a platform");
+    expect(textOf(renderer!.toJSON())).not.toContain("译文");
+  });
+
+  it("translates every question page and retains translations while paging", async () => {
+    configured();
+    const data = classifyTool({ name: "AskUserQuestion", callId: "pages", status: "completed", questionData: {
+      questions: [{ question: "First question", options: [{ label: "First option" }] },
+        { question: "Second question", options: [{ label: "Second option" }] }],
+    } });
+    await act(async () => { renderer = TestRenderer.create(draw(data)); });
+    await act(async () => translateButton("question-translate").props.onPress({ stopPropagation() {} }));
+    expect(host.rpc.mock.calls.map(([arg]) => (arg as { text: string }).text)).toEqual(
+      expect.arrayContaining(["First question", "First option", "Second question", "Second option"]));
+    await press("Next question");
+    expect(textOf(renderer!.toJSON())).toContain("译文");
+    expect(textOf(renderer!.toJSON())).not.toContain("Second question");
+    expect(host.rpc).toHaveBeenCalledTimes(4);
+  });
+
+  it("does not send permission commands for translation", async () => {
+    configured();
+    const text = `Agent ${agentId} (Builder) needs permission.\n\n<permission-request>\n${JSON.stringify({ requestId: "p1", request: {
+      name: "Bash", description: "Inspect output", input: { command: "cat /tmp/output" },
+    } })}\n</permission-request>`;
+    const data = classifyTool({ name: "agent_message", status: "completed", detail: { type: "plain_text", text },
+      agentMessage: { event: "permission-required", sender: { id: agentId, title: "Builder" }, text } });
+    await act(async () => { renderer = TestRenderer.create(draw(data)); });
+    await act(async () => translateButton("permission-translate").props.onPress({ stopPropagation() {} }));
+    expect(host.rpc.mock.calls.map(([arg]) => (arg as { text: string }).text)).not.toContain("cat /tmp/output");
+    expect(textOf(renderer!.toJSON())).toContain("cat /tmp/output");
+    expect(host.respondToPermission).not.toHaveBeenCalled();
+  });
+});
+
+describe("structured detail translation", () => {
+  function draw(data: ReturnType<typeof classifyTool>) {
+    return React.createElement(PreviewPanelSample, { tokens, children: React.createElement(ToolPreviewContent, {
+      data, tokens, compact: false, resolvePath: (path) => path, translationAgentId: "parent-agent",
+    }) });
+  }
+  beforeEach(() => publishTranslationSettings({ enabled: true, mode: "openai", endpoint: "https://example.test/v1", endpointModel: "test" }, "structured-test"));
+  it("retries a failed question field without re-requesting successful fields", async () => {
+    const data = classifyTool({ name: "AskUserQuestion", callId: "retry", status: "completed", questionData: {
+      questions: [{ question: "Choose", options: [{ label: "One" }, { label: "Two" }] }],
+    } });
+    host.rpc.mockRejectedValueOnce(new Error("temporary failure"));
+    await act(async () => { renderer = TestRenderer.create(draw(data)); });
+    const button = () => renderer!.root.find((node) => String(node.type) === "Pressable" && node.props.testID === "question-translate");
+    await act(async () => button().props.onPress({ stopPropagation() {} }));
+    expect(host.rpc).toHaveBeenCalledTimes(3);
+    expect(textOf(renderer!.toJSON())).toContain("temporary failure");
+    await act(async () => button().props.onPress({ stopPropagation() {} }));
+    expect(host.rpc).toHaveBeenCalledTimes(4);
+    expect(host.rpc.mock.calls[3]![0]).toEqual(expect.objectContaining({ text: "Choose" }));
+    expect(textOf(renderer!.toJSON())).not.toContain("temporary failure");
+  });
+  it("translates a permission question by field and leaves the option structure intact", async () => {
+    const text = `Agent ${agentId} (Builder) needs permission.\n\n<permission-request>\n${JSON.stringify({ requestId: "q1", request: {
+      kind: "question", name: "request_user_input_async", input: { questions: [{ question: "Choose a path", options: [{ label: "First" }, { label: "Second", description: "Details" }] }] },
+    } })}\n</permission-request>`;
+    const data = classifyTool({ name: "agent_message", status: "completed", detail: { type: "plain_text", text },
+      agentMessage: { event: "permission-required", sender: { id: agentId, title: "Builder" }, text } });
+    await act(async () => { renderer = TestRenderer.create(draw(data)); });
+    const button = renderer!.root.find((node) => String(node.type) === "Pressable" && node.props.testID === "permission-question-0-translate");
+    await act(async () => button.props.onPress({ stopPropagation() {} }));
+    const sent = host.rpc.mock.calls.map(([arg]) => (arg as { text: string }).text);
+    expect(sent).toEqual(expect.arrayContaining(["Choose a path", "First", "Second", "Details"]));
+    expect(renderer!.root.findAll((node) => String(node.type) === "View" && node.props.testID === "permission-option-0-0")).toHaveLength(1);
+    expect(renderer!.root.findAll((node) => String(node.type) === "View" && node.props.testID === "permission-option-0-1")).toHaveLength(1);
+    expect(host.respondToPermission).not.toHaveBeenCalled();
   });
 });

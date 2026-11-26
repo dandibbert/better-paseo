@@ -6,7 +6,7 @@ import { lexBlock } from "../lex";
 import { renderBlocks } from "./blocks";
 import { nextReuse, type NodeReuse } from "./reuse";
 import type { RenderContext } from "./context";
-import { BlockSelection, selectableBlock } from "./block-selection";
+import { BlockSelection, blockSelectionPlatform, selectableBlock } from "./block-selection";
 
 export interface MdBlockProps {
   /** The block's source; for the streaming tail, already repaired. */
@@ -36,14 +36,17 @@ function MdBlockBody({ raw, open, first, context, id }: MdBlockProps) {
     finishedBefore.current = !open;
   });
 
-  const tokens = lexBlock(raw, open);
+  const tokens = lexBlock(raw, open, context.codexDirectives === true);
   // While the block is the open tail, the parts a chunk left alone keep what
   // was drawn for them. A link definition or a footnote changes how text
   // before it reads, so a block holding one is drawn whole every time.
   const drawn = useRef<{ context: RenderContext; nodes: NodeReuse["next"] } | null>(null);
   const reuse = nextReuse(drawn, context, open && !hasReferences(tokens, raw));
   const nodes = renderBlocks(tokens, context, id, { first, open, reuse });
-  return Platform.OS === "ios" && selectableBlock(tokens)
+  if (Platform.OS === "web") {
+    return <span data-bcblock="" style={{ display: "contents" }}>{nodes}</span>;
+  }
+  return context.blockSelection !== false && blockSelectionPlatform() && selectableBlock(tokens)
     ? <BlockSelection source={raw} blocks={tokens} tokens={context.tokens}>{nodes}</BlockSelection>
     : <>{nodes}</>;
 }

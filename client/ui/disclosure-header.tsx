@@ -1,6 +1,6 @@
 import React, { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from "react";
 import { Platform, Pressable, StyleSheet, Text, View, type GestureResponderEvent, type TextProps } from "react-native";
-import { Icon } from "@getpaseo/plugin/client/react-native";
+import { Icon } from "@getpaseo/plugin/client/ui";
 import type { ExtendedThemeTokens } from "../components/theme-tokens";
 import { radiusV2, space } from "../components/theme-tokens";
 import { selectableTextStyle, unselectable } from "../components/selection";
@@ -13,7 +13,7 @@ import { TYPE } from "./tokens/typography";
 import { useHover } from "./use-hover";
 import { useInputCapabilities } from "./use-input-capabilities";
 import { useEnhancerPreferences } from "../preferences";
-import { TooltipAlignContext, TooltipSideContext } from "./toolbar-button";
+import { ToolbarHoverColorContext, TooltipAlignContext, TooltipSideContext } from "./toolbar-button";
 import { HoverPreview, HoverPreviewContext, RowLongPressContext, useHoverPreview } from "./hover-preview";
 import { useScrollAnchor, type ScrollAnchor } from "./scroll-anchor";
 import { useContainerButton } from "./container-button";
@@ -24,6 +24,9 @@ import { rowPressAction } from "../details/click-model";
 import { CurrentMarker } from "../details/current-marker";
 import { RowMenu, type RowMenuAnchor } from "../details/row-menu";
 import { toolbarLabel } from "../i18n/toolbar-strings";
+import { SelectionTranslationContext } from "../translation/selection";
+import { SelectionTranslationScope } from "../translation/ui";
+import { selectionColorProps } from "../components/text-selection";
 
 /**
  * Row geometry (S7 design spec §2.5, F0 "Row heights and hit areas").
@@ -33,7 +36,8 @@ import { toolbarLabel } from "../i18n/toolbar-strings";
  * a failed row's error line and an opened body share one text column at
  * `textColumn`. The slot is exactly as wide as the 14pt icon, so the icon's
  * left edge sits on the prose edge rather than centred a few points in; the
- * slot's trailing pad keeps the icon-to-text gap at 10. Rows are 26 tall on desktop and 28 on touch, tighter than
+ * slot's trailing pad and `slotTrim` keep the icon-to-text gap at 6 while the
+ * row's other parts stay `gap` apart. Rows are 26 tall on desktop and 28 on touch, tighter than
  * the host's own 30, and touch rows reach 44 through `hitSlop`.
  */
 export const DISCLOSURE_HEADER = {
@@ -46,18 +50,23 @@ export const DISCLOSURE_HEADER = {
   /** The slot's trailing pad: the slot's content box is the icon's 14pt square. */
   iconSlotPad: 2,
   icon: 14,
+  /**
+   * The slot's trailing margin: it pulls the text in from the row's `gap` to
+   * `space.xs`, so the icon sits close to its text.
+   */
+  slotTrim: space.xs - space.sm,
   verb: TYPE.label.size,
   target: TYPE.target,
   meta: TYPE.meta.size,
   chevron: 14,
-  /** Slot + gap: where the verb, an error line and an opened body start. */
-  textColumn: 16 + space.sm,
+  /** Slot + the trimmed gap: where the verb, an error line and an opened body start. */
+  textColumn: 16 + space.xs,
   /** Middle-truncation budget for a string target, in characters. */
   targetBudget: { desktop: 72, compact: 40 },
 } as const;
 
 /**
- * How loud a row is (docs/prototypes/quiet-tool-rows.md). `quiet` is a call
+ * How loud a row is (https://github.com/RoundRedDot/better-paseo/blob/f2ab453297c4ccb88a08e2129af0cb3528c4e628/docs/prototypes/quiet-tool-rows.md). `quiet` is a call
  * that has finished: it sits one step behind the prose. `active` is one still
  * running, its target halfway back to `foreground`. `loud` is a row that waits
  * for the reader (an open question) and is never dimmed.
@@ -141,9 +150,17 @@ export interface DisclosureHeaderProps {
   copyItems?(): CopyItem[];
   readsImage?: boolean;
   onViewImage?(): void;
+  /**
+   * Selection for a separately registered details entry. Such a row only
+   * opens the panel: it reports `selected` rather than `expanded`, and its
+   * hover hint is the panel icon rather than a chevron.
+   */
+  detailsMarker?: { agentId: string; id: string; selected: boolean };
   tokens: ExtendedThemeTokens;
   /** `layout.compact`. */
   compact?: boolean;
+  /** A fixed-width prefix inside the row's hover and press area. */
+  leading?: { content: ReactNode; width: number };
   /** The status slot: a muted tool icon, a `RunningDot`, a failure mark. */
   icon?: ReactNode;
   /**
@@ -238,8 +255,8 @@ export interface DisclosureHeaderProps {
  *
  *   [slot] Verb  target……………………  meta
  *
- * No frame and no fill of its own. Hover paints `surface1`, a press or a held
- * long-press `surface2`. There is no chevron at rest: the whole row is the
+ * No frame and no fill of its own. Hover, a press or a held
+ * long-press paints a translucent highlight. There is no chevron at rest: the whole row is the
  * control. Where the pointer can hover, the slot shows a chevron while the row
  * is hovered, in place of the icon, so nothing moves; an opened row keeps a
  * down chevron there.
@@ -267,6 +284,7 @@ export function DisclosureHeader({
   onToggle,
   tokens,
   compact = false,
+  leading,
   icon,
   iconIsStatus = false,
   verb,
@@ -298,9 +316,11 @@ export function DisclosureHeader({
   copyItems,
   readsImage = false,
   onViewImage,
+  detailsMarker,
 }: DisclosureHeaderProps) {
   const preferences = useEnhancerPreferences();
   const placement = useContext(BlockPlacementContext);
+  const selectionScope = useContext(SelectionTranslationContext);
   const previewOwner = useContext(HoverPreviewContext);
   const detailsEnabled = Boolean(preferences.blockDetails && placement && previewKey && !previewOwner);
   const details = useDetails(detailsEnabled ? placement!.agentId : "");
@@ -345,7 +365,7 @@ export function DisclosureHeader({
     anchor.hold();
   }, [anchor]);
   const pressOut = useCallback(() => setPressed(false), []);
-  const palette = rowPalette(tokens, tone, hovered || pressed || expanded || menuOpen || isCurrent);
+  const palette = rowPalette(tokens, tone, hovered || pressed || expanded || menuOpen || isCurrent || Boolean(detailsMarker?.selected));
   const rowLabelStyle = preferences.rowLabelStyle;
   // Icon-only rows still need words: a row with no target keeps its verb.
   const hasTarget = target !== undefined && target !== null && target !== "";
@@ -382,7 +402,11 @@ export function DisclosureHeader({
     subtitle: (detailsSubtitle ?? meta?.filter((part): part is string => typeof part === "string") ?? [])
       .map((part) => toolbarLabel(part, preferences.language)),
     tone: detailsTone, icon: detailsIcon ?? "FileText", readsImage,
-    render: previewContent ?? (() => null), copies: copyItems ?? (() => []), onOpen: onPreviewOpen,
+    render: previewContent && selectionScope ? () => <SelectionTranslationScope
+      agentId={selectionScope.agentId} kind={selectionScope.kind} streaming={selectionScope.streaming}>
+      {previewContent()}
+    </SelectionTranslationScope> : previewContent ?? (() => null),
+    copies: copyItems ?? (() => []), onOpen: onPreviewOpen,
     measure: () => new Promise((resolve) => {
       const node = anchorRef.current;
       if (!node) return resolve(null);
@@ -443,7 +467,7 @@ export function DisclosureHeader({
     typeof target === "string" ? (
       <Text
         {...((inert ? surfaceProps(selectionSurface, codeSurface) : codeSurface) as object)}
-        selectable={inert && !detailsEnabled}
+        selectable={inert && !detailsEnabled} {...selectionColorProps()}
         numberOfLines={1}
         ellipsizeMode="tail"
         style={[
@@ -506,11 +530,15 @@ export function DisclosureHeader({
             <RowLongPressContext.Provider value={detailsEnabled ? openMenu : pressPreview ? preview.press : longPress}>
               <Pressable
                 ref={button.ref}
+                {...(Platform.OS === "web" && (detailsMarker || detailsEnabled) ? { dataSet: { bcworkdetails: detailsMarker?.id ?? previewKey } } : {})}
                 accessibilityRole={button.accessibilityRole}
                 accessibilityLabel={label}
-                accessibilityState={inert ? undefined : { expanded }}
+                // A row that only opens the details panel (`detailsMarker`) never
+                // expands in place: it reports whether the panel shows it instead.
+                accessibilityState={inert ? undefined : detailsMarker ? { selected: detailsMarker.selected } : { expanded }}
                 // React Native Web reads the ARIA prop, not `accessibilityState`.
-                aria-expanded={inert ? undefined : expanded}
+                aria-expanded={inert || detailsMarker ? undefined : expanded}
+                aria-pressed={detailsMarker ? detailsMarker.selected : undefined}
                 disabled={inert && !detailsEnabled}
                 onPressIn={pressIn}
                 onPressOut={pressOut}
@@ -531,16 +559,20 @@ export function DisclosureHeader({
                 {...(pointerProps as object)}
                 style={({ pressed: pressedState }) => [
                   styles.row,
-                  { height },
-                  hovered && { backgroundColor: tokens.v2.surface1 },
-                  (pressedState || (detailsEnabled && (menuOpen || actionsActive || pressed))) && { backgroundColor: tokens.v2.surface2 },
+                  leading && { marginHorizontal: -space.md, paddingHorizontal: space.md },
+                  { height, borderRadius: radiusV2.block },
+                  hovered && { backgroundColor: tokens.row.hover },
+                  (pressedState || (detailsEnabled && (menuOpen || actionsActive || pressed))) && { backgroundColor: tokens.row.hover },
                 ]}
               >
-                {detailsEnabled && hasMarker.current ? <CurrentMarker agentId={placement!.agentId} id={previewKey!} tokens={tokens} /> : null}
+                {detailsEnabled && hasMarker.current ? <CurrentMarker agentId={placement!.agentId} id={previewKey!} tokens={tokens} radius={radiusV2.block} /> : null}
+                {detailsMarker ? <CurrentMarker agentId={detailsMarker.agentId} id={detailsMarker.id} tokens={tokens} radius={radiusV2.block} /> : null}
+                {leading ? <View style={{ width: leading.width, marginRight: -DISCLOSURE_HEADER.gap }}>{leading.content}</View> : null}
                 <View style={styles.slot}>
                   {showChevron ? (
                     <Icon
-                      name={expanded ? "ChevronDown" : "ChevronRight"}
+                      // A panel-only row hints at the details panel, as "Open details" does.
+                      name={expanded ? "ChevronDown" : detailsMarker ? "PanelRight" : "ChevronRight"}
                       size={DISCLOSURE_HEADER.chevron}
                       color={palette.icon}
                     />
@@ -551,7 +583,7 @@ export function DisclosureHeader({
                 {showVerb ? (
                   <Text
                     {...((inert ? selectionSurface : {}) as object)}
-                    selectable={inert && !detailsEnabled}
+                    selectable={inert && !detailsEnabled} {...selectionColorProps()}
                     numberOfLines={1}
                     style={[
                       styles.verb,
@@ -569,10 +601,12 @@ export function DisclosureHeader({
                 ) : null}
                 {hoverActions || (hoverSlot && countedTarget) ? (
                   <View style={styles.targetBox}>
-                    {countedTarget ?? <View style={styles.fill} />}
+                    <View style={styles.targetContent}>{countedTarget}</View>
                     {hoverActions ? (
-                      <View style={[styles.overlay, { backgroundColor: inert ? tokens.v2.surface0 : tokens.v2.surface1 }]}>
-                        <RowTooltips>{actions}</RowTooltips>
+                      <View style={styles.overlay}>
+                        <ToolbarHoverColorContext.Provider value={tokens.surface2}>
+                          <RowTooltips>{actions}</RowTooltips>
+                        </ToolbarHoverColorContext.Provider>
                       </View>
                     ) : null}
                   </View>
@@ -592,7 +626,8 @@ export function DisclosureHeader({
                     onLongPress={openMenu} delayLongPress={500}
                     onPress={(event) => { event.stopPropagation(); toggle(); }}
                     hitSlop={slop > 0 ? { top: slop, bottom: slop } : undefined}
-                    style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: capabilities.hover ? 28 : 44 }} />
+                    style={{ position: "absolute", left: leading ? space.md + leading.width - DISCLOSURE_HEADER.bleed : 0,
+                      top: 0, bottom: 0, width: capabilities.hover ? 28 : 44 }} />
                 ) : null}
               </Pressable>
             </RowLongPressContext.Provider>
@@ -602,7 +637,7 @@ export function DisclosureHeader({
       {detailsEnabled && menuAnchor ? <RowMenu anchor={menuAnchor} title={title}
         subtitle={detailsSubtitle} hasBody={!inert} readsImage={readsImage} copyItems={copyItems?.() ?? []}
         expanded={expanded} detailsOpen={isCurrent}
-        tokens={tokens} onOpen={() => detailsApi.open(placement!.agentId, previewKey!)}
+        tokens={tokens} onOpen={(form) => detailsApi.open(placement!.agentId, previewKey!, { form })}
         onToggle={toggle} onViewImage={onViewImage} onClose={closeMenu} /> : null}
       {preview.open && previewContent ? (
         <HoverPreview preview={preview} tokens={tokens} wraps={previewWraps}>{previewContent()}</HoverPreview>
@@ -634,11 +669,11 @@ const styles = StyleSheet.create({
     gap: DISCLOSURE_HEADER.gap,
     paddingHorizontal: DISCLOSURE_HEADER.paddingX,
     marginHorizontal: -DISCLOSURE_HEADER.bleed,
-    borderRadius: radiusV2.block,
   },
   slot: {
     width: DISCLOSURE_HEADER.iconSlot,
     paddingRight: DISCLOSURE_HEADER.iconSlotPad,
+    marginRight: DISCLOSURE_HEADER.slotTrim,
     alignItems: "center",
     justifyContent: "center",
   },
@@ -664,14 +699,11 @@ const styles = StyleSheet.create({
     alignItems: "center",
     alignSelf: "stretch",
   },
-  fill: {
+  targetContent: {
     flex: 1,
+    minWidth: 0,
   },
   overlay: {
-    position: "absolute",
-    top: 0,
-    bottom: 0,
-    right: 0,
     flexDirection: "row",
     alignItems: "center",
     gap: ACTION_GAP,

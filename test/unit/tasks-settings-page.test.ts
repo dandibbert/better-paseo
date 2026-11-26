@@ -1,3 +1,9 @@
+vi.mock("../../client/state/home-directory", () => ({ useHomeDirectory: () => "/Users/example" }));
+import { measureHostTree } from "./helpers/yoga-host-layout";
+import { ProviderLogo } from "../../client/components/provider-logo";
+import type { AgentUpdate } from "../../shared/agent-updates";
+import { resetUpdateIndicatorsForTests } from "../../client/tasks/board/update-indicator";
+import { resetAgentUpdatesForTests } from "../../client/agent-updates";
 import { deviceTasksStore } from "../../client/tasks/device-preferences";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_TASKS_SETTINGS as STOCK_SETTINGS, applyDensity, effectiveCard } from "../../shared/tasks-settings";
@@ -9,17 +15,22 @@ const DEFAULT_TASKS_SETTINGS = { ...STOCK_SETTINGS, enabled: false, board: { ...
 // a hand edit makes the density custom, the preview follows the switches,
 // reset asks first, and an unusable record offers a reset.
 
-const state = vi.hoisted(() => ({ current: null as unknown, previews: [] as Array<Record<string, unknown>>, language: "en" as "en" | "zh", rpc: vi.fn(async (): Promise<unknown> => ({ state: "idle" })), copyText: vi.fn(async () => {}), openTerminal: vi.fn(async (): Promise<unknown> => ({ status: "opened" })) }));
+const state = vi.hoisted(() => ({ current: null as unknown, previews: [] as Array<Record<string, unknown>>, language: "en" as "en" | "zh", rpc: vi.fn(async (): Promise<unknown> => ({ state: "idle" })), copyText: vi.fn(async () => {}), agents: vi.fn(async (): Promise<unknown> => ({ state: "idle", entries: [], error: null })), openTerminal: vi.fn(async (): Promise<unknown> => ({ status: "opened" })), editors: vi.fn(async (): Promise<unknown> => ({ apps: [] })) }));
 vi.mock("react-native", async () => import("./helpers/rn-mock"));
-vi.mock("@getpaseo/plugin/client", () => ({ useSettings: (definition: { id: string }) => definition.id === "title-generation" ? { status: "loading", reload: vi.fn() } : state.current, useRpc: (definition: { name: string }) => definition.name === "settings.open-terminal" ? state.openTerminal : state.rpc }));
-vi.mock("@getpaseo/plugin/client/ui", () => ({
-  SettingsSelect: "SettingsSelect", TextInput: "TextInput",
-  SidebarRow: () => { throw new Error("SidebarRow must render inside a sidebar item"); },
-}));
-vi.mock("@getpaseo/plugin/client/react-native", async () => {
-  const React = await import("react");
-  const Modal = Object.assign((props: { children?: React.ReactNode }) => React.createElement("Modal", null, props.children), { Content: (props: { children?: React.ReactNode }) => React.createElement("ModalContent", null, props.children) });
-  return { TextInput: "TextInput", Icon: "Icon", Modal, copyText: state.copyText, useToast: () => ({ show() {}, error() {} }) };
+const surfacePaseo = vi.hoisted(() => ({}));
+vi.mock("@getpaseo/plugin/client", () => ({ usePaseo: () => surfacePaseo, useSettings: (definition: { id: string }) => definition.id === "title-generation" || definition.id === "timeline-translation" ? { status: "loading", saving: false, saveError: null, save: vi.fn(async () => true), reset: vi.fn(async () => true), reload: vi.fn() } : state.current, useRpc: (definition: { name: string }) => definition.name === "file.editors" ? state.editors : definition.name === "settings.agent-updates" ? state.agents : definition.name === "settings.open-terminal" ? state.openTerminal : state.rpc }));
+vi.mock("@getpaseo/plugin/client/ui", async () => {
+  // The plugin imports all of these from `client/ui` now; where both mocks name a key, the UI one wins.
+  const fromReactNative = await (async () => {
+    const React = await import("react");
+    const Modal = Object.assign((props: { children?: React.ReactNode }) => React.createElement("Modal", null, props.children), { Content: (props: { children?: React.ReactNode }) => React.createElement("ModalContent", null, props.children) });
+    return { TextInput: "TextInput", Icon: "Icon", Modal, copyText: state.copyText, useToast: () => ({ show() {}, error() {} }) };
+  })();
+  const fromUi = await (() => ({
+    SettingsSelect: "SettingsSelect", TextInput: "TextInput",
+    SidebarRow: () => { throw new Error("SidebarRow must render inside a sidebar item"); },
+  }))();
+  return { ...fromReactNative, ...fromUi };
 });
 vi.mock("../../client/tasks/i18n", () => ({ useTasksLanguage: () => state.language, resolveTasksLanguage: () => state.language }));
 vi.mock("../../client/tasks/chunk/load", async () => import("../../client/tasks/settings/tasks-panel"));
@@ -50,7 +61,7 @@ const { SETTINGS_STRINGS } = await import("../../client/i18n/settings-page-strin
 const { resetEnabledNotice } = await import("../../client/tasks/settings/use-tasks-form");
 const { BetterPaseoSettingsPage } = await import("../../client/settings-page");
 const { CommandBand } = await import("../../client/ui/command-band");
-const { Section, SettingRow } = await import("../../client/settings-controls");
+const { Section, SettingRow, Segmented, PlainButton } = await import("../../client/settings-controls");
 const { setSettingsTab } = await import("../../client/settings-tab");
 const { resetEnhancerPreferences, updateEnhancerPreferences } = await import("../../client/preferences");
 const { TASKS_SETTINGS_STRINGS } = await import("../../client/tasks/settings/strings");
@@ -103,6 +114,49 @@ const radio = (r: Renderer, group: string, label: string) =>
   byLabel(r, group).findAll((node) => (node.type as unknown) === "Pressable" && textOf(node) === label)[0]!;
 const lastSaved = (api: ReturnType<typeof makeSettings>) => (api.save.mock.calls.at(-1) as unknown as [typeof DEFAULT_TASKS_SETTINGS, string])[0];
 
+it.each([
+  ["Version", true, true, 1], ["版本", true, true, 1.4],
+  ["Version", false, false, 1.4], ["版本", true, false, 1],
+] as const)("centres the %s segment label independently of its update dot", (label, compact, contentWidth, textScale) => {
+  let r!: Renderer;
+  const render = (badge: boolean) => React.createElement(Segmented, {
+    value: "version", options: [{ value: "version", label, badge: badge ? "Update available" : undefined }],
+    onChange: vi.fn(), look: look(compact), label: "Tabs", contentWidth,
+  });
+  try {
+    act(() => { r = TestRenderer.create(render(false)); });
+    const segment = () => r.root.find((node) => typeof node.type === "string" && node.props.accessibilityRole === "radio");
+    const labelNode = () => segment().find((node) => typeof node.type === "string" && node.props.children === label);
+    const before = measureHostTree(segment(), { width: 160, textScale });
+    const beforeButton = before.get(segment())!; const beforeLabel = before.get(labelNode())!;
+    act(() => { r.update(render(true)); });
+    const after = measureHostTree(segment(), { width: 160, textScale });
+    const afterButton = after.get(segment())!; const afterLabel = after.get(labelNode())!;
+    const dot = after.get(byTestID(r, "update-badge")[0]!)!;
+    expect(afterButton.width).toBe(beforeButton.width);
+    expect(afterLabel.left).toBeCloseTo(beforeLabel.left, 1);
+    expect(Math.abs((afterLabel.left + afterLabel.width / 2) - (afterButton.left + afterButton.width / 2))).toBeLessThanOrEqual(0.5);
+    expect(Math.abs(dot.left - (afterLabel.left + afterLabel.width) - 4)).toBeLessThanOrEqual(1);
+    expect(Math.abs((dot.top + dot.height / 2) - (afterLabel.top + afterLabel.height / 2))).toBeLessThanOrEqual(0.5);
+    expect(dot.left + dot.width).toBeLessThanOrEqual(afterButton.left + afterButton.width);
+    expect(segment().props.accessibilityLabel).toBe(`${label}, Update available`);
+  } finally { act(() => r?.unmount()); }
+});
+
+it.each(["Check for updates", "检查更新"])("keeps the update dot close to the %s button label", (label) => {
+  let r!: Renderer;
+  try {
+    act(() => { r = TestRenderer.create(React.createElement(PlainButton, { label, onPress: vi.fn(), look: look(true), updateBadge: true })); });
+    const control = button(r, label);
+    const text = control.find((node) => typeof node.type === "string" && node.props.children === label);
+    const layout = measureHostTree(control, { width: 160 });
+    const labelFrame = layout.get(text)!; const dot = layout.get(byTestID(r, "version-item-update-dot")[0]!)!;
+    expect(Math.abs(dot.left - (labelFrame.left + labelFrame.width) - 4)).toBeLessThanOrEqual(1);
+    expect(Math.abs((dot.top + dot.height / 2) - (labelFrame.top + labelFrame.height / 2))).toBeLessThanOrEqual(0.5);
+    expect(dot.left + dot.width).toBeLessThanOrEqual(layout.get(control)!.left + layout.get(control)!.width);
+  } finally { act(() => r?.unmount()); }
+});
+
 it("does not render an empty description as a native text node", () => {
   let r!: Renderer;
   act(() => { r = TestRenderer.create(React.createElement(SettingRow, { title: "Title", description: "", look: look(true) })); });
@@ -112,7 +166,7 @@ it("does not render an empty description as a native text node", () => {
 
 it("records, cancels, clears and restores the device shortcut without saving host settings", async () => {
   vi.stubGlobal("__rnMockOS", "web");
-  vi.stubGlobal("navigator", { platform: "MacIntel" });
+  vi.stubGlobal("navigator", { platform: "MacIntel", userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/142.0 Electron/39.0 Safari/537.36" });
   const target = new EventTarget();
   vi.stubGlobal("window", target);
   const press = (code: string, modifiers = {}) => target.dispatchEvent(Object.assign(new Event("keydown", { cancelable: true }), { code, metaKey: false, ctrlKey: false, altKey: false, shiftKey: false, repeat: false, isComposing: false, ...modifiers }));
@@ -160,6 +214,8 @@ it("hides keyboard settings on native phones", () => {
 });
 
 beforeEach(() => {
+  resetUpdateIndicatorsForTests();
+  resetAgentUpdatesForTests();
   state.previews = [];
   state.language = "en";
   resetTasksEnabled();
@@ -294,6 +350,8 @@ describe("Tasks half of the settings page", () => {
     expect(shown[0]!.props.card.thinkingLabel).toBe("High");
     expect(shown[0]!.props.fields.provider).toBe(true);
     expect(shown[0]!.props.fields.thinking).toBe(true);
+    // The preview has no board to clear, so the dialog offers no clear action there.
+    expect(r.root.findAll((node) => node.props.testID === "hidden-tasks-clear-filters")).toHaveLength(0);
   });
 
   it("sets the web hover hint on the rendered button", () => {
@@ -432,6 +490,16 @@ describe("Tasks half of the settings page", () => {
     act(() => r.unmount());
   });
 
+  it("saves the plan chip independently and changes density", async () => {
+    const api = makeSettings();
+    const r = panel();
+    expect(byTestID(r, "tasks-field-preview")).toHaveLength(1);
+    await act(async () => byLabel(r, "Plan capsule").props.onPress());
+    expect(lastSaved(api).card.plan).toBe(false);
+    expect(lastSaved(api).density).toBe("custom");
+    act(() => r.unmount());
+  });
+
   it("a field chip flips its field and makes the density custom", async () => {
     const api = makeSettings();
     const r = panel();
@@ -471,8 +539,9 @@ describe("Tasks half of the settings page", () => {
     const values = { ...DEFAULT_TASKS_SETTINGS, mobile: { compactCards: true } };
     makeSettings({ values });
     panel(true);
-    expect(state.previews.at(-1)!.fields).toEqual(effectiveCard(values, true));
-    expect(state.previews.at(-1)!.compact).toBe(true);
+    const phoneCard = state.previews.findLast((card) => card.compact === true)!;
+    expect(phoneCard.fields).toEqual(effectiveCard(values, true));
+    expect(phoneCard.compact).toBe(true);
   });
 
   it("on a desktop page, draws the board as a phone does when the preview's device switch says so", () => {
@@ -539,10 +608,10 @@ describe("Tasks half of the settings page", () => {
   it("reset asks first, then keeps the board on", async () => {
     const api = makeSettings({ values: { ...applyDensity(DEFAULT_TASKS_SETTINGS, "full"), enabled: true } });
     const r = panel();
-    await act(async () => button(r, "Restore").props.onPress());
+    await act(async () => button(r, "Reset · Restore the Tasks defaults").props.onPress());
     expect(api.save).not.toHaveBeenCalled();
     expect(textOf(r.root)).toContain("This restores card, board and sidebar options to their defaults.");
-    await act(async () => button(r, "Restore now").props.onPress());
+    await act(async () => button(r, "Confirm · Restore the Tasks defaults").props.onPress());
     expect(api.reset).not.toHaveBeenCalled();
     expect(lastSaved(api)).toEqual({ ...STOCK_SETTINGS, board: { ...STOCK_SETTINGS.board, showArchived: false }, enabled: true });
     expect(deviceTasksStore().snapshot().values).toMatchObject({ showArchived: true, hideSubtasks: false, laneWidth: "default", showEmptyGroups: true });
@@ -551,9 +620,9 @@ describe("Tasks half of the settings page", () => {
   it("the armed reset can be cancelled", async () => {
     const api = makeSettings();
     const r = panel();
-    await act(async () => button(r, "Restore").props.onPress());
-    await act(async () => button(r, "Cancel").props.onPress());
-    expect(r.root.findAll((node) => node.props.accessibilityLabel === "Restore now")).toHaveLength(0);
+    await act(async () => button(r, "Reset · Restore the Tasks defaults").props.onPress());
+    await act(async () => button(r, "Cancel · Restore the Tasks defaults").props.onPress());
+    expect(r.root.findAll((node) => node.props.accessibilityLabel === "Confirm · Restore the Tasks defaults")).toHaveLength(0);
     expect(api.save).not.toHaveBeenCalled();
   });
 
@@ -562,8 +631,8 @@ describe("Tasks half of the settings page", () => {
     const r = panel();
     expect(byTestID(r, "tasks-board-preview")).toHaveLength(0);
     expect(textOf(r.root)).toContain("The saved Tasks settings are unusable: bad");
-    await act(async () => button(r, "Restore").props.onPress());
-    await act(async () => button(r, "Restore now").props.onPress());
+    await act(async () => button(r, "Reset · Restore the Tasks defaults").props.onPress());
+    await act(async () => button(r, "Confirm · Restore the Tasks defaults").props.onPress());
     expect(api.reset).toHaveBeenCalledTimes(1);
   });
 
@@ -648,6 +717,43 @@ it.each(["en", "zh"] as const)("renders version summaries with wrapping text in 
   expect(textOf(r.root)).toContain("1.1.5");
   expect(textOf(r.root)).toContain("1.1.4");
   expect(textOf(r.root)).not.toContain(language === "en" ? "一条会自动换行的更新说明" : "A long update that wraps naturally");
+  act(() => r.unmount());
+});
+
+it.each(["zh", "en"] as const)("renders %s release-note group titles without bullets", async (language) => {
+  makeSettings();
+  updateEnhancerPreferences({ language });
+  setSettingsTab("version");
+  state.rpc.mockReset();
+  state.rpc.mockResolvedValue({ state: "done", source: "git", current: "1".repeat(40), latest: "1".repeat(40), matches: true, checkedAt: 1,
+    versions: { status: "available", current: "1.6.0", latest: "1.6.0", currentBuild: 202611161008, latestBuild: 202611161008 },
+    notes: { status: "available", releases: [
+      { version: "1.6.0",
+        zh: ["时间线", "简洁：只保留对话和结果。", "任务面板", "工作区很多时，任务留在原泳道。"],
+        en: ["Timeline", "Simple: keeps only conversation and results.", "Task panel", "When there are many workspaces, tasks stay in their lanes."] },
+      { version: "1.5.7", zh: ["修复回答问题弹窗背景过暗的问题。"], en: ["Fix the question dialog background being too dark."] },
+    ] } });
+  let r!: Renderer;
+  await act(async () => { r = TestRenderer.create(React.createElement(BetterPaseoSettingsPage, { theme: theme as never, layout: { platform: "ios", compact: true } as never, host: {} as never })); });
+  const headingText = language === "zh" ? "时间线" : "Timeline";
+  const nextHeadingText = language === "zh" ? "任务面板" : "Task panel";
+  const bulletText = language === "zh" ? "简洁：只保留对话和结果。" : "Simple: keeps only conversation and results.";
+  const olderText = language === "zh" ? "修复回答问题弹窗背景过暗的问题。" : "Fix the question dialog background being too dark.";
+  const heading = r.root.find((node) => (node.type as unknown) === "Text" && node.props.children === headingText);
+  const nextHeading = r.root.find((node) => (node.type as unknown) === "Text" && node.props.children === nextHeadingText);
+  const bullet = r.root.find((node) => (node.type as unknown) === "Text" && node.props.children === bulletText);
+  const older = r.root.find((node) => (node.type as unknown) === "Text" && node.props.children === olderText);
+  const rowOf = (node: Node) => node.parent?.parent as Node | undefined;
+  expect(heading.props.accessibilityRole).toBe("header");
+  expect(nextHeading.props.accessibilityRole).toBe("header");
+  expect(StyleSheet.flatten(heading.props.style)).toMatchObject({ fontWeight: "600", marginTop: 0 });
+  expect(StyleSheet.flatten(nextHeading.props.style)).toMatchObject({ fontWeight: "600", marginTop: 8 });
+  expect(rowOf(heading)?.props.style?.flexDirection).toBeUndefined();
+  expect(rowOf(nextHeading)?.props.style?.flexDirection).toBeUndefined();
+  for (const item of [bullet, older]) {
+    expect(rowOf(item)?.props.style?.flexDirection).toBe("row");
+    expect(rowOf(item)?.findAll((node) => (node.type as unknown) === "View" && node.props.style?.width === 5 && node.props.style?.height === 5)).toHaveLength(1);
+  }
   act(() => r.unmount());
 });
 
@@ -769,11 +875,12 @@ it.each([
     SETTINGS_STRINGS.en.versionTitle,
     SETTINGS_STRINGS.en.versionUpdateCommand,
     SETTINGS_STRINGS.en.releaseNotesTitle,
+    "Agent versions",
   ]);
   expect(textOf(r.root)).toContain(SETTINGS_STRINGS.en.versionCommandHint);
   expect(textOf(r.root)).toContain(command);
   expect(textOf(r.root.findByType(CommandBand))).toBe(`$ ${command}`);
-  expect(r.root.findAll((node) => node.props.accessibilityLabel === "Go to update")).toHaveLength(0);
+  expect(r.root.findAll((node) => node.props.accessibilityLabel === "Open system Terminal")).toHaveLength(0);
   expect(textOf(r.root)).toContain("Paseo does not yet let plugins open its terminal from settings.");
   await act(async () => { button(r, "Copy update command").props.onPress(); });
   expect(state.copyText).toHaveBeenCalledWith(command);
@@ -792,6 +899,7 @@ it.each(["1.0.1", "1.0.0"])("does not offer an update when the directory version
   expect(r.root.findAllByType(Section).map((section) => section.props.title)).toEqual([
     SETTINGS_STRINGS.en.versionTitle,
     SETTINGS_STRINGS.en.releaseNotesTitle,
+    "Agent versions",
   ]);
   expect(r.root.findAll((node) => node.props.accessibilityLabel === "Copy update command")).toHaveLength(0);
   const toggle = byLabel(r, "Automatically check for updates");
@@ -826,7 +934,7 @@ it.each(["opened", "unsupported", "failed"] as const)("opens the host terminal a
   state.rpc.mockResolvedValue({ state: "done", source: "git", current: "1".repeat(40), latest: "2".repeat(40), matches: false, checkedAt: 1, versions: { status: "available", current: "1.0.1", latest: "1.1.1", currentBuild: 202610311637, latestBuild: 202610311700 }, notes: { status: "missing" } });
   let r!: Renderer;
   await act(async () => { r = TestRenderer.create(React.createElement(BetterPaseoSettingsPage, { theme: theme as never, layout: { platform: "web", compact: false } as never, host: {} as never })); });
-  await act(async () => { button(r, "Go to update").props.onPress(); });
+  await act(async () => { button(r, "Open system Terminal").props.onPress(); });
   expect(state.copyText).toHaveBeenCalledWith("paseo plugin update better-paseo");
   expect(state.openTerminal).toHaveBeenCalledWith({ source: "git", latest: "2".repeat(40) });
   expect(state.copyText.mock.invocationCallOrder[0]!).toBeLessThan(state.openTerminal.mock.invocationCallOrder[0]!);
@@ -848,7 +956,7 @@ it("does not open a terminal when copying fails", async () => {
   state.rpc.mockResolvedValue({ state: "done", source: "git", current: "1".repeat(40), latest: "2".repeat(40), matches: false, checkedAt: 1, versions: { status: "available", current: "1.0.1", latest: "1.1.1", currentBuild: 202610311637, latestBuild: 202610311700 }, notes: { status: "missing" } });
   let r!: Renderer;
   await act(async () => { r = TestRenderer.create(React.createElement(BetterPaseoSettingsPage, { theme: theme as never, layout: { platform: "web", compact: false } as never, host: {} as never })); });
-  await act(async () => { button(r, "Go to update").props.onPress(); });
+  await act(async () => { button(r, "Open system Terminal").props.onPress(); });
   expect(state.openTerminal).not.toHaveBeenCalled();
   expect(textOf(r.root)).toContain(SETTINGS_STRINGS.en.versionCopyFailed);
   act(() => r.unmount());
@@ -869,6 +977,315 @@ it("explains when a revision has no version mapping while displaying known versi
   expect(byTestID(r, "update-badge")).toHaveLength(0);
   expect(textOf(r.root)).toContain(SETTINGS_STRINGS.en.versionMarketCommandHint);
   expect(button(r, SETTINGS_STRINGS.en.versionCopyMarketCommand)).toBeTruthy();
-  expect(r.root.findAll((node) => node.props.accessibilityLabel === "Go to update")).toHaveLength(0);
+  expect(r.root.findAll((node) => node.props.accessibilityLabel === "Open system Terminal")).toHaveLength(0);
   act(() => r.unmount());
+});
+
+it("shows agent-only updates for the selected host and explains the workspace terminal capability gap", async () => {
+  makeSettings(); setSettingsTab("version");
+  state.rpc.mockResolvedValue({ state: "idle" });
+  state.agents.mockResolvedValue({ state: "done", error: null, entries: [{ provider: "codex", label: "Codex", executable: "/owned/bin/codex", current: "1.0.0", latest: "1.2.0", status: "available", updateAvailable: true, method: "npm", issue: null, command: null }] });
+  let r!: Renderer;
+  try {
+    await act(async () => { r = TestRenderer.create(React.createElement(BetterPaseoSettingsPage, { theme: theme as never, layout: { platform: "web", compact: false }, host: { id: "agent-host-a", label: "Host A" } })); });
+    expect(byTestID(r, "update-badge")).toHaveLength(1);
+    expect(textOf(r.root)).toContain("Selected host: Host A");
+    expect(textOf(r.root)).toContain("/owned/bin/codex");
+    expect(textOf(r.root)).toContain("1.2.0");
+    act(() => byTestID(r, "agent-version-toggle-codex")[0]!.props.onPress());
+    expect(button(r, "Update in Paseo terminal").props.disabled).toBe(true);
+    expect(textOf(r.root)).toContain("cannot navigate plugins to an exact workspace terminal");
+    expect(button(r, "Check agent updates")).toBeTruthy();
+    expect(byTestID(r, "version-item-update-dot")[0]!.props.style).toMatchObject({ width: 4, height: 4, alignSelf: "center" });
+    state.agents.mockResolvedValue({ state: "done", entries: [], error: null });
+    await act(async () => { r.update(React.createElement(BetterPaseoSettingsPage, { theme: theme as never, layout: { platform: "web", compact: false }, host: { id: "agent-host-b", label: "Host B" } })); });
+    expect(textOf(r.root)).toContain("Selected host: Host B");
+    expect(textOf(r.root)).not.toContain("/owned/bin/codex");
+    expect(byTestID(r, "update-badge")).toHaveLength(0);
+    await act(async () => { button(r, "Check agent updates").props.onPress(); });
+    expect(state.agents).toHaveBeenCalledWith({ action: "check" });
+  } finally { act(() => r?.unmount()); state.agents.mockResolvedValue({ state: "idle", entries: [], error: null }); }
+});
+
+it("retains confirmed plugin and agent dots through rechecks and transport errors, then clears on a conclusive result", async () => {
+  vi.useFakeTimers();
+  makeSettings(); setSettingsTab("version");
+  const installed = { state: "done", source: "git", current: "1".repeat(40), latest: "2".repeat(40), matches: false, checkedAt: 1, versions: { status: "available", current: "1.0.0", latest: "1.2.0", currentBuild: 202611010000, latestBuild: 202611020000 }, notes: { status: "missing" } };
+  state.rpc.mockResolvedValue(installed);
+  const row = { provider: "codex", label: "Codex", executable: "/owned/codex", current: "1.0.0", latest: "1.2.0", method: "npm", command: null, status: "available", updateAvailable: true, issue: "npm_runtime_unverified" };
+  state.agents.mockResolvedValue({ state: "done", entries: [row], error: null });
+  let r!: Renderer;
+  try {
+    await act(async () => { r = TestRenderer.create(React.createElement(BetterPaseoSettingsPage, { theme: theme as never, layout: { platform: "web", compact: false }, host: { id: "retain-host", label: "Retain" } })); });
+    expect(byTestID(r, "version-item-update-dot")).toHaveLength(2);
+    act(() => byTestID(r, "agent-version-toggle-codex")[0]!.props.onPress());
+    expect(textOf(r.root)).toContain(SETTINGS_STRINGS.en.agentIssues.npm_runtime_unverified);
+    state.rpc.mockResolvedValue({ state: "checking" });
+    state.agents.mockResolvedValue({ state: "checking", entries: [], error: null });
+    await act(async () => { button(r, "Check for updates").props.onPress(); button(r, "Check agent updates").props.onPress(); });
+    expect(byTestID(r, "version-item-update-dot")).toHaveLength(2);
+    expect(byTestID(r, "update-badge")).toHaveLength(1);
+    state.rpc.mockRejectedValue(new Error("PRIVATE_DIAGNOSTIC"));
+    state.agents.mockRejectedValue(new Error("PRIVATE_DIAGNOSTIC"));
+    await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+    expect(byTestID(r, "version-item-update-dot")).toHaveLength(2);
+    expect(textOf(r.root)).not.toContain("PRIVATE_DIAGNOSTIC");
+    state.rpc.mockResolvedValue({ ...installed, matches: true });
+    state.agents.mockResolvedValue({ state: "done", entries: [{ ...row, status: "current", updateAvailable: false }], error: null });
+    await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+    expect(byTestID(r, "version-item-update-dot")).toHaveLength(0);
+    expect(byTestID(r, "update-badge")).toHaveLength(0);
+  } finally { act(() => r?.unmount()); vi.useRealTimers(); state.agents.mockResolvedValue({ state: "idle", entries: [], error: null }); }
+});
+
+it.each(["en", "zh"] as const)("renders specific structured agent failure causes in %s", async (language) => {
+  makeSettings(); setSettingsTab("version"); updateEnhancerPreferences({ language });
+  state.rpc.mockResolvedValue({ state: "idle" });
+  const codes = Object.keys(SETTINGS_STRINGS[language].agentIssues) as Array<keyof typeof SETTINGS_STRINGS.en.agentIssues>;
+  state.agents.mockResolvedValue({ state: "done", error: null, entries: codes.map((issue) => ({ provider: issue, label: issue, executable: null, current: null, latest: null, method: "unknown", status: "error", updateAvailable: false, command: null, issue })) });
+  let r!: Renderer;
+  try {
+    await act(async () => { r = TestRenderer.create(React.createElement(BetterPaseoSettingsPage, { theme: theme as never, layout: { platform: "web", compact: false }, host: { id: `issues-${language}`, label: "Issues" } })); });
+    for (const code of codes) {
+      act(() => byTestID(r, `agent-version-toggle-${code}`)[0]!.props.onPress());
+      expect(textOf(r.root)).toContain(SETTINGS_STRINGS[language].agentIssues[code]);
+    }
+  } finally { act(() => r?.unmount()); state.agents.mockResolvedValue({ state: "idle", entries: [], error: null }); }
+});
+
+it.each(["en", "zh"] as const)("explains plugin and selected-host Agent automatic checks in %s", async (language) => {
+  makeSettings(); setSettingsTab("version"); updateEnhancerPreferences({ language });
+  state.rpc.mockResolvedValue({ state: "idle" });
+  state.agents.mockResolvedValue({ state: "idle", entries: [], error: null });
+  let r!: Renderer;
+  try {
+    await act(async () => { r = TestRenderer.create(React.createElement(BetterPaseoSettingsPage, { theme: theme as never, layout: { platform: "web", compact: false }, host: { id: `auto-description-${language}`, label: "Selected" } })); });
+    const copy = SETTINGS_STRINGS[language].versionAutoCheckDescription;
+    expect(textOf(r.root)).toContain(copy);
+    for (const term of language === "en" ? ["selected host", "plugin directory", "Agent CLIs", "24 hours"] : ["所选主机", "插件市场", "Agent CLI", "24 小时"]) expect(copy).toContain(term);
+  } finally { act(() => r?.unmount()); }
+});
+
+
+const layoutAgent: AgentUpdate = {
+  provider: "codex", label: "Codex", executable: "/Users/example/.nvm/versions/node/v24.18.0/bin/codex",
+  current: "1.0.0", latest: "1.2.0", method: "npm", status: "available", updateAvailable: true,
+  issue: "npm_runtime_unverified", command: null,
+};
+
+it.each(["en", "zh"] as const)("localizes the OpenCode server label in %s", async (language) => {
+  makeSettings(); setSettingsTab("version"); updateEnhancerPreferences({ language });
+  state.rpc.mockResolvedValue({ state: "idle" });
+  state.agents.mockResolvedValue({ state: "done", error: null, entries: [{ ...layoutAgent, provider: "opencode", label: "OpenCode", server: true, executable: null }] });
+  let r!: Renderer;
+  try {
+    await act(async () => { r = TestRenderer.create(React.createElement(BetterPaseoSettingsPage, { theme: theme as never, layout: { platform: "web", compact: false }, host: { id: `server-${language}`, label: "Host" } })); });
+    expect(textOf(byTestID(r, "agent-version-opencode")[0]!)).toContain(language === "zh" ? "OpenCode 服务器" : "OpenCode server");
+  } finally { act(() => r?.unmount()); state.agents.mockResolvedValue({ state: "idle", entries: [], error: null }); }
+});
+
+it.each(["en", "zh"] as const)("labels an inherited version as a reference in %s", async (language) => {
+  makeSettings(); setSettingsTab("version"); updateEnhancerPreferences({ language });
+  state.rpc.mockResolvedValue({ state: "idle" });
+  state.agents.mockResolvedValue({ state: "done", error: null, entries: [{ ...layoutAgent, provider: "copy", status: "reference", method: "unknown", releasePackage: "@openai/codex", updateAvailable: false, issue: "release_source_unknown" }] });
+  let r!: Renderer;
+  try {
+    await act(async () => { r = TestRenderer.create(React.createElement(BetterPaseoSettingsPage, { theme: theme as never, layout: { platform: "web", compact: false }, host: { id: `reference-${language}`, label: "Host" } })); });
+    const row = byTestID(r, "agent-version-copy")[0]!;
+    expect(textOf(row)).toContain(language === "zh" ? "参考版本 1.2.0" : "Reference 1.2.0");
+    expect(textOf(row)).not.toContain(language === "zh" ? "可更新至" : "Update to");
+    act(() => byTestID(r, "agent-version-toggle-copy")[0]!.props.onPress());
+    expect(textOf(row)).toContain(language === "zh" ? "参考版本来源：npm @openai/codex 的 latest 标签" : "Reference source: npm @openai/codex latest tag");
+    expect(byTestID(r, "version-item-update-dot")).toHaveLength(0);
+  } finally { act(() => r?.unmount()); state.agents.mockResolvedValue({ state: "idle", entries: [], error: null }); }
+});
+
+it.each(["en", "zh"] as const)("names the package actually used for a custom Agent check in %s", async (language) => {
+  makeSettings(); setSettingsTab("version"); updateEnhancerPreferences({ language });
+  state.rpc.mockResolvedValue({ state: "idle" });
+  state.agents.mockResolvedValue({ state: "done", error: null, entries: [{ ...layoutAgent, provider: "antigravity", label: "Antigravity", releasePackage: "agy-acp-bridge" }] });
+  let r!: Renderer;
+  try {
+    await act(async () => { r = TestRenderer.create(React.createElement(BetterPaseoSettingsPage, { theme: theme as never, layout: { platform: "web", compact: false }, host: { id: `source-${language}`, label: "Host" } })); });
+    act(() => byTestID(r, "agent-version-toggle-antigravity")[0]!.props.onPress());
+    expect(textOf(r.root)).toContain(SETTINGS_STRINGS[language].agentLatestPackage("agy-acp-bridge"));
+  } finally { act(() => r?.unmount()); state.agents.mockResolvedValue({ state: "idle", entries: [], error: null }); }
+});
+
+it.each(["en", "zh"] as const)("keeps compact Agent status summaries accurate and details accessible in %s", async (language) => {
+  makeSettings(); setSettingsTab("version"); updateEnhancerPreferences({ language });
+  state.rpc.mockResolvedValue({ state: "idle" });
+  const t = SETTINGS_STRINGS[language];
+  const entries: AgentUpdate[] = [
+    layoutAgent,
+    { ...layoutAgent, provider: "claude", label: "Claude", status: "current", updateAvailable: false, method: "native", latest: "1.0.0", issue: null },
+    { ...layoutAgent, provider: "grok", label: "Grok", status: "unknown", updateAvailable: false, method: "unknown", latest: null, issue: "release_source_unknown" },
+    { ...layoutAgent, provider: "omp", label: "Oh My Pi", status: "error", updateAvailable: true, latest: null, issue: "latest_fetch_failed" },
+  ];
+  state.agents.mockResolvedValue({ state: "done", entries, error: null });
+  let r!: Renderer;
+  try {
+    await act(async () => { r = TestRenderer.create(React.createElement(BetterPaseoSettingsPage, { theme: theme as never, layout: { platform: "ios", compact: true }, host: { id: `summary-${language}`, label: "Selected" } })); });
+    expect(r.root.findAllByType(ProviderLogo).map((node) => node.props.provider)).toEqual(entries.map((entry) => entry.provider));
+    expect(textOf(r.root)).toContain(t.agentEnabledCount(4));
+    expect(byTestID(r, "version-item-update-dot")).toHaveLength(2);
+    const statuses = language === "zh"
+      ? ["可更新至 1.2.0", "已经是最新版本", "版本信息未知", "检查失败，请重试"]
+      : ["Update to 1.2.0", "Already up to date", "Version information unknown", "Check failed. Retry"];
+    for (const [index, status] of statuses.entries()) {
+      const entry = entries[index]!;
+      const row = byTestID(r, `agent-version-${entry.provider}`)[0]!;
+      const toggle = byTestID(r, `agent-version-toggle-${entry.provider}`)[0]!;
+      expect(textOf(row)).toContain(status);
+      expect(row.findAll((node) => typeof node.type === "string" && node.props.children === status)).toHaveLength(1);
+      expect(toggle.props.accessibilityLabel.endsWith(status)).toBe(true);
+      expect(toggle.props.accessibilityRole).toBe("button");
+      expect(toggle.props.accessibilityState.expanded).toBe(false);
+      expect(byTestID(r, `agent-version-details-${entry.provider}`)).toHaveLength(0);
+      act(() => toggle.props.onPress());
+      expect(toggle.props["aria-expanded"]).toBe(true);
+      const details = byTestID(r, `agent-version-details-${entry.provider}`)[0]!;
+      expect(textOf(details)).toContain(t.agentInstallMethod);
+      if (entry.issue) expect(textOf(details)).toContain(t.agentIssues[entry.issue]);
+      if (entry.status === "available") {
+        expect(textOf(details)).toContain(t.agentOriginalInstaller);
+        expect(textOf(details)).toContain(t.versionWorkspaceTerminalUnavailable);
+        expect(details.findAll((node) => typeof node.type === "string" && node.props.accessibilityLabel === t.versionWorkspaceTerminal)[0]!.props.disabled).toBe(true);
+      }
+      act(() => toggle.props.onPress());
+      expect(byTestID(r, `agent-version-details-${entry.provider}`)).toHaveLength(0);
+    }
+    // A retained availability dot must not turn a failed check into a successful comparison.
+    expect(textOf(byTestID(r, "agent-version-omp")[0]!)).not.toContain(t.agentUpdateTo("—"));
+  } finally { act(() => r?.unmount()); state.agents.mockResolvedValue({ state: "idle", entries: [], error: null }); }
+});
+
+it("keeps plugin and Agent checks independent and resets disclosure when changing hosts", async () => {
+  makeSettings(); setSettingsTab("version");
+  state.rpc.mockReset(); state.rpc.mockResolvedValue({ state: "idle" });
+  state.agents.mockReset(); state.agents.mockResolvedValue({ state: "done", entries: [layoutAgent], error: null });
+  let r!: Renderer;
+  const page = (id: string) => React.createElement(BetterPaseoSettingsPage, { theme: theme as never, layout: { platform: "web" as const, compact: false }, host: { id, label: id } });
+  try {
+    await act(async () => { r = TestRenderer.create(page("layout-host-a")); });
+    act(() => byTestID(r, "agent-version-toggle-codex")[0]!.props.onPress());
+    expect(byTestID(r, "agent-version-details-codex")).toHaveLength(1);
+    await act(async () => { r.update(page("layout-host-b")); });
+    expect(byTestID(r, "agent-version-details-codex")).toHaveLength(0);
+    state.rpc.mockClear(); state.agents.mockClear();
+    state.agents.mockResolvedValue({ state: "checking", entries: [layoutAgent], error: null });
+    await act(async () => button(r, SETTINGS_STRINGS.en.agentCheck).props.onPress());
+    expect(state.agents).toHaveBeenCalledWith({ action: "check" });
+    expect(state.rpc).not.toHaveBeenCalled();
+    expect(button(r, SETTINGS_STRINGS.en.agentCheck).props.accessibilityState).toEqual({ disabled: true, busy: true });
+    expect(button(r, SETTINGS_STRINGS.en.versionCheck).props.disabled).toBe(false);
+    state.agents.mockClear();
+    state.rpc.mockResolvedValue({ state: "checking" });
+    await act(async () => button(r, SETTINGS_STRINGS.en.versionCheck).props.onPress());
+    expect(state.rpc).toHaveBeenCalledWith({ action: "check" });
+    expect(state.agents).not.toHaveBeenCalled();
+  } finally { act(() => r?.unmount()); state.agents.mockResolvedValue({ state: "idle", entries: [], error: null }); }
+});
+
+it("copies only an Agent's verified command from its expanded details", async () => {
+  makeSettings(); setSettingsTab("version");
+  state.rpc.mockResolvedValue({ state: "idle" });
+  state.copyText.mockClear();
+  const command = "claude update";
+  state.agents.mockResolvedValue({ state: "done", entries: [{ ...layoutAgent, provider: "claude", label: "Claude", command, issue: null, method: "native" }], error: null });
+  let r!: Renderer;
+  try {
+    await act(async () => { r = TestRenderer.create(React.createElement(BetterPaseoSettingsPage, { theme: theme as never, layout: { platform: "ios", compact: true }, host: { id: "copy-agent", label: "Copy" } })); });
+    expect(r.root.findAll((node) => typeof node.type === "string" && node.props.accessibilityLabel === SETTINGS_STRINGS.en.versionCopyCommand)).toHaveLength(0);
+    act(() => byTestID(r, "agent-version-toggle-claude")[0]!.props.onPress());
+    await act(async () => button(r, SETTINGS_STRINGS.en.versionCopyCommand).props.onPress());
+    expect(state.copyText).toHaveBeenCalledWith(command);
+    expect(button(r, SETTINGS_STRINGS.en.versionCommandCopied)).toBeTruthy();
+  } finally { act(() => r?.unmount()); state.agents.mockResolvedValue({ state: "idle", entries: [], error: null }); }
+});
+
+it.each([
+  ["en", true, 320, 1, false], ["zh", true, 320, 1.4, true],
+  ["en", true, 390, 1.4, true], ["zh", true, 390, 1, false],
+  ["en", false, 720, 1, true], ["zh", false, 1000, 1.4, false],
+] as const)("contains long Agent paths and centered dots (%s compact=%s width=%s scale=%s dark=%s)", async (language, compact, width, textScale, dark) => {
+  makeSettings(); setSettingsTab("version"); updateEnhancerPreferences({ language });
+  state.rpc.mockResolvedValue({ state: "idle" });
+  const executable = "/Users/example/" + "very-long-directory/".repeat(15) + "codex";
+  const displayPath = "~/" + "very-long-directory/".repeat(15) + "codex";
+  state.agents.mockResolvedValue({ state: "done", entries: [{ ...layoutAgent, executable }], error: null });
+  const selectedTheme = dark ? { colors: { ...theme.colors, surface0: "#141416", surface1: "#1c1c1f", surface2: "#252529", foreground: "#f4f4f5", foregroundMuted: "#a1a1aa", border: "#37373e" } } : theme;
+  let r!: Renderer;
+  try {
+    await act(async () => { r = TestRenderer.create(React.createElement(BetterPaseoSettingsPage, { theme: selectedTheme as never, layout: { platform: compact ? "ios" : "web", compact }, host: { id: `geometry-${language}-${width}`, label: "Selected" } })); });
+    const row = byTestID(r, "agent-version-codex")[0]!;
+    const summary = byTestID(r, "agent-version-toggle-codex")[0]!;
+    const options = { width, textScale, wrapText: true, wordWrap: true };
+    const frames = measureHostTree(row, options);
+    for (const [node, frame] of frames) {
+      expect(frame.left, `${String(node.type)} left`).toBeGreaterThanOrEqual(0);
+      expect(frame.left + frame.width, `${String(node.type)} right`).toBeLessThanOrEqual(width + 0.5);
+    }
+    const path = summary.find((node) => typeof node.type === "string" && node.props.children === displayPath);
+    expect(path.props.numberOfLines).toBe(1);
+    expect(frames.get(path)!.width).toBeGreaterThan(0);
+    const dot = byTestID(r, "version-item-update-dot")[0]!;
+    const dotFrame = frames.get(dot)!;
+    const nameFrame = frames.get(summary.find((node) => typeof node.type === "string" && node.props.children === "Codex"))!;
+    expect(dotFrame.width).toBe(4); expect(dotFrame.height).toBe(4);
+    expect(Math.abs(dotFrame.top + 2 - (nameFrame.top + nameFrame.height / 2))).toBeLessThanOrEqual(0.5);
+    const method = summary.find((node) => typeof node.type === "string" && node.props.children === "npm");
+    const methodFrame = frames.get(method)!;
+    expect(Math.abs(dotFrame.left - (methodFrame.left + methodFrame.width) - 4)).toBeLessThanOrEqual(1);
+    act(() => summary.props.onPress());
+    const expandedFrames = measureHostTree(row, options);
+    for (const frame of expandedFrames.values()) expect(frame.left + frame.width).toBeLessThanOrEqual(width + 0.5);
+    const details = byTestID(r, "agent-version-details-codex")[0]!;
+    const fullPath = details.find((node) => typeof node.type === "string" && node.props.children === displayPath);
+    expect(fullPath.props.selectable).toBe(true);
+    expect(fullPath.props.numberOfLines).toBeUndefined();
+  } finally { act(() => r?.unmount()); state.agents.mockResolvedValue({ state: "idle", entries: [], error: null }); }
+});
+
+
+it.each([["en", true, 320], ["zh", true, 390], ["en", false, 1000], ["zh", false, 1000]] as const)("keeps plugin version numbers visible beside their labels (%s compact=%s width=%s)", async (language, compact, width) => {
+  makeSettings(); setSettingsTab("version"); updateEnhancerPreferences({ language });
+  state.rpc.mockResolvedValue({ state: "done", source: "git", current: "1".repeat(40), latest: "1".repeat(40), matches: true, checkedAt: 1,
+    versions: { status: "available", current: "1.5.6", latest: "1.5.6", currentBuild: 202611140000, latestBuild: 202611140000 }, notes: { status: "missing" } });
+  let r!: Renderer;
+  try {
+    await act(async () => { r = TestRenderer.create(React.createElement(BetterPaseoSettingsPage, { theme: theme as never, layout: { platform: compact ? "ios" : "web", compact }, host: { id: `plugin-geometry-${language}`, label: "Selected" } })); });
+    const section = r.root.findAllByType(Section)[0]!;
+    const hostSection = section.find((node) => typeof node.type === "string");
+    const frames = measureHostTree(hostSection, { width, wrapText: true, wordWrap: true });
+    const versions = section.findAll((node) => typeof node.type === "string" && node.props.children === "1.5.6");
+    expect(versions).toHaveLength(2);
+    for (const version of versions) {
+      const frame = frames.get(version)!;
+      expect(frame.width).toBeGreaterThan(15);
+      expect(frame.left + frame.width).toBeLessThanOrEqual(width);
+    }
+    if (!compact) expect(frames.get(versions[0]!)!.top).toBe(frames.get(versions[1]!)!.top);
+  } finally { act(() => r?.unmount()); }
+});
+
+it.each([false, true])("keeps translation settings, which the Tasks board also uses, with chat off (opened from a translation: %s)", async (fromTranslation) => {
+  const { TimelineTranslationSettings } = await import("../../client/translation/settings");
+  const { registerTranslationSettingsOpener, openTranslationSettings, clearTranslationSettingsTarget } = await import("../../client/translation/navigation");
+  makeSettings();
+  updateEnhancerPreferences({ chatEnabled: false });
+  setSettingsTab("display");
+  const host = {} as never;
+  const release = registerTranslationSettingsOpener(host, () => {});
+  if (fromTranslation) openTranslationSettings(host);
+  let r!: Renderer;
+  try {
+    act(() => { r = TestRenderer.create(React.createElement(BetterPaseoSettingsPage, { theme: theme as never, layout: { platform: "web", compact: false } as never, host: {} as never })); });
+    expect(r.root.findAllByType(TimelineTranslationSettings)).toHaveLength(1);
+    act(() => r.unmount());
+  } finally {
+    clearTranslationSettingsTarget();
+    release();
+    resetEnhancerPreferences();
+  }
 });

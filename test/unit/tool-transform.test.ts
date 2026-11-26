@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ToolCallTimelineItem } from "@getpaseo/protocol/agent-types";
-import { transformToolCall } from "../../client/tools/transform";
+import { transformToolCall, transformToolCallAt } from "../../client/tools/transform";
 import { classifyTool, type ToolCallPayload } from "../../client/tools/classify";
 import { readUserQuestions } from "../../client/tools/user-questions";
 
@@ -139,6 +139,37 @@ describe("tool_call transformer", () => {
         detail: { type: "unknown", input: { terminalId: "t1", reason: "Auth" }, output: null },
       });
       expect(transformToolCall({ item: control, phase: "streaming" })).toBeUndefined();
+    }
+  });
+
+  it("preserves native GenUI, terminal control, and user shell cards at every timeline level", () => {
+    const nativeItems = [
+      item({
+        name: "render_ui",
+        status: "completed",
+        detail: { type: "unknown", input: { type: "metric", title: "Sample", data: { value: 42 } }, output: null },
+      }),
+      item({
+        name: "request_terminal_control",
+        status: "running",
+        detail: { type: "unknown", input: { terminalId: "t1", reason: "Auth" }, output: null },
+      }),
+      item({
+        name: "shell",
+        status: "running",
+        detail: { type: "shell", command: "git status", origin: "user", terminalId: "term-1" } as unknown as ToolCallTimelineItem["detail"],
+      }),
+    ];
+
+    for (const timelineLevel of ["simple", "standard", "detailed"] as const) {
+      for (const tool of nativeItems) {
+        expect(
+          transformToolCallAt(
+            { item: tool, phase: tool.status === "running" ? "streaming" : "complete" },
+            { chatEnabled: true, timelineLevel, assistantMarkdown: true },
+          ),
+        ).toBeUndefined();
+      }
     }
   });
 });

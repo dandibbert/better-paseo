@@ -14,6 +14,7 @@ import {
   clampHoverDelay,
   preferencesSchema,
   type StoredPreferences,
+  type FileOpenApp,
 } from "../shared/preferences-settings";
 import type { SettingsLanguagePreference } from "./i18n/settings-strings";
 
@@ -59,11 +60,8 @@ export const INLINE_CODE_PALETTE = {
   coral: { light: "#cf222e", dark: "#ff7b72" },
   jade: { light: "#047857", dark: "#34d399" },
   amber: { light: "#925900", dark: "#fbbf24" },
-  rose: { light: "#be123c", dark: "#fb7185" },
-  zinc: { light: "#52525b", dark: "#a1a1aa" },
   midnight: { light: "#35568e", dark: "#91b2e9" },
   claude: { light: "#a7452c", dark: "#ee9a7e" },
-  ghostty: { light: "#435fa8", dark: "#a9bff4" },
   pureBlack: { light: "#000000", dark: "#ffffff" },
 } as const;
 
@@ -81,6 +79,7 @@ export type MarkdownVariantPreference = "document" | "compact" | "terminal";
  */
 export type MonoFontPreference = "host" | "custom";
 /** Tool cards start collapsed; `expand-failed` opens failed ones by default. */
+export type TimelineLevel = "simple" | "standard" | "detailed";
 export type ToolDetailPreference = "collapsed" | "expand-failed";
 export type PathDisplayPreference = "relative" | "absolute";
 export type RowLabelStylePreference = "icon" | "label" | "both";
@@ -110,6 +109,7 @@ export interface EnhancerPreferences {
   blockFontSize: number;
   toolDetail: ToolDetailPreference;
   pathDisplay: PathDisplayPreference;
+  fileOpenApp: FileOpenApp;
   /** Show desktop hover previews for collapsed rows and file paths. */
   hoverPreview: boolean;
   /** Seconds the pointer rests before a desktop hover preview opens (0-10, tenths). */
@@ -122,7 +122,7 @@ export interface EnhancerPreferences {
    */
   detailsFontSize: number;
   /**
-   * Tap a row to open its details in a drawer or panel (docs/prototypes/block-details-sheet.md).
+   * Tap a row to open its details in a drawer or panel (https://github.com/RoundRedDot/better-paseo/blob/f2ab453297c4ccb88a08e2129af0cb3528c4e628/docs/prototypes/block-details-sheet.md).
    * On by default; off brings back the long-press preview and tap-to-expand.
    */
   blockDetails: boolean;
@@ -132,6 +132,7 @@ export interface EnhancerPreferences {
   previewStripes: boolean;
   /** Draw the chat with the plugin. Off leaves every chat row to Paseo; the Tasks board does not depend on it. */
   chatEnabled: boolean;
+  timelineLevel: TimelineLevel;
   /**
    * Paseo maps a stream item to the plugin timeline item before any transformer
    * runs, and that mapping carries only the text. Pasted images therefore never
@@ -154,6 +155,8 @@ export interface EnhancerPreferences {
    * subset rather than a superset.
    */
   assistantMarkdown: boolean;
+  /** Leave replies containing UI fences to another renderer. */
+  liveUiReplies: boolean;
   /** Which look the markdown renderer uses. */
   markdownVariant: MarkdownVariantPreference;
   /**
@@ -228,6 +231,7 @@ export const DEFAULT_PREFERENCES: Readonly<EnhancerPreferences> = {
   blockFontSize: BLOCK_FONT_SIZE_DEFAULT,
   toolDetail: "collapsed",
   pathDisplay: "relative",
+  fileOpenApp: "system",
   hoverPreview: true,
   hoverDelaySeconds: HOVER_DELAY_DEFAULT,
   previewWrap: true,
@@ -236,9 +240,11 @@ export const DEFAULT_PREFERENCES: Readonly<EnhancerPreferences> = {
   previewLineNumbers: true,
   previewStripes: true,
   chatEnabled: true,
+  timelineLevel: "standard",
   enhancedUserBubble: false,
   selectionActions: true,
   assistantMarkdown: true,
+  liveUiReplies: false,
   markdownVariant: "document",
   rowLabelStyle: "icon",
   footerMetric: "tps",

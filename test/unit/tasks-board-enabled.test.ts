@@ -1,5 +1,5 @@
 import React from "react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, onTestFinished, beforeEach, describe, expect, it, vi } from "vitest";
 import TestRenderer, { act, type ReactTestInstance } from "react-test-renderer";
 import "./helpers/quiet-renderer";
 import { createFakePaseo, makeAgent, makePlacement, makeWorkspace } from "./helpers/fake-paseo";
@@ -12,46 +12,54 @@ vi.mock("react-native", async () => {
   const AppState = { currentState: "active", addEventListener: () => ({ remove() {} }) };
   return { ...rn, AppState, default: { ...rn.default, AppState } };
 });
-vi.mock("@getpaseo/plugin/client/react-native", async () => {
-  const rn = await import("./helpers/rn-mock");
-  const React = await import("react");
-  type Props = Record<string, unknown> & { children?: React.ReactNode };
-  function FlatList(props: Props) {
-    const data = (props.data as unknown[]) ?? [];
-    const render = props.renderItem as (info: { item: unknown; index: number }) => React.ReactNode;
-    return React.createElement("FlatList", null, data.map((item, index) => React.createElement(React.Fragment, { key: index }, render({ item, index }))));
-  }
-  function Modal(props: Props) {
-    return props.open ? React.createElement("Modal", null, props.children) : null;
-  }
-  Modal.Content = (props: Props) => React.createElement("ModalContent", null, props.children);
-  return {
-    Icon: (props: Props) => React.createElement("Icon", { name: props.name }),
-    FlatList,
-    Modal,
-    ScrollView: rn.ScrollView,
-    TextInput: rn.TextInput,
-    useToast: () => ({ show() {}, error() {} }),
-  };
+vi.mock("@getpaseo/plugin/client/ui", async () => {
+  // The plugin imports all of these from `client/ui` now; where both mocks name a key, the UI one wins.
+  const fromReactNative = await (async () => {
+    const rn = await import("./helpers/rn-mock");
+    const React = await import("react");
+    type Props = Record<string, unknown> & { children?: React.ReactNode };
+    function FlatList(props: Props) {
+      const data = (props.data as unknown[]) ?? [];
+      const render = props.renderItem as (info: { item: unknown; index: number }) => React.ReactNode;
+      return React.createElement("FlatList", null, data.map((item, index) => React.createElement(React.Fragment, { key: index }, render({ item, index }))));
+    }
+    function Modal(props: Props) {
+      return props.open ? React.createElement("Modal", null, props.children) : null;
+    }
+    Modal.Content = (props: Props) => React.createElement("ModalContent", null, props.children);
+    return {
+      Icon: (props: Props) => React.createElement("Icon", { name: props.name }),
+      FlatList,
+      Modal,
+      ScrollView: rn.ScrollView,
+      TextInput: rn.TextInput,
+      useToast: () => ({ show() {}, error() {} }),
+    };
+  })();
+  const fromUi = await (async () => {
+    const React = await import("react");
+    return {
+      SidebarRow: (props: Record<string, unknown> & { trailing?: React.ReactNode }) =>
+        React.createElement("SidebarRow", { label: props.label }, props.trailing),
+    };
+  })();
+  return { ...fromReactNative, ...fromUi };
 });
 const host = vi.hoisted(() => ({
   settings: null as Record<string, unknown> | null,
   paseo: null as unknown,
   /** Renders that read the settings through the host's hook (each mounted reader is one live read). */
   settingsHooks: 0,
+  /** The device settings record (`tasks-device`). */
+  device: { values: {} as Record<string, unknown>, revision: "missing" },
 }));
 vi.mock("@getpaseo/plugin/client", () => ({
   usePaseo: () => host.paseo,
   useRpc: (contract: { name: string }) => (input: { agentIds?: string[] }) => Promise.resolve(contract.name === "tasks.availability" ? { entries: input.agentIds!.map((agentId) => ({ agentId, availability: { issue: null, blocked: {} } })) } : { stop: false }),
-  useSettings: () => (host.settingsHooks++, host.settings ? { status: "ready", values: host.settings, revision: "1", saving: false, saveError: null } : { status: "loading" }),
+  useSettings: (definition: { id: string }) => definition.id === "tasks-device"
+    ? { status: "ready", values: host.device.values, revision: host.device.revision, saving: false, saveError: null, save: async (values: Record<string, unknown>) => { host.device = { values, revision: JSON.stringify(values) }; return true; }, reload: async () => {} }
+    : (host.settingsHooks++, host.settings ? { status: "ready", values: host.settings, revision: "1", saving: false, saveError: null } : { status: "loading" }),
 }));
-vi.mock("@getpaseo/plugin/client/ui", async () => {
-  const React = await import("react");
-  return {
-    SidebarRow: (props: Record<string, unknown> & { trailing?: React.ReactNode }) =>
-      React.createElement("SidebarRow", { label: props.label }, props.trailing),
-  };
-});
 
 import { TasksBoardScreen } from "../../client/tasks/board/board-screen";
 import { TasksSidebarEntry } from "../../client/tasks/board/sidebar-entry";
@@ -169,6 +177,20 @@ describe("Tasks sidebar entry, opt-in", () => {
     await mount(sidebar());
     expect(renderer!.root.findAll((node) => (node.type as unknown) === "SidebarRow")).toHaveLength(1);
     expect(fake.openSubscriptions()).toBe(0);
+  });
+
+  it("reports the device settings from a row without counts, so the web shortcut loads at startup", async () => {
+    const holder = globalThis as Record<string, unknown>;
+    delete holder.__betterPaseoDeviceTasksStorageForTests;
+    holder.__rnMockOS = "web";
+    holder.localStorage = { getItem: () => null, setItem() {} };
+    onTestFinished(() => { delete holder.__rnMockOS; delete holder.localStorage; });
+    const { deviceTasksStore } = await import("../../client/tasks/device-preferences");
+    const { deviceBoardPreferences } = await import("../../client/tasks/device-store");
+    deviceTasksStore().load(deviceBoardPreferences(DEFAULT_TASKS_SETTINGS.board));
+    host.settings = { ...DEFAULT_TASKS_SETTINGS, enabled: true, sidebar: { count: "none" } };
+    await mount(sidebar());
+    await act(async () => { await vi.waitFor(() => expect(deviceTasksStore().snapshot()).toMatchObject({ ready: true, error: null }), 5_000); });
   });
 
   it("releases its subscriptions when the board is turned off", async () => {
@@ -344,7 +366,7 @@ describe("Tasks board across a reconnect", () => {
 describe("Tasks registrations, opt-in", () => {
   it("opens from the shortcut and removes the listener when disabled or unloaded", async () => {
     vi.stubGlobal("__rnMockOS", "web");
-    vi.stubGlobal("navigator", { platform: "MacIntel" });
+    vi.stubGlobal("navigator", { platform: "MacIntel", userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/142.0 Electron/39.0 Safari/537.36" });
     const target = new EventTarget();
     vi.stubGlobal("window", target);
     const press = () => target.dispatchEvent(Object.assign(new Event("keydown", { cancelable: true }), { code: "KeyY", metaKey: true, ctrlKey: false, altKey: false, shiftKey: true, repeat: false, isComposing: false }));

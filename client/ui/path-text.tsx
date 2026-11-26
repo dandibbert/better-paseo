@@ -1,16 +1,18 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Platform, Pressable, StyleSheet, Text, View, type LayoutChangeEvent, type TextStyle } from "react-native";
-import { Icon } from "@getpaseo/plugin/client/react-native";
+import { Icon } from "@getpaseo/plugin/client/ui";
 import { useAgent, useWorkspace } from "@getpaseo/plugin/client";
 import type { ExtendedThemeTokens } from "../components/theme-tokens";
 import { radiusV2, space } from "../components/theme-tokens";
 import { codeSurface } from "../components/host-font-escape";
 import { unselectable } from "../components/selection";
 import { ProseSpan } from "./prose-text";
+import { useHomeDirectory } from "../state/home-directory";
 import { useEnhancerPreferences } from "../preferences";
 import {
   formatPath,
   pathRootsFor,
+  shortenHome,
   type PathDisplayMode,
   type PathRoot,
 } from "../paths/format-path";
@@ -24,11 +26,13 @@ import { HoverPreview, HoverPreviewBody, HoverPreviewHeader, RowLongPressContext
 import { ToolbarCopyButton } from "./toolbar-button";
 import { RowBodyPressContext, RowPaletteContext } from "./disclosure-header";
 import { useContainerButton } from "./container-button";
+import { selectionColorProps } from "../components/text-selection";
 
 /** Where paths are made relative to, for one renderer (plan §3.9 item 3). */
 export interface PathContextValue {
   roots: readonly PathRoot[];
   cwd?: string;
+  home?: string;
   mode: PathDisplayMode;
   /** `file.reveal` with an absolute path; absent where the renderer has none. */
   reveal?(absolutePath: string): void;
@@ -57,14 +61,16 @@ export function usePathContextValue(
     (workspace) => workspace.projectDisplayName,
   );
   const mode = useEnhancerPreferences().pathDisplay;
+  const home = useHomeDirectory();
   return useMemo(
     () => ({
       roots: pathRootsFor({ directory, projectRootPath, projectDisplayName, cwd }),
       cwd,
+      home,
       mode,
       reveal,
     }),
-    [cwd, directory, projectRootPath, projectDisplayName, mode, reveal],
+    [cwd, directory, projectRootPath, projectDisplayName, mode, reveal, home],
   );
 }
 
@@ -117,6 +123,8 @@ export interface PathTextProps {
   grow?: boolean;
   /** Show the hover copy icon. Off when the surrounding row has its own. */
   copyOnHover?: boolean;
+  /** Emphasize the final path segment. */
+  boldName?: boolean;
   /** Text style overrides (size, colour). */
   style?: TextStyle;
 }
@@ -142,6 +150,7 @@ export function PathText({
   onReveal,
   budget,
   copyOnHover = true,
+  boldName = false,
   style,
   fit = false,
   grow = false,
@@ -208,6 +217,7 @@ export function PathText({
     : shownPath(formatted, limit, strict);
   const label = shownParts.label;
   const shown = shownParts.text;
+  const nameStart = shown.lastIndexOf("/") + 1;
   const textStyle = [
     styles.text,
     { color: palette?.target ?? tokens.foreground, fontFamily: tokens.fontMono },
@@ -235,7 +245,7 @@ export function PathText({
         // it is a <div> with role="button" (see `useContainerButton`).
         accessibilityRole={button.accessibilityRole}
         accessibilityLabel={formatted.absolutePath}
-        accessibilityHint={touchFirst || !reveal ? "Copies the path" : "Reveals the file"}
+        accessibilityHint={touchFirst || !reveal ? "Copies the path" : "Opens or reveals the path"}
         onPress={rowBodyPress ?? onPress}
         delayLongPress={rowBodyPress ? 500 : undefined}
         onLongPress={rowLongPress ?? (capabilities.touch ? copyAbsolute : undefined)}
@@ -250,7 +260,7 @@ export function PathText({
           style={[...textStyle, unselectable, hovered && styles.hovered]}
         >
           {label ? <Text style={{ color: palette?.meta ?? tokens.foregroundMuted }}>{`${label}/`}</Text> : null}
-          {shown}
+          {boldName ? <>{shown.slice(0, nameStart)}<Text style={{ fontWeight: "700" }}>{shown.slice(nameStart)}</Text></> : shown}
         </Text>
         {copyOnHover && capabilities.hover ? (
           // Space is always reserved, so the icon appearing never shifts layout.
@@ -283,7 +293,7 @@ export function PathText({
             selectable={false}
             style={[styles.tooltipText, { color: tokens.foreground, fontFamily: tokens.fontMono }]}
           >
-            {formatted.absolutePath}
+            {shortenHome(formatted.absolutePath, context.home)}
             {formatted.suffix}
           </Text>
         </View>
@@ -295,8 +305,8 @@ export function PathText({
           <ToolbarCopyButton text={formatted.absolutePath} icon="Link" tokens={tokens} label="Copy path" />
         </HoverPreviewHeader>
         <HoverPreviewBody>
-          <Text {...(codeSurface as object)} selectable style={[styles.tooltipText, { color: tokens.foreground, fontFamily: tokens.fontMono }]}>
-            {formatted.absolutePath}{formatted.suffix}
+          <Text {...(codeSurface as object)} selectable {...selectionColorProps()} style={[styles.tooltipText, { color: tokens.foreground, fontFamily: tokens.fontMono }]}>
+            {shortenHome(formatted.absolutePath, context.home)}{formatted.suffix}
           </Text>
         </HoverPreviewBody>
       </HoverPreview> : null}

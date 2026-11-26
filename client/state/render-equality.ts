@@ -96,7 +96,9 @@ export function assistantPropsEqual<T extends TextData>(prev: Props<T>, next: Pr
     sameFrame(prev, next) &&
     sameTime(prev.timestamp, next.timestamp) &&
     a.phase === b.phase &&
-    a.blockIndex === b.blockIndex && a.listContinuation === b.listContinuation && sameText(a.messageText, b.messageText) &&
+    a.blockIndex === b.blockIndex &&
+    a.listContinuation === b.listContinuation &&
+    sameText(a.messageText, b.messageText) &&
     sameText(a.text, b.text)
   );
 }

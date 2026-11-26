@@ -1,0 +1,239 @@
+import React from "react";
+import TestRenderer, { act } from "react-test-renderer";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { DEFAULT_TASKS_SETTINGS } from "../../shared/tasks-settings";
+import "./helpers/quiet-renderer";
+
+vi.mock("react-native", () => import("./helpers/rn-mock"));
+(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+
+const holder = globalThis as Record<string, unknown>;
+const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+beforeEach(() => {
+  vi.resetModules();
+  // The shared test helper hands every test its own storage; these choose the host's.
+  delete holder.__betterPaseoDeviceTasksStorageForTests;
+  holder.__rnMockOS = "web";
+  const data = new Map<string, string>();
+  holder.localStorage = { getItem: (key: string) => data.get(key) ?? null, setItem: (key: string, value: string) => data.set(key, value) };
+});
+afterEach(() => {
+  vi.doUnmock("@getpaseo/plugin");
+  vi.doUnmock("@getpaseo/plugin/client");
+  delete holder.__rnMockOS;
+  delete holder.localStorage;
+});
+
+/** One record behind the host's hook, shared by every caller like its query (Paseo 0.16 `use-settings.ts`). */
+function mockDeviceHook() {
+  const host = { record: { revision: "missing", values: {} as Record<string, unknown> }, saved: [] as unknown[] };
+  const listeners = new Set<() => void>();
+  vi.doMock("@getpaseo/plugin/client", async () => {
+    const { useSyncExternalStore } = await import("react");
+    return {
+      useSettings: (definition: { id: string; scope: string }) => {
+        expect(definition).toMatchObject({ id: "tasks-device", scope: "device" });
+        const current = useSyncExternalStore((listener) => { listeners.add(listener); return () => listeners.delete(listener); }, () => host.record);
+        return {
+          status: "ready", revision: current.revision, values: current.values, saving: false, saveError: null,
+          async save(values: Record<string, unknown>, revision: string) {
+            if (revision !== host.record.revision) return false;
+            host.saved.push(values);
+            host.record = { revision: JSON.stringify(values), values };
+            for (const listener of listeners) listener();
+            return true;
+          },
+          reset: async () => true,
+          reload: async () => {},
+        };
+      },
+    };
+  });
+  return host;
+}
+
+describe("device Tasks preferences by host version", () => {
+  it("keeps the board's own storage on a host without device settings (Paseo 0.14, 0.15)", async () => {
+    vi.doMock("@getpaseo/plugin", async (original) => {
+      const actual = await original<typeof import("@getpaseo/plugin")>();
+      return {
+        ...actual,
+        defineSettings: (definition: { scope: string }) => {
+          if (definition.scope !== "host") throw new Error("Only host-scoped settings are supported");
+          return definition;
+        },
+      };
+    });
+    const useSettings = vi.fn();
+    vi.doMock("@getpaseo/plugin/client", () => ({ useSettings }));
+    const { deviceTasksStore, useDeviceTasksPreferences } = await import("../../client/tasks/device-preferences");
+    const { installedDeviceSettings, TASKS_DEVICE_SETTINGS } = await import("../../client/tasks/device-settings");
+    expect(TASKS_DEVICE_SETTINGS).toBeNull();
+    function Probe() {
+      useDeviceTasksPreferences(DEFAULT_TASKS_SETTINGS);
+      return null;
+    }
+    let renderer!: TestRenderer.ReactTestRenderer;
+    await act(async () => { renderer = TestRenderer.create(React.createElement(Probe)); });
+    expect(deviceTasksStore().snapshot().ready).toBe(true);
+    await deviceTasksStore().update({ hideSubtasks: true });
+    expect(JSON.parse((holder.localStorage as Storage).getItem("paseo/better-chat/tasks/device-board/v1")!).hideSubtasks).toBe(true);
+    expect(installedDeviceSettings()).toBeNull();
+    expect(useSettings).not.toHaveBeenCalled();
+    act(() => renderer.unmount());
+  });
+
+  it("reads and saves through the settings hook on Paseo 0.16, leaving the old records to an older plugin", async () => {
+    const host = mockDeviceHook();
+    (holder.localStorage as Storage).setItem("paseo/better-chat/tasks/sidebar/v1", JSON.stringify({ open: false, width: 380 }));
+    const { deviceTasksStore, useDeviceTasksPreferences } = await import("../../client/tasks/device-preferences");
+    const { readSidebarPreference, writeSidebarPreference, resetSidebarPreference } = await import("../../client/tasks/board/sidebar-model");
+    let ready = false;
+    function Probe() {
+      ready = useDeviceTasksPreferences(DEFAULT_TASKS_SETTINGS).ready;
+      return null;
+    }
+    let renderer!: TestRenderer.ReactTestRenderer;
+    await act(async () => { renderer = TestRenderer.create(React.createElement(Probe)); });
+    await act(async () => { await vi.waitFor(() => expect(ready).toBe(true)); });
+    // The old web sidebar came along; the board reads it once the record loaded.
+    resetSidebarPreference();
+    expect(readSidebarPreference()).toMatchObject({ open: false, width: 380 });
+    await act(async () => { await deviceTasksStore().update({ titleLines: "3" }); });
+    await act(async () => { writeSidebarPreference({ open: true, width: 360 }); await tick(); await tick(); });
+    await act(async () => { await vi.waitFor(() => expect(host.record.values).toMatchObject({ sidebar: { open: true, width: 360 } })); });
+    expect(host.record.values).toMatchObject({ board: { titleLines: "3" } });
+    expect(host.saved.length).toBeGreaterThanOrEqual(2);
+    // The web copy follows, for the shortcut at startup, in a key no older plugin uses.
+    const copy = JSON.parse((holder.localStorage as Storage).getItem("paseo/better-chat/tasks/device-settings-copy/v1")!);
+    expect(copy.titleLines).toBe("3");
+    // The old records were only read: another host's older plugin may still be writing them.
+    expect((holder.localStorage as Storage).getItem("paseo/better-chat/tasks/device-board/v1")).toBeNull();
+    expect(JSON.parse((holder.localStorage as Storage).getItem("paseo/better-chat/tasks/sidebar/v1")!)).toEqual({ open: false, width: 380 });
+    act(() => renderer.unmount());
+  });
+
+  it("keeps saving through one host's bundle after another host's bundle unmounts its hook", async () => {
+    const host = mockDeviceHook();
+    // Each host loads its own copy of the plugin's modules; they share the device runtime.
+    const first = await import("../../client/tasks/device-preferences");
+    vi.resetModules();
+    const second = await import("../../client/tasks/device-preferences");
+    expect(second).not.toBe(first);
+    function ProbeA() { first.useDeviceTasksPreferences(DEFAULT_TASKS_SETTINGS); return null; }
+    function ProbeB() { second.useDeviceTasksPreferences(DEFAULT_TASKS_SETTINGS); return null; }
+    let a!: TestRenderer.ReactTestRenderer;
+    let b!: TestRenderer.ReactTestRenderer;
+    await act(async () => { a = TestRenderer.create(React.createElement(ProbeA)); b = TestRenderer.create(React.createElement(ProbeB)); });
+    await act(async () => { await vi.waitFor(() => expect(second.deviceTasksStore().snapshot().ready).toBe(true)); });
+    act(() => a.unmount());
+    await act(async () => { await second.deviceTasksStore().update({ showArchived: false }); });
+    expect(host.record.values).toMatchObject({ board: { showArchived: false } });
+    act(() => b.unmount());
+  });
+
+  it("keeps its own device runtime beside one another plugin version left, and works through its own hook", async () => {
+    const host = mockDeviceHook();
+    const other = { store: { snapshot: vi.fn(), subscribe: vi.fn(), load: vi.fn(), update: vi.fn(), restore: vi.fn(), current: vi.fn(), receive: vi.fn() }, deviceSettings: true };
+    const otherAdapter = { report: vi.fn(), leave: vi.fn(), storage: {}, sidebar: { stored: vi.fn(), persist: vi.fn() } };
+    // What an older plugin version left: its own keys, its own code.
+    holder.__betterPaseoDeviceTasks_r1 = other;
+    holder.__betterPaseoDeviceSettings_r1 = otherAdapter;
+    const { deviceTasksStore, useDeviceTasksPreferences } = await import("../../client/tasks/device-preferences");
+    expect(deviceTasksStore()).not.toBe(other.store);
+    function Probe() { useDeviceTasksPreferences(DEFAULT_TASKS_SETTINGS); return null; }
+    let renderer!: TestRenderer.ReactTestRenderer;
+    await act(async () => { renderer = TestRenderer.create(React.createElement(Probe)); });
+    await act(async () => { await vi.waitFor(() => expect(deviceTasksStore().snapshot().ready).toBe(true)); });
+    await act(async () => { await deviceTasksStore().update({ showEmptyGroups: false }); });
+    expect(host.record.values).toMatchObject({ board: { showEmptyGroups: false } });
+    // Neither of the other version's objects ran.
+    expect(otherAdapter.report).not.toHaveBeenCalled();
+    expect(other.store.load).not.toHaveBeenCalled();
+    act(() => renderer.unmount());
+    delete holder.__betterPaseoDeviceTasks_r1;
+    delete holder.__betterPaseoDeviceSettings_r1;
+  });
+
+  it("shows one host's sidebar change to another host's board", async () => {
+    const host = mockDeviceHook();
+    host.record = { revision: JSON.stringify({ sidebar: { open: true, width: 300 } }), values: { sidebar: { open: true, width: 300 } } };
+    const preferences = await import("../../client/tasks/device-preferences");
+    const a = await import("../../client/tasks/board/sidebar-model");
+    vi.resetModules();
+    const b = await import("../../client/tasks/board/sidebar-model");
+    expect(b).not.toBe(a);
+    function Probe() { preferences.useDeviceTasksPreferences(DEFAULT_TASKS_SETTINGS); return null; }
+    let renderer!: TestRenderer.ReactTestRenderer;
+    await act(async () => { renderer = TestRenderer.create(React.createElement(Probe)); });
+    await act(async () => { await vi.waitFor(() => expect(preferences.deviceTasksStore().snapshot().ready).toBe(true)); });
+    expect(b.readSidebarPreference()).toMatchObject({ open: true, width: 300 });
+    act(() => a.writeSidebarPreference({ open: false, width: 400 }));
+    expect(b.readSidebarPreference()).toMatchObject({ open: false, width: 400 });
+    await act(async () => { await vi.waitFor(() => expect(host.record.values).toMatchObject({ sidebar: { open: false, width: 400 } })); });
+    expect(b.readSidebarPreference()).toMatchObject({ open: false, width: 400 });
+    act(() => renderer.unmount());
+  });
+
+  it("loads the store for the web shortcut through the sidebar row's hook alone", async () => {
+    const host = mockDeviceHook();
+    host.record = { revision: JSON.stringify({ board: { openShortcut: "Mod+Shift+KeyK" } }), values: { board: { ...(await import("../../client/tasks/device-store")).deviceBoardPreferences(DEFAULT_TASKS_SETTINGS.board), openShortcut: "Mod+Shift+KeyK" } } };
+    const { deviceTasksStore, useDeviceSettingsReport } = await import("../../client/tasks/device-preferences");
+    const { deviceBoardPreferences } = await import("../../client/tasks/device-store");
+    // Startup asks for the record (`contribute.tsx`); no board or settings page is open.
+    deviceTasksStore().load(deviceBoardPreferences(DEFAULT_TASKS_SETTINGS.board));
+    function Row() { useDeviceSettingsReport(); return null; }
+    let renderer!: TestRenderer.ReactTestRenderer;
+    await act(async () => { renderer = TestRenderer.create(React.createElement(Row)); });
+    await act(async () => { await vi.waitFor(() => expect(deviceTasksStore().snapshot().ready).toBe(true)); });
+    expect(deviceTasksStore().current()?.openShortcut).toBe("Mod+Shift+KeyK");
+    act(() => renderer.unmount());
+  });
+
+  it("keeps a mounted bundle's board working when a bundle of a newer version loads beside it", async () => {
+    const host = mockDeviceHook();
+    host.record = { revision: JSON.stringify({ board: { titleLines: "2" } }), values: {} };
+    const older = await import("../../client/tasks/device-preferences");
+    function OlderProbe() { older.useDeviceTasksPreferences(DEFAULT_TASKS_SETTINGS); return null; }
+    let a!: TestRenderer.ReactTestRenderer;
+    await act(async () => { a = TestRenderer.create(React.createElement(OlderProbe)); });
+    await act(async () => { await vi.waitFor(() => expect(older.deviceTasksStore().snapshot().ready).toBe(true)); });
+    // Another host's bundle carries newer store and adapter code.
+    vi.resetModules();
+    vi.doMock("../../client/tasks/device-runtime-version", () => ({ DEVICE_RUNTIME_VERSION: 999 }));
+    const newer = await import("../../client/tasks/device-preferences");
+    function NewerProbe() { newer.useDeviceTasksPreferences(DEFAULT_TASKS_SETTINGS); return null; }
+    let b!: TestRenderer.ReactTestRenderer;
+    await act(async () => { b = TestRenderer.create(React.createElement(NewerProbe)); });
+    await act(async () => { await vi.waitFor(() => expect(newer.deviceTasksStore().snapshot().ready).toBe(true)); });
+    expect(newer.deviceTasksStore()).not.toBe(older.deviceTasksStore());
+    // The older bundle re-renders with the same revision, and its board still reads and saves.
+    await act(async () => { a.update(React.createElement(OlderProbe)); });
+    expect(older.deviceTasksStore().snapshot().ready).toBe(true);
+    await act(async () => { await older.deviceTasksStore().update({ hideSubtasks: true }); });
+    await act(async () => { await newer.deviceTasksStore().update({ laneWidth: "wide" }); });
+    expect(host.record.values).toMatchObject({ board: { hideSubtasks: true, laneWidth: "wide" } });
+    await act(async () => { await vi.waitFor(() => expect(older.deviceTasksStore().snapshot().values).toMatchObject({ hideSubtasks: true, laneWidth: "wide" })); });
+    act(() => { a.unmount(); b.unmount(); });
+    vi.doUnmock("../../client/tasks/device-runtime-version");
+  });
+
+  it("saves only what a board changed in the sidebar, so another board's change survives", async () => {
+    const host = mockDeviceHook();
+    host.record = { revision: JSON.stringify({ sidebar: { open: true, width: 300 } }), values: { sidebar: { open: true, width: 300 } } };
+    const preferences = await import("../../client/tasks/device-preferences");
+    const sidebar = await import("../../client/tasks/board/sidebar-model");
+    function Probe() { preferences.useDeviceTasksPreferences(DEFAULT_TASKS_SETTINGS); return null; }
+    let renderer!: TestRenderer.ReactTestRenderer;
+    await act(async () => { renderer = TestRenderer.create(React.createElement(Probe)); });
+    await act(async () => { await vi.waitFor(() => expect(preferences.deviceTasksStore().snapshot().ready).toBe(true)); });
+    // Two mounted boards both showed { open: true, width: 300 }.
+    const shown = { open: true, width: 300 };
+    act(() => sidebar.writeSidebarPreference({ ...shown, width: 400 }, shown));
+    act(() => sidebar.writeSidebarPreference({ ...shown, open: false }, shown));
+    await act(async () => { await vi.waitFor(() => expect(host.record.values).toMatchObject({ sidebar: { open: false, width: 400 } })); });
+    expect(sidebar.readSidebarPreference()).toMatchObject({ open: false, width: 400 });
+    act(() => renderer.unmount());
+  });
+});

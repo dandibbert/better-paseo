@@ -9,6 +9,7 @@
  *
  * Pure: no React, no host hooks.
  */
+import { decodeHtmlEntities, parseListedLinks } from "./web-link";
 import type {
   GitHubToolData,
   HubData,
@@ -378,7 +379,7 @@ const PASEO_TOOLS = new Set([
 ]);
 
 /** Names of search tools that arrive without a protocol `search` detail. */
-const SEARCH_NAMES = new Set(["grep", "glob", "search", "web_search"]);
+const SEARCH_NAMES = new Set(["grep", "glob", "search", "web_search", "websearch"]);
 
 /** Output that is not text is shown as JSON, capped so a huge record stays cheap. */
 const MAX_JSON = 20000;
@@ -421,9 +422,21 @@ function readSearch(
     ? detail.webResults.flatMap((entry) => {
         const row = asRecord(entry);
         const url = asString(row?.url);
-        return url ? [{ title: asString(row?.title) ?? url, url }] : [];
+        return url ? [{ title: decodeHtmlEntities(asString(row?.title) ?? url), url }] : [];
       })
     : [];
+  // OpenCode names its web search `websearch`; the daemon passes it on as an unknown tool.
+  const toolName = asString(detail.toolName) ?? (rawName === "websearch" ? "web_search" : rawName || undefined);
+  let content = asString(detail.content) ?? outputText;
+  // A web search that printed its hits as text (Oh My Pi's numbered list,
+  // Claude Code's Links line, Markdown links) reads as those hits, so it draws
+  // as a structured search does.
+  if (webResults.length === 0 && toolName === "web_search") {
+    webResults.push(...parseListedLinks(content).map((link) => ({ ...link, title: decodeHtmlEntities(link.title) })));
+  }
+  // The text a web search printed only repeats its hits with page dumps
+  // between them; once there are hits, they are what the row shows.
+  if (webResults.length > 0 && toolName === "web_search") content = undefined;
   return {
     query:
       asString(detail.query) ??
@@ -431,11 +444,11 @@ function readSearch(
       asString(input.query) ??
       asString(input.glob) ??
       "",
-    toolName: asString(detail.toolName) ?? (rawName || undefined),
+    toolName,
     files: asStringArray(detail.filePaths),
     numFiles: asNumber(detail.numFiles),
     numMatches: asNumber(detail.numMatches),
-    content: asString(detail.content) ?? outputText,
+    content,
     webResults: webResults.length > 0 ? webResults : undefined,
     annotations: asStringArray(detail.annotations),
     truncated: detail.truncated === true ? true : undefined,

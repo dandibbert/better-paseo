@@ -31,6 +31,7 @@ export const ScrollView = host("ScrollView");
 export const TextInput = host("TextInput");
 export const SafeAreaView = host("SafeAreaView");
 export const ActivityIndicator = host("ActivityIndicator");
+export const RefreshControl = host("RefreshControl");
 
 /** Its children while visible, as a host element in place. */
 export function Modal(props: Props) {
@@ -82,6 +83,9 @@ function os(): string {
 export const Platform = {
   get OS() {
     return os();
+  },
+  get isPad() {
+    return (globalThis as { __rnMockIsPad?: boolean }).__rnMockIsPad ?? false;
   },
   select<T>(choices: Record<string, T>): T | undefined {
     const key = os();

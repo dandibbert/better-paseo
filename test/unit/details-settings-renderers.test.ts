@@ -6,6 +6,7 @@ import "./helpers/quiet-renderer";
 (globalThis as { __rnMockOS?: string }).__rnMockOS = "web";
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
+vi.mock("@getpaseo/plugin/client/ui", () => ({ Icon: () => null, useToast: () => ({ error: () => {} }) }));
 vi.mock("react-native", () => import("./helpers/rn-mock"));
 vi.mock("@getpaseo/plugin/client", () => ({
   useAgent: () => undefined,
@@ -22,10 +23,12 @@ vi.mock("../../client/preferences", () => ({
     toolDetail: "collapsed", markdownVariant: "document", pathDisplay: "relative", previewWrap: true,
   }),
 }));
-vi.mock("../../client/components/theme-tokens", () => ({
+vi.mock("../../client/components/theme-tokens", async (original) => ({
+  ...await original<object>(),
   useThemeTokens: () => ({
     fontUi: "system", fontMono: "monospace", foreground: "#111", foregroundMuted: "#666",
-    typography: { block: { rowHeight: { compact: 22, desktop: 26 }, caption: { size: 11 } } },
+    v2: { surface0: "#fff", surface1: "#f6f6f7", surface2: "#eee", border: "#ccc", elevation: { overlay: {} } },
+    typography: { content: { size: 15, lineHeight: 22 }, mono: { size: 12, lineHeight: 18 }, block: { rowHeight: { compact: 22, desktop: 26 }, caption: { size: 11 } } },
   }),
 }));
 vi.mock("../../client/components/tool-callouts", () => ({ ToolCallout: () => null }));
@@ -51,7 +54,8 @@ vi.mock("../../client/components/hub-live", () => ({ TimelineTailHub: () => null
 vi.mock("../../client/components/turn-footer", () => ({ AssistantFooter: () => null }));
 vi.mock("../../client/components/system-card", () => ({ SystemCard: () => null }));
 vi.mock("../../client/components/markdown/markdown-view", () => ({ MarkdownView: () => null }));
-vi.mock("../../client/timeline-tail", () => ({ useTextItemTailKey: () => "reply-key" }));
+vi.mock("../../client/timeline-tail", () => ({ useTextItemTailKey: () => ({ key: "reply-key", previous: null }),
+  useNoteTimelineItem: () => {}, useIsTimelineTail: () => false, useTimelineTailAt: () => null }));
 vi.mock("../../client/timeline-order", () => ({
   useHasEntryAfter: () => false, useNextEntryIsRow: () => false, useTimelineEntry() {},
   useTimelineToolGroup: () => ({ group: null, anythingBelow: false, rowBelow: false, copiesBelow: 0, copiesBelowHeight: 0 }),
@@ -67,7 +71,8 @@ vi.mock("../../client/tools/disclosure", () => ({ defaultToolExpanded: () => fal
 vi.mock("../../client/debug/perf", () => ({ probeCard: () => ({ node: null, viewProps: {} }), textItemKey: () => "text-key" }));
 vi.mock("../../client/ui/use-revealed-text", () => ({ useRevealedText: (text: string) => text }));
 vi.mock("../../client/state/latest-prompt", () => ({ useIsLatestPrompt: () => false }));
-vi.mock("../../client/state/turn-footers", () => ({ useTurnFooter: () => null }));
+vi.mock("../../client/state/turn-footers", () => ({ useTurnFooter: () => null, useTurnWork: () => ({ store: null, work: null }) }));
+vi.mock("../../client/components/turn-work-card", () => ({ TurnWorkCard: () => null }));
 vi.mock("../../client/state/agent-message-senders", () => ({ useAgentMessageSender: () => null }));
 vi.mock("../../client/state/footer-model", () => ({ useFooterModel: () => ({ modelName: null, thinkingLabel: null }) }));
 vi.mock("../../client/system-envelope", () => ({ parseSystemEnvelope: () => null }));

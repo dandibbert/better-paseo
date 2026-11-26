@@ -1,3 +1,4 @@
+import { SHEET_BODY_INSET } from "./tokens/sheet";
 import React, { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
 import {
   Animated, Modal, Platform, Pressable, ScrollView, StyleSheet, Text, View,
@@ -6,10 +7,12 @@ import {
 import type { ExtendedThemeTokens } from "../components/theme-tokens";
 import { radiusV2, space, withAlpha } from "../components/theme-tokens";
 import { selectionSurface } from "../components/selection-actions";
+import { surfaceProps } from "../components/view-props";
+import { bindSelectionScopeElement, selectionScopeDataSet, SelectionTranslationContext } from "../translation/selection";
 import { bindPreviewMaximize, bindPreviewPointer, watchNextPointerMove, watchPointerOutside, dropSelectionIn, openPreviewLayer } from "../web";
 import { useInputCapabilities } from "./use-input-capabilities";
 import { cssShadow } from "./tokens/css-shadow";
-import { floatShadow } from "./tokens/float";
+import { floatShadow, PREVIEW_HEADER, previewHeaderLook } from "./tokens/float";
 import { DEFAULT_PREFERENCES, useEnhancerPreferences } from "../preferences";
 import { SafeInset } from "./safe-inset";
 import { phoneChrome, PREVIEW_LIMIT, pressPreviewFrame, pressPreviewOrigin } from "./press-preview-placement";
@@ -33,6 +36,8 @@ import { DetailsToolbar, type DetailsWrap } from "../details/chrome/details-tool
 import { BackToLatestPill } from "../details/chrome/back-to-latest";
 import { ZoomBadge } from "../details/chrome/zoom-badge";
 import { usePinchZoom } from "../details/shell/pinch-zoom";
+import { usePublishZoomControls } from "../details/shell/zoom-controls";
+import { createNativeStickySource, createWebStickySource, DetailsStickySourceContext } from "../details/sticky-step";
 import { TextZoomContext } from "./text-zoom";
 
 /** Prevent a path inside a preview-enabled header from opening a second layer. */
@@ -708,7 +713,7 @@ function HoverPanelHeader({ tokens, icon, iconLabel, left, center: centerProp, m
   return (
     <View
       testID="hover-preview-header"
-      style={[styles.header, { backgroundColor: tokens.v2.surface1, borderBottomColor: tokens.v2.borderSubtle }]}
+      style={[styles.header, previewHeaderLook(tokens)]}
     >
       <View ref={toolbarRef} testID="hover-preview-toolbar" {...(toolbarDrag ?? {})} style={[styles.toolbar, Platform.OS === "web" && styles.grab]}>
         <View testID="hover-preview-start" style={[styles.toolbarStart, fitControls && styles.toolbarControls]}>
@@ -814,11 +819,23 @@ function detailsWrap(actions: PreviewActions | null, kind: DetailsShellValue["en
  * and a stream it follows lets go past 48 from the end and follows again
  * within 8; while let go, "Back to latest" counts the lines that came since.
  * The hover panel keeps its one slack unless `follow` sets a band.
+ *
+ * `stickySteps` marks a body whose opened work steps pin their rows
+ * (`sticky-step.tsx`). The web pins them with `position: sticky`, which holds
+ * to the nearest scroller, so with lines unwrapped the body itself scrolls
+ * sideways there instead of a sideways scroller inside it.
+ *
+ * `onScrolledChange` hears, in the details chrome, whether the body has
+ * scrolled down from its top, so a bar above it can cast an edge over the
+ * content it now covers.
  */
-export function HoverPreviewBody({ children, streaming = false, follow }: {
+export function HoverPreviewBody({ children, streaming = false, follow, fullBleed = false, stickySteps = false, onScrolledChange }: {
   children: ReactNode;
   streaming?: boolean;
   follow?: PreviewFollowBand;
+  fullBleed?: boolean;
+  stickySteps?: boolean;
+  onScrolledChange?(scrolled: boolean): void;
 }) {
   const actions = useContext(PreviewActionsContext);
   const details = useContext(PreviewChromeContext) === "details";
@@ -841,14 +858,30 @@ export function HoverPreviewBody({ children, streaming = false, follow }: {
   const shell = useContext(DetailsShellContext);
   const pulls = Boolean(report) && Platform.OS !== "web" && shell !== null && shell.form !== "side";
   // The phone drawer's pinch sets its text size.
-  const zoom = report ? shell?.zoom : undefined;
+  const zoom = report && Platform.OS !== "web" ? shell?.zoom : undefined;
   const pinch = usePinchZoom(zoom, report ? scroller.value : null);
   const [bodyTop, setBodyTop] = useState(true);
   const bodyTopRef = useRef(true);
+  // Told only when it flips: the latest listener, read at the scroll.
+  const scrolledListener = useRef(onScrolledChange);
+  scrolledListener.current = onScrolledChange;
+  const scrolledRef = useRef(false);
+  const noteOffset = useCallback((offset: number) => {
+    const scrolled = offset > 0;
+    if (scrolled === scrolledRef.current) return;
+    scrolledRef.current = scrolled;
+    scrolledListener.current?.(scrolled);
+  }, []);
   // iOS text sets its size only as it draws, so a new zoom mounts the content
   // again: text kept the old size's frame, and a command band cut its last line.
   const textZoom = useContext(TextZoomContext);
-  const redrawKey = Platform.OS === "ios" ? textZoom : undefined;
+  const redrawKey = Platform.OS === "ios" && typeof textZoom === "number" ? textZoom : undefined;
+  // An opened work step pins its row to the body's top (`sticky-step.tsx`).
+  const [nativeSticky] = useState(() => createNativeStickySource({
+    content: () => (scroller.ref.current as unknown as { getInnerViewRef?(): unknown } | null)?.getInnerViewRef?.() ?? null,
+    offset: () => scroller.value.offset(),
+    scrollTo: (top) => scroller.ref.current?.scrollTo({ y: top, animated: false }),
+  }));
   const detailsScroll = useMemo(() => (report ? {
     ...scroller.props,
     onScroll(event: NativeSyntheticEvent<NativeScrollEvent>) {
@@ -861,16 +894,45 @@ export function HoverPreviewBody({ children, streaming = false, follow }: {
       }
     },
     onLayout(event: LayoutChangeEvent) {
+      const height = event.nativeEvent.layout.height;
       scroller.props.onLayout(event);
-      report.laidOut(event.nativeEvent.layout.height);
+      report.laidOut(height);
+      nativeSticky.laidOut(height);
     },
     onContentSizeChange(width: number, height: number) {
       scroller.props.onContentSizeChange(width, height);
       report.contentSized(height);
       pinch.contentSized(height);
+      nativeSticky.changed();
     },
-  } : scroller.props), [report, scroller.props, pinch.contentSized]);
+  } : scroller.props), [report, scroller.props, pinch.contentSized, nativeSticky]);
+  // The offset reaches a pinned row on the native driver; the reports still run in JS.
+  const detailsOnScroll = useMemo(() => Animated.event(
+    [{ nativeEvent: { contentOffset: { y: nativeSticky.scrollY } } }],
+    { useNativeDriver: true, listener: (event: NativeSyntheticEvent<NativeScrollEvent>) => {
+      const offset = event.nativeEvent.contentOffset.y;
+      detailsScroll.onScroll(event);
+      noteOffset(offset);
+    } },
+  ), [nativeSticky, detailsScroll.onScroll, noteOffset]);
+  // The toolbar's text size buttons (`zoom-controls.ts`).
+  usePublishZoomControls(zoom ? shell?.zoomControls : undefined, pinch);
   const webBody = useRef<View>(null);
+  const selectionScope = useContext(SelectionTranslationContext);
+  const scopeData = Platform.OS === "web" ? selectionScopeDataSet(selectionScope) : null;
+  const bindWebBody = useCallback((node: View | null) => {
+    webBody.current = node;
+    if (!node || !selectionScope) return;
+    bindSelectionScopeElement(node, selectionScope);
+    return () => {
+      if (webBody.current === node) webBody.current = null;
+      bindSelectionScopeElement(node, null);
+    };
+  }, [selectionScope]);
+  const [webSticky] = useState(() => createWebStickySource(() => webBody.current as unknown as HTMLElement | null));
+  useEffect(() => (details && Platform.OS === "web" ? webSticky.bind() : undefined), [details, webSticky]);
+  useEffect(() => (details && Platform.OS === "web" ? webSticky.subscribe(() => noteOffset(webSticky.offset())) : undefined),
+    [details, webSticky, noteOffset]);
   const tail = useStreamingTail(streaming, webBody, band, behind.onChange);
   useWebScrollMemory(webBody, memoryKey, remembered, streaming, tail.pinned);
   // Lines keep their length; the body scrolls sideways, with a track under it
@@ -878,7 +940,10 @@ export function HoverPreviewBody({ children, streaming = false, follow }: {
   // line's descenders, sits down near the panel's bottom edge, and is up only
   // while the reader scrolls: a long body must be read to its end before the
   // track would otherwise come into view.
-  const content = wrap && !wrap.on ? (
+  // One column in either wrap, so turning it does not mount the steps again.
+  const content = details && stickySteps && wrap && Platform.OS === "web" ? (
+    <View style={wrap.on ? styles.stepsColumn : styles.stepsUnwrapped}>{children}</View>
+  ) : wrap && !wrap.on ? (
     <HScroll tokens={wrap.tokens} trackStyle={previewTrack()} contentContainerStyle={styles.unwrappedScroll}
       trackOnScroll scrollEnabled={!scroller.held}>
       <View style={[styles.unwrapped, Platform.OS !== "web" && styles.unwrappedNative]}>{children}</View>
@@ -892,26 +957,29 @@ export function HoverPreviewBody({ children, streaming = false, follow }: {
     }} />
   ) : null;
   if (details) {
+    const horizontalInset = fullBleed ? styles.fullBleed : shell?.form === "drawer" ? styles.drawerInset : undefined;
     // The drawer's and the floating panel's pull, on the body alone.
     const pan = shell && shell.form !== "side" ? report?.panHandlers() : undefined;
     return (
       <View testID="details-body" ref={pinch.body} collapsable={false} {...pan} {...pinch.handlers} style={styles.detailsBody}>
         {Platform.OS !== "web" ? (
-          <ScrollView ref={scroller.ref} testID="hover-preview-body" style={[styles.pressBody, styles.pressBodyFill]} contentContainerStyle={styles.pressBodyContent}
-            scrollEnabled={!scroller.held && !(pulls && bodyTop)} scrollEventThrottle={16} {...detailsScroll}
+          <Animated.ScrollView ref={scroller.ref} testID="hover-preview-body" style={[styles.pressBody, styles.pressBodyFill]} contentContainerStyle={[styles.pressBodyContent, horizontalInset]}
+            scrollEnabled={!scroller.held && !(pulls && bodyTop)} scrollEventThrottle={16} {...detailsScroll} onScroll={detailsOnScroll}
             bounces={!(pulls && bodyTop)} disableScrollViewPanResponder={pulls && bodyTop}>
             <PreviewScrollerContext.Provider value={scroller.value}>
               <PreviewViewportContext.Provider value={scroller.viewport}>
                 {/* At rest after the slide-in, only the text that came or changed while sliding mounts again. */}
                 <ProseRedrawContext.Provider value={report ?? null}>
-                  <ProseSelectionContext.Provider key={redrawKey} value>{content}</ProseSelectionContext.Provider>
+                  <DetailsStickySourceContext.Provider value={nativeSticky}>
+                    <ProseSelectionContext.Provider key={redrawKey} value>{content}</ProseSelectionContext.Provider>
+                  </DetailsStickySourceContext.Provider>
                 </ProseRedrawContext.Provider>
               </PreviewViewportContext.Provider>
             </PreviewScrollerContext.Provider>
-          </ScrollView>
+          </Animated.ScrollView>
         ) : (
-          <View ref={webBody} testID="hover-preview-body" style={[styles.body, styles.bodyFill, styles.detailsScroll]}>
-            {content}
+          <View ref={scopeData ? bindWebBody : webBody} {...(scopeData ? surfaceProps(selectionSurface, { dataSet: scopeData } as never) : {})} testID="hover-preview-body" style={[styles.body, styles.bodyFill, styles.detailsScroll, shell?.form === "side" && styles.sideScroll, horizontalInset]}>
+            <DetailsStickySourceContext.Provider value={webSticky}>{content}</DetailsStickySourceContext.Provider>
           </View>
         )}
         {pill}
@@ -938,7 +1006,7 @@ export function HoverPreviewBody({ children, streaming = false, follow }: {
     );
   }
   return (
-    <View ref={webBody} testID="hover-preview-body" style={[styles.body, fill && styles.bodyFill]}>
+    <View ref={scopeData ? bindWebBody : webBody} {...(scopeData ? surfaceProps(selectionSurface, { dataSet: scopeData } as never) : {})} testID="hover-preview-body" style={[styles.body, fill && styles.bodyFill]}>
       {content}
     </View>
   );
@@ -1206,7 +1274,7 @@ const styles = StyleSheet.create({
   panel: { padding: 0, borderWidth: 1, borderRadius: radiusV2.overlay },
   // In the page, not on the layer: clipped to its corners, with no shadow to float on.
   sample: { overflow: "hidden", boxShadow: "none" } as ViewStyle,
-  toolbar: { flexDirection: "row", alignItems: "center", gap: space.xs },
+  toolbar: { flexDirection: "row", alignItems: "center", gap: PREVIEW_HEADER.gap },
   // The title and the empty stretches drag; buttons set their own pointer cursor.
   grab: { cursor: "grab", touchAction: "none" } as unknown as ViewStyle,
   // Equal flexible sides keep the centre slot in the middle of the panel.
@@ -1222,9 +1290,9 @@ const styles = StyleSheet.create({
     flexShrink: 1,
     overflowY: "auto",
     overscrollBehavior: "contain",
-    marginTop: space.md,
-    paddingHorizontal: space.md,
-    paddingBottom: space.md,
+    marginTop: PREVIEW_HEADER.bodyInset,
+    paddingHorizontal: PREVIEW_HEADER.bodyInset,
+    paddingBottom: PREVIEW_HEADER.bodyInset,
     gap: space.sm,
   } as ViewStyle,
   // A maximized panel has a fixed height. The body fills it, so a picture can
@@ -1247,10 +1315,16 @@ const styles = StyleSheet.create({
   // at its fit detent sizes itself to its content, which a 0 basis would collapse.
   detailsBody: { flexGrow: 1, flexShrink: 1, minHeight: 0, position: "relative" },
   detailsScroll: { flexGrow: 1, flexShrink: 1, minHeight: 0 },
+  sideScroll: { marginTop: 0 },
   pressBodyFill: { flexGrow: 1, minHeight: 0 },
   pressBodyContent: { padding: space.md, gap: space.sm },
+  fullBleed: { paddingHorizontal: 0 },
+  drawerInset: { paddingHorizontal: SHEET_BODY_INSET },
   unwrappedScroll: { flexGrow: 1 },
   unwrapped: { flexGrow: 1, gap: space.sm },
+  stepsColumn: { gap: space.sm },
+  // As wide as its widest line, and no narrower than the body: the body scrolls sideways.
+  stepsUnwrapped: { gap: space.sm, width: "max-content", minWidth: "100%" } as unknown as ViewStyle,
   // On a phone a text is one layer, and a layer wider than the GPU's largest
   // texture (16384px, 5461pt at 3x) draws nothing: a minified JSON line
   // left the whole output blank. Lines past this width wrap here instead.
@@ -1259,9 +1333,8 @@ const styles = StyleSheet.create({
   header: {
     flexShrink: 0,
     zIndex: 1,
-    paddingHorizontal: space.md,
-    paddingTop: space.sm,
-    paddingBottom: space.sm,
-    borderBottomWidth: 1,
+    paddingHorizontal: PREVIEW_HEADER.paddingX,
+    paddingVertical: PREVIEW_HEADER.paddingY,
+    borderBottomWidth: PREVIEW_HEADER.border,
   },
 });

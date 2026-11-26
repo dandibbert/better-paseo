@@ -49,6 +49,13 @@ describe("completed turn footers", () => {
     expect(completedTurnFooters(rows, false, null)).toEqual([{ at: 2000, text: "answer", startedAt: 1000, completedAt: 4000, durationMs: 3000 }]);
   });
 
+  it("treats omp's single-dot filler as no reply of its own", () => {
+    const rows = [prompt(1), reply(2, "answer"), reply(3, "."),
+      entry({ type: "tool_call", callId: "c1", name: "read", status: "completed", error: null,
+        detail: { type: "plain_text", label: "Read", text: "file" } }, 4)];
+    expect(completedTurnFooters(rows, false, null)).toEqual([{ at: 2000, text: "answer", startedAt: 1000, completedAt: 4000, durationMs: 3000 }]);
+  });
+
   it("retains prompt boundaries when canonical turn IDs are unavailable", () => {
     const rows = [prompt(1), reply(2, "first"), prompt(3), reply(4, "second")];
     expect(completedTurnFooters(rows, true, null).map((row) => row.text)).toEqual(["first"]);
@@ -477,5 +484,32 @@ describe("turn footer timing after a reload", () => {
       await store.refresh();
       expect(store.get(15000, "notified")).toMatchObject({ startedAt: 10000, durationMs: 5000 });
     } finally { stop(); }
+  });
+});
+
+describe("running work handed from row to row", () => {
+  it("keeps the turn's live calls when one row releases the live read in the commit the next row retains it", async () => {
+    const harness = setup([prompt(1, "t")]);
+    const settle = async () => { for (let index = 0; index < 5; index++) await Promise.resolve(); await new Promise((resolve) => setTimeout(resolve, 0)); };
+    harness.store.setRunning(true);
+    const first = harness.store.retainLive();
+    const unsubscribeFirst = harness.store.subscribeWork({ kind: "live" }, () => {});
+    await settle();
+    const edit = { type: "tool_call", name: "Edit", callId: "e1", status: "completed", error: null,
+      detail: { type: "edit", filePath: "a.ts", unifiedDiff: "@@\n-a\n+b" } } as const;
+    harness.emit({ type: "timeline", provider: "codex", item: edit, turnId: "t" } as PaseoAgentTimelineEvent["event"]);
+    const owns = () => true;
+    expect(harness.store.work({ kind: "live" }, owns)?.files.map((file) => file.path)).toEqual(["a.ts"]);
+    const reads = harness.refetch.mock.calls.length;
+    // The card leaves one row and mounts under the next one in the same commit.
+    unsubscribeFirst();
+    first();
+    const second = harness.store.retainLive();
+    const unsubscribeSecond = harness.store.subscribeWork({ kind: "live" }, () => {});
+    await settle();
+    expect(harness.store.work({ kind: "live" }, owns)?.files.map((file) => file.path)).toEqual(["a.ts"]);
+    expect(harness.refetch.mock.calls.length).toBe(reads);
+    unsubscribeSecond();
+    second();
   });
 });

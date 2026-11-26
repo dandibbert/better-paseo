@@ -1,9 +1,16 @@
+import { useHomeDirectory } from "./state/home-directory";
+import { UPDATE_INDICATOR_COLOR } from "./ui/update-indicator";
 import { useRpc } from "@getpaseo/plugin/client";
-import { hasUpdate, updateCheckRpc } from "../shared/update-check";
+import { updateCheckRpc } from "../shared/update-check";
+import { hasAgentUpdate, type AgentUpdate } from "../shared/agent-updates";
+import { TimelineTranslationSettings } from "./translation/settings";
+import { clearTranslationSettingsTarget, translationSettingsTarget } from "./translation/navigation";
+import { useAgentUpdates } from "./agent-updates";
+import { recordPluginUpdate, useKnownPluginUpdate } from "./tasks/board/update-indicator";
 import { openTerminalRpc, updateCommand } from "../shared/open-terminal";
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Platform, Pressable, ScrollView, StyleSheet, Text, View, useWindowDimensions, type ViewStyle } from "react-native";
-import { copyText, TextInput } from "@getpaseo/plugin/client/react-native";
+import { copyText, Icon, TextInput } from "@getpaseo/plugin/client/ui";
 import { DETAILS_FONT_SIZE_DEFAULT, DETAILS_FONT_SIZE_MIN, DETAILS_FONT_SIZE_MAX, clampDetailsFontSize } from "../shared/preferences-settings";
 import type { PluginSurfaceProps } from "@getpaseo/plugin/client";
 import { codeSurface, itemRootFont } from "./components/host-font-escape";
@@ -31,6 +38,7 @@ import {
   type MonoFontPreference,
   type PathDisplayPreference,
   type RowLabelStylePreference,
+  type TimelineLevel,
   type UiFontPreference,
 } from "./preferences";
 import {
@@ -46,13 +54,20 @@ import { SettingsPreview } from "./settings-preview";
 import { selectionCodeText } from "./components/selection-actions";
 import { CommandBand } from "./ui/command-band";
 import { SelectableSpan, SelectableText } from "./ui/prose-text";
-import { PHONE_PREVIEW_WIDTH, PlainButton, Section, SectionNote, Segmented, SettingsTips, SettingRow, Toggle, controlStyles, settingsTextStyle, type PageLook } from "./settings-controls";
+import { Group, PHONE_PREVIEW_WIDTH, PlainButton, ResetRow, Section, SectionNote, Segmented, SettingsTips, SettingRow, Toggle, controlStyles, settingsTextStyle, type PageLook } from "./settings-controls";
+import { FileOpenChoices } from "./settings-file-open";
+import { installedEditorsRpc } from "../shared/file-rpc";
+import { FILE_OPEN_APPS, type FileOpenApp } from "../shared/file-open-apps";
 import { setSettingsTab, useSettingsTab, type SettingsTab } from "./settings-tab";
 import { TasksSettingsPanel } from "./tasks/settings/tasks-panel";
 import type { SyncStatus } from "./state/preference-sync";
 import { resolveLanguage, type SettingsLanguagePreference } from "./i18n/settings-strings";
 import { SETTINGS_STRINGS, type SettingsStrings } from "./i18n/settings-page-strings";
 import { describeMonoSource } from "./settings-mono-source";
+import { ProviderLogo, providerBrand } from "./components/provider-logo";
+import { tildePath } from "./tasks/cards/format";
+import { releaseNoteLine } from "./release-notes";
+import { selectionColorProps } from "./components/text-selection";
 
 /** A wrapping single-choice group; seven segments cannot fit on a phone. */
 function FooterMetricControl({ value, look }: { value: import("./preferences").FooterMetricPreference; look: PageLook }) {
@@ -95,43 +110,83 @@ function storageHint(sync: SyncStatus, t: SettingsStrings): string | null {
   return null;
 }
 
+/**
+ * Both palettes run in the same hue order so the two rows line up column by
+ * column: the default, then red, orange, amber, green, the blues, violet and
+ * black. Each row also carries one colour the other lacks; `zinc` against
+ * `green` is the single column whose hues differ.
+ */
 const ACCENT_OPTIONS: ReadonlyArray<{
   id: AccentPreset;
   label: "accentHost" | "accentJade" | "accentViolet" | "accentAmber" | "accentRose" | "accentZinc" | "accentMidnight" | "accentClaude" | "accentGhostty" | "accentPureBlack";
   color: string | undefined;
 }> = [
   { id: "host", label: "accentHost", color: undefined },
-  { id: "jade", label: "accentJade", color: ACCENT_PRESETS.jade },
-  { id: "violet", label: "accentViolet", color: ACCENT_PRESETS.violet },
-  { id: "amber", label: "accentAmber", color: ACCENT_PRESETS.amber },
   { id: "rose", label: "accentRose", color: ACCENT_PRESETS.rose },
+  { id: "claude", label: "accentClaude", color: ACCENT_PRESETS.claude },
+  { id: "amber", label: "accentAmber", color: ACCENT_PRESETS.amber },
+  { id: "jade", label: "accentJade", color: ACCENT_PRESETS.jade },
   { id: "zinc", label: "accentZinc", color: ACCENT_PRESETS.zinc },
   { id: "midnight", label: "accentMidnight", color: ACCENT_PRESETS.midnight },
-  { id: "claude", label: "accentClaude", color: ACCENT_PRESETS.claude },
   { id: "ghostty", label: "accentGhostty", color: ACCENT_PRESETS.ghostty },
+  { id: "violet", label: "accentViolet", color: ACCENT_PRESETS.violet },
   { id: "pureBlack", label: "accentPureBlack", color: ACCENT_PRESETS.pureBlack },
 ];
 
 const INLINE_CODE_OPTIONS: ReadonlyArray<{
   id: InlineCodeColorPreference;
-  label: "inlineCodeGrey" | "inlineCodeBlue" | "inlineCodeViolet" | "inlineCodeGreen" | "inlineCodeCoral" | "accentJade" | "accentAmber" | "accentRose" | "accentZinc" | "accentMidnight" | "accentClaude" | "accentGhostty" | "accentPureBlack";
+  label: "inlineCodeGrey" | "inlineCodeBlue" | "inlineCodeViolet" | "inlineCodeGreen" | "inlineCodeCoral" | "accentJade" | "accentAmber" | "accentMidnight" | "accentClaude" | "accentPureBlack";
 }> = [
   { id: "grey", label: "inlineCodeGrey" },
+  { id: "coral", label: "inlineCodeCoral" },
+  { id: "claude", label: "accentClaude" },
+  { id: "amber", label: "accentAmber" },
+  { id: "jade", label: "accentJade" },
+  { id: "green", label: "inlineCodeGreen" },
+  { id: "midnight", label: "accentMidnight" },
   { id: "blue", label: "inlineCodeBlue" },
   { id: "violet", label: "inlineCodeViolet" },
-  { id: "green", label: "inlineCodeGreen" },
-  { id: "coral", label: "inlineCodeCoral" },
-  { id: "jade", label: "accentJade" },
-  { id: "amber", label: "accentAmber" },
-  { id: "rose", label: "accentRose" },
-  { id: "zinc", label: "accentZinc" },
-  { id: "midnight", label: "accentMidnight" },
-  { id: "claude", label: "accentClaude" },
-  { id: "ghostty", label: "accentGhostty" },
   { id: "pureBlack", label: "accentPureBlack" },
 ];
 
 type PreviewDevice = "desktop" | "mobile";
+
+/** A fixed viewport (100 x 80 units) shows how extra work steps push the reply down. */
+function TimelineLevelIllustration({ level, tokens }: { level: TimelineLevel; tokens: ExtendedThemeTokens }) {
+  const at = (y: number) => `${y / 80 * 100}%` as const;
+  const stepWidths = level === "detailed" ? [50, 36, 56, 42] : [];
+  // Standard folds a turn's work into a "worked for" line and an edited-files card.
+  const workEnd = level === "standard" ? 56 : 25 + stepWidths.length * 9;
+  const replyWidths = level === "simple" ? [80, 72, 80, 76, 46] : level === "standard" ? [80, 48] : [80];
+  const bar = (key: string, left: number, top: number, width: number, color: string, height = 4.25) =>
+    <View key={key} style={{ position: "absolute", left: `${left}%`, top: at(top), width: `${width}%`, height: `${height}%`, borderRadius: 4, backgroundColor: color }} />;
+  return (
+    <View accessible={false} style={{ width: "100%", aspectRatio: 1.25, borderWidth: 1, borderRadius: 6, borderColor: tokens.v2.border, backgroundColor: tokens.v2.surface0, overflow: "hidden" }}>
+      <View style={{ position: "absolute", left: "40%", top: "8.75%", width: "54%", height: "15%", borderRadius: 9, backgroundColor: tokens.userSurface }} />
+      {level === "standard" ? <>
+        {bar("worked-icon", 10, 23.6, 4.2, tokens.foregroundSubtle)}
+        {bar("worked", 18, 23.6, 24, tokens.foregroundSubtle)}
+        <View style={{ position: "absolute", left: "6%", top: at(30), width: "88%", height: at(24), borderWidth: 1, borderRadius: 5, borderColor: tokens.v2.border, backgroundColor: tokens.accentBg }} />
+        {bar("files-icon", 10, 33.4, 4.2, tokens.accent)}
+        {bar("files", 18, 33.4, 34, tokens.foregroundMuted)}
+        {bar("files-add", 72, 33.4, 9, tokens.row.diffAdd)}
+        {bar("files-del", 83, 33.4, 6, tokens.row.diffDel)}
+        <View style={{ position: "absolute", left: "6%", top: at(39.5), width: "88%", height: 1, backgroundColor: tokens.v2.border }} />
+        {[40, 28].map((width, index) => <React.Fragment key={index}>
+          {bar(`file-${index}`, 18, 42.6 + index * 6, width, tokens.foregroundSubtle, 3.6)}
+          {bar(`file-add-${index}`, 76, 42.6 + index * 6, 5, tokens.row.diffAdd, 3.6)}
+          {bar(`file-del-${index}`, 83, 42.6 + index * 6, 6, tokens.row.diffDel, 3.6)}
+        </React.Fragment>)}
+      </> : null}
+      {stepWidths.length > 0 ? <View style={{ position: "absolute", left: "6%", top: "31.25%", width: "88%", height: "45%", borderRadius: 5, backgroundColor: tokens.accentBg }} /> : null}
+      {stepWidths.map((width, index) => <React.Fragment key={index}>
+        <View style={{ position: "absolute", left: "11%", top: at(25 + index * 9 + 2.4), width: "4.2%", aspectRatio: 1, borderRadius: 20, backgroundColor: tokens.accent }} />
+        {bar(`step-${index}`, 19, 25 + index * 9 + 2.8, width, tokens.foregroundSubtle)}
+      </React.Fragment>)}
+      {replyWidths.map((width, index) => bar(`reply-${index}`, 10, workEnd + 4 + index * 9 + 2.2, width, tokens.foreground, 5.75))}
+    </View>
+  );
+}
 
 /** Accent swatches: 22pt, each in a 44pt target. */
 const SWATCH = 22;
@@ -544,34 +599,37 @@ function PreviewPanel({
   );
 }
 
-/** Reset needs a second press within a few seconds: it reaches every client of the host. */
 function ResetButton({ look }: { look: PageLook }) {
-  const { tokens, t } = look;
-  const [armed, setArmed] = useState(false);
-  useEffect(() => {
-    if (!armed) return;
-    const timer = setTimeout(() => setArmed(false), RESET_ARM_MS);
-    return () => clearTimeout(timer);
-  }, [armed]);
+  const { t } = look;
   return (
-    <View style={styles.reset}>
-      <PlainButton
-        label={armed ? t.resetConfirm : t.resetDefaults}
-        onPress={() => {
-          if (!armed) return setArmed(true);
-          setArmed(false);
-          resetEnhancerPreferences();
-        }}
-        look={look}
+    <Group look={look}>
+      <ResetRow first look={look} title={t.resetDefaults} description={t.resetDescription}
+        confirmDescription={t.resetConfirmDescription} onReset={resetEnhancerPreferences}
       />
-      <Text style={[styles.rowNote, settingsTextStyle(tokens, -1), { color: armed ? tokens.warning : tokens.foregroundMuted, fontFamily: tokens.fontUi }]}>
-        {t.resetDescription}
-      </Text>
-    </View>
+    </Group>
   );
 }
 
-function useVersionCheck() {
+/** Editors installed on this host. Null until the scan returns; a failed scan lists every supported editor. */
+function useInstalledFileOpenApps(): readonly FileOpenApp[] | null {
+  const list = useRpc(installedEditorsRpc);
+  const [apps, setApps] = useState<readonly FileOpenApp[] | null>(null);
+  useEffect(() => {
+    let live = true;
+    void list({}).then((result) => {
+      if (!live) return;
+      if (!Array.isArray(result.apps)) {
+        setApps([...FILE_OPEN_APPS]);
+        return;
+      }
+      setApps(["system", ...result.apps]);
+    }).catch(() => { if (live) setApps([...FILE_OPEN_APPS]); });
+    return () => { live = false; };
+  }, [list]);
+  return apps;
+}
+
+function useVersionCheck(hostId: string) {
   const check = useRpc(updateCheckRpc);
   const [state, setState] = useState<Awaited<ReturnType<typeof check>> | { state: "starting" }>({ state: "idle" });
   const started = useRef(false);
@@ -579,29 +637,35 @@ function useVersionCheck() {
     let active = true;
     void check({ action: "status" }).then((result) => {
       if (!active || started.current) return;
+      recordPluginUpdate(hostId, result);
       setState(result);
     }).catch(() => { if (active && !started.current) setState({ state: "failed" }); });
     return () => { active = false; };
-  }, [check]);
+  }, [check, hostId]);
   useEffect(() => {
     if (state.state === "starting") return;
     let active = true;
     const timer = setTimeout(() => {
       void check({ action: "status" }).then((result) => {
-        if (active) setState(result);
+        if (active) { recordPluginUpdate(hostId, result); setState(result); }
       }).catch(() => { if (active) setState({ state: "failed" }); });
     }, state.state === "checking" ? 2000 : 30_000);
     return () => { active = false; clearTimeout(timer); };
-  }, [check, state]);
+  }, [check, state, hostId]);
   async function run() {
     started.current = true;
     setState({ state: "starting" });
     try {
       if (state.state === "failed") {
         const previous = await check({ action: "status" });
-        if (previous.state === "checking" || previous.state === "done") return setState(previous);
+        if (previous.state === "checking" || previous.state === "done") {
+          recordPluginUpdate(hostId, previous);
+          return setState(previous);
+        }
       }
-      setState(await check({ action: "check" }));
+      const result = await check({ action: "check" });
+      recordPluginUpdate(hostId, result);
+      setState(result);
     }
     catch { setState({ state: "failed" }); }
   }
@@ -617,16 +681,16 @@ function VersionResult({ state, look, language, updateAvailable }: {
   const { t, tokens } = look;
   const labelStyle = [settingsTextStyle(tokens, -1), { color: tokens.foregroundMuted, fontFamily: tokens.fontUi }];
   return <View style={{ gap: space.sm, marginTop: space.xs }}>
-    {[
+    <View style={styles.versionLines}>{[
       { label: t.versionInstalled, version: state.versions.status === "available" ? state.versions.current : null, revision: state.current },
       { label: t.versionDirectory, version: state.versions.status === "available" ? state.versions.latest : null, revision: state.latest },
-    ].map((entry) => <View key={entry.label} style={{ flexDirection: "row", alignItems: "flex-start", gap: space.md }}>
-      <Text style={[labelStyle, { width: tokens.typography.ui.size * (language === "zh" ? 4 : 9) }]}>{entry.label}</Text>
-      <View style={{ flex: 1, flexDirection: "row", flexWrap: "wrap", columnGap: space.sm, alignItems: "baseline" }}>
+    ].map((entry) => <View key={entry.label} style={styles.versionLine}>
+      <Text style={labelStyle}>{entry.label}</Text>
+      <View style={{ flexShrink: 1, minWidth: 0, flexDirection: "row", flexWrap: "wrap", columnGap: space.sm, alignItems: "baseline" }}>
         {entry.version ? <Text {...(codeSurface as object)} style={[settingsTextStyle(tokens, -1), { color: tokens.foreground, fontFamily: tokens.fontMono, fontWeight: "500" }]}>{entry.version}</Text> : null}
         <Text {...(codeSurface as object)} style={[settingsTextStyle(tokens, -1), { color: entry.version ? tokens.foregroundMuted : tokens.foreground, fontFamily: tokens.fontMono }]}>{entry.version ? `(${entry.revision.slice(0, 7)})` : entry.revision.slice(0, 7)}</Text>
       </View>
-    </View>)}
+    </View>)}</View>
     <View style={{ gap: 2, marginTop: space.xs }}>
       <Text style={[labelStyle, { color: tokens.foreground, fontWeight: updateAvailable ? "500" : "400" }]}>{state.matches ? t.versionUpToDate : updateAvailable ? t.versionNewAvailable : t.versionAvailable}</Text>
       <Text style={labelStyle}>{t.versionChecked(new Date(state.checkedAt).toLocaleString(language === "zh" ? "zh-CN" : "en-US", { year: new Date(state.checkedAt).getFullYear() === new Date().getFullYear() ? undefined : "numeric", month: "numeric", day: "numeric", hour: "numeric", minute: "numeric", second: "numeric" }))}</Text>
@@ -636,13 +700,106 @@ function VersionResult({ state, look, language, updateAvailable }: {
   </View>;
 }
 
-function VersionSection({ look, language, version, autoUpdateCheck, native }: { look: PageLook; language: "en" | "zh"; version: ReturnType<typeof useVersionCheck>; autoUpdateCheck: boolean; native: boolean }) {
+function UpdateDot() {
+  return <View testID="version-item-update-dot" accessible={false} style={{ width: 4, height: 4, borderRadius: 2, alignSelf: "center", backgroundColor: UPDATE_INDICATOR_COLOR }} />;
+}
+
+function AgentVersionRow({ entry, look }: { entry: AgentUpdate; look: PageLook }) {
+  const home = useHomeDirectory();
+  const [expanded, setExpanded] = useState(false);
+  const { copied, copy } = useCopy();
+  const { t, tokens, compact } = look;
+  const text = { ...settingsTextStyle(tokens, -1), color: tokens.foregroundMuted, fontFamily: tokens.fontUi };
+  const methods = { npm: "npm", homebrew: "Homebrew", native: t.agentNative, unknown: t.agentUnknownMethod };
+  const statuses = { available: t.agentUpdateTo(entry.latest ?? "—"), current: t.versionUpToDate, reference: t.agentReferenceVersion(entry.latest ?? "—"), error: t.agentCheckFailed, unknown: t.agentUnknownVersion };
+  const status = statuses[entry.status].replace(/[.\u3002]+$/, "");
+  const statusColor = entry.status === "available" ? tokens.danger : entry.status === "error" || entry.status === "unknown" ? tokens.warning : tokens.foregroundMuted;
+  const brand = providerBrand(entry.provider);
+  const executable = entry.server ? t.agentOpenCodeServer : entry.executable ? tildePath(entry.executable, home) : t.agentUnknownExecutable;
+  let source = t.agentLatestSource;
+  if (entry.releaseSource === "antigravity") source = t.agentAntigravitySource;
+  if (entry.releasePackage) source = entry.status === "reference" ? t.agentReferencePackage(entry.releasePackage) : t.agentLatestPackage(entry.releasePackage);
+  return <View testID={`agent-version-${entry.provider}`} style={{ borderTopWidth: 1, borderTopColor: tokens.v2.border }}>
+    <Pressable
+      testID={`agent-version-toggle-${entry.provider}`}
+      accessibilityRole="button"
+      accessibilityLabel={`${entry.label}, ${methods[entry.method]}, ${t.versionInstalled}: ${entry.current ?? "—"}, ${status}`}
+      accessibilityHint={t.agentDetailsHint}
+      accessibilityState={{ expanded }}
+      aria-expanded={expanded}
+      onPress={() => setExpanded(!expanded)}
+      style={({ pressed }) => [styles.agentSummary, { paddingVertical: compact ? 11 : 14, backgroundColor: pressed ? tokens.v2.surface2 : "transparent" }]}
+    >
+      <View accessible={false} style={styles.agentLogo}>
+        <ProviderLogo provider={entry.provider} size={compact ? 24 : 26} color={brand.monochrome ? tokens.foreground : undefined} />
+      </View>
+      <View style={styles.agentIdentity}>
+        <View style={styles.agentNameLine}>
+          <View style={{ flexDirection: "row", alignItems: "center", gap: 4, flexShrink: 1 }}>
+            <Text style={[styles.agentName, settingsTextStyle(tokens), { color: tokens.foreground, fontFamily: tokens.fontUi, fontWeight: "500" }]}>{entry.label}</Text>
+            {entry.method === "unknown" && entry.updateAvailable ? <UpdateDot /> : null}
+          </View>
+          {entry.method !== "unknown" ? <View style={{ flexDirection: "row", alignItems: "center", gap: 4 }}>
+            <Text style={[styles.agentMethod, settingsTextStyle(tokens, -3), { color: tokens.foregroundMuted, borderColor: tokens.v2.border, fontFamily: tokens.fontUi }]}>{methods[entry.method]}</Text>
+            {entry.updateAvailable ? <UpdateDot /> : null}
+          </View> : null}
+        </View>
+        <Text numberOfLines={1} ellipsizeMode="middle" style={[text, { fontFamily: tokens.fontMono }]}>{executable}</Text>
+      </View>
+      <View style={[styles.agentState, { width: compact ? 104 : 160 }]}>
+        <Text style={[text, { color: tokens.foreground, fontFamily: tokens.fontMono, textAlign: "right" }]}>{entry.current ?? "—"}</Text>
+        <Text style={[text, { color: statusColor, textAlign: "right" }]}>{status}</Text>
+      </View>
+      <Icon name={expanded ? "ChevronDown" : "ChevronRight"} size={14} color={tokens.foregroundSubtle} />
+    </Pressable>
+    {expanded ? <View testID={`agent-version-details-${entry.provider}`} style={[styles.agentDetails, { paddingLeft: compact ? space.lg : 58 }]}>
+      <Text selectable {...selectionColorProps()} style={[text, { fontFamily: tokens.fontMono }]}>{executable}</Text>
+      <View style={styles.agentDetailLine}>
+        <Text style={text}>{t.versionInstalled}: {entry.current ?? "—"}</Text>
+        <Text style={text}>{entry.status === "reference" ? t.agentReferenceLabel : t.versionDirectory}: {entry.latest ?? "—"}</Text>
+        <Text style={text}>{t.agentInstallMethod}: {methods[entry.method]}</Text>
+      </View>
+      {entry.latest ? <Text style={text}>{source}</Text> : null}
+      {entry.issue ? <Text accessibilityRole="alert" style={[text, { color: tokens.warning }]}>{t.agentIssues[entry.issue]}</Text> : null}
+      {entry.status === "available" ? <>
+        <View style={styles.agentDetailLine}>
+          <PlainButton label={t.versionWorkspaceTerminal} disabled onPress={() => {}} look={look} />
+          {entry.command ? <PlainButton label={copied ? t.versionCommandCopied : t.versionCopyCommand} onPress={() => { void copy(entry.command!); }} look={look} /> : null}
+        </View>
+        {entry.command ? <Text selectable {...selectionColorProps()} style={[text, { fontFamily: tokens.fontMono }]}>{entry.command}</Text> : <Text style={text}>{t.agentOriginalInstaller}</Text>}
+        <Text style={text}>{t.versionWorkspaceTerminalUnavailable}</Text>
+      </> : null}
+    </View> : null}
+  </View>;
+}
+
+function AgentVersionSection({ look, agents, host }: { look: PageLook; agents: ReturnType<typeof useAgentUpdates>; host: PluginSurfaceProps["host"] }) {
+  const { t, tokens } = look;
+  const text = { ...settingsTextStyle(tokens, -1), color: tokens.foregroundMuted, fontFamily: tokens.fontUi };
+  return <View style={{ gap: space.sm }}>
+    <Section title={t.agentVersions} look={look}>
+      <SettingRow title={t.agentUpdates} description={`${t.agentHost}: ${host.label}`} first look={look}
+        control={<PlainButton label={agents.state.state === "checking" ? t.versionChecking : t.versionCheck} accessibilityLabel={t.agentCheck} loading={agents.state.state === "checking"} disabled={agents.state.state === "checking"} onPress={() => { void agents.run(); }} look={look} />} />
+      {agents.state.entries.length > 0 ? <View style={styles.agentColumns}>
+        <Text style={[text, { flex: 1 }]}>{t.agentEnabledCount(agents.state.entries.length)}</Text>
+        <Text style={text}>{t.versionInstalled}</Text>
+      </View> : null}
+      {agents.state.entries.map((entry) => <AgentVersionRow key={entry.provider} entry={entry} look={look} />)}
+      {agents.state.state === "failed" ? <SectionNote look={look} text={t.agentSnapshotFailed} /> : null}
+      {agents.state.state === "done" && agents.state.entries.length === 0 ? <SectionNote look={look} text={t.agentEmpty} /> : null}
+    </Section>
+    <SectionNote look={look} text={t.agentDetailsHint} />
+    <SectionNote look={look} text={t.versionWorkspaceTerminalUnavailable} />
+  </View>;
+}
+
+function VersionSection({ look, language, version, autoUpdateCheck, native, agents, host, knownUpdate }: { look: PageLook; language: "en" | "zh"; version: ReturnType<typeof useVersionCheck>; autoUpdateCheck: boolean; native: boolean; agents: ReturnType<typeof useAgentUpdates>; host: PluginSurfaceProps["host"]; knownUpdate: boolean }) {
   const { state, run } = version;
   const { copied, copy } = useCopy();
   const openTerminal = useRpc(openTerminalRpc);
   const [terminalStatus, setTerminalStatus] = useState<"idle" | "opening" | "opened" | "unsupported" | "failed" | "copyFailed">("idle");
   const t = look.t;
-  const updateAvailable = state.state !== "starting" && hasUpdate(state);
+  const updateAvailable = knownUpdate;
   const orderUnknown = state.state === "done" && !state.matches && (state.versions.status === "unavailable" || state.versions.current === null || state.versions.latest === null || state.versions.currentBuild === null || state.versions.latestBuild === null);
   const command = state.state === "done" ? updateCommand() : "";
   async function goToUpdate() {
@@ -663,8 +820,8 @@ function VersionSection({ look, language, version, autoUpdateCheck, native }: { 
   <Section title={t.versionTitle} look={look}>
     <SettingRow title={t.versionAutoCheck} description={t.versionAutoCheckDescription} first look={look}
       control={<Toggle value={autoUpdateCheck} onChange={(autoUpdateCheck) => updateEnhancerPreferences({ autoUpdateCheck })} label={t.versionAutoCheck} look={look} />} />
-    <SettingRow title={t.versionInfo} description={description} stacked look={look}
-      control={<PlainButton label={state.state === "checking" || state.state === "starting" ? t.versionChecking : t.versionCheck} disabled={state.state === "checking" || state.state === "starting"} loading={state.state === "checking" || state.state === "starting"} onPress={() => { void run(); }} look={look} />} />
+    <SettingRow title={t.versionInfo} description={description} look={look}
+      control={<PlainButton label={state.state === "checking" || state.state === "starting" ? t.versionChecking : t.versionCheck} updateBadge={updateAvailable} disabled={state.state === "checking" || state.state === "starting"} loading={state.state === "checking" || state.state === "starting"} onPress={() => { void run(); }} look={look} />} />
   </Section>
   {(updateAvailable || orderUnknown) && state.state === "done" ? <Section title={orderUnknown ? t.versionMarketCommand : t.versionUpdateCommand} look={look}>
       <View style={{ paddingHorizontal: space.lg, paddingVertical: look.compact ? 11 : 14, gap: space.sm }}>
@@ -676,6 +833,7 @@ function VersionSection({ look, language, version, autoUpdateCheck, native }: { 
           </SelectableText>
         </CommandBand>
         <View style={{ flexDirection: "row", flexWrap: "wrap", gap: space.sm }}>
+          <PlainButton label={t.versionWorkspaceTerminal} disabled onPress={() => {}} look={look} />
           <PlainButton label={copied ? t.versionCommandCopied : orderUnknown ? t.versionCopyMarketCommand : t.versionCopyCommand} onPress={() => { void copy(command); }} look={look} />
           {!native && !orderUnknown ? <PlainButton label={t.versionOpenTerminal} disabled={terminalStatus === "opening"} loading={terminalStatus === "opening"} onPress={() => { void goToUpdate(); }} look={look} /> : null}
         </View>
@@ -685,16 +843,20 @@ function VersionSection({ look, language, version, autoUpdateCheck, native }: { 
       </View>
   </Section> : null}
   {state.state === "done" ? <Section title={t.releaseNotesTitle} look={look}>
-    <View style={{ paddingHorizontal: 18, paddingVertical: 20 }}>
+    <View style={{ paddingHorizontal: space.lg, paddingVertical: look.compact ? 11 : 14 }}>
       {state.notes.status === "available"
-        ? <View style={{ gap: 24 }}>
-            {state.notes.releases.map((release) => <View key={release.version} style={{ gap: 12 }}>
-              <Text style={[settingsTextStyle(look.tokens, 3), { color: look.tokens.foregroundMuted, fontFamily: look.tokens.fontUi, fontWeight: "600" }]}>{release.version}</Text>
+        ? <View style={{ gap: space.lg }}>
+            {state.notes.releases.map((release) => <View key={release.version} style={{ gap: space.sm }}>
+              <Text style={[settingsTextStyle(look.tokens, -1), { color: look.tokens.foregroundMuted, fontFamily: look.tokens.fontUi, fontWeight: "600" }]}>{release.version}</Text>
               <View style={{ gap: 8 }}>
-                {release[language].map((item, index) => <View key={index} style={{ flexDirection: "row", alignItems: "flex-start", gap: 13 }}>
-                  <View style={{ width: 5, height: 5, borderRadius: 3, marginTop: Math.round((look.tokens.typography.ui.size + 1) * 1.56 / 2 - 2.5), backgroundColor: look.tokens.foregroundMuted }} />
-                  <Text style={{ flex: 1, minWidth: 0, color: look.tokens.foreground, fontFamily: look.tokens.fontUi, fontSize: look.tokens.typography.ui.size + 1, lineHeight: Math.round((look.tokens.typography.ui.size + 1) * 1.56) }}>{item}</Text>
-                </View>)}
+                {release[language].map((item, index) => {
+                  const line = releaseNoteLine(item);
+                  if (line.kind === "heading") return <Text key={index} accessibilityRole="header" style={[settingsTextStyle(look.tokens, -1), { marginTop: index === 0 ? 0 : space.sm, color: look.tokens.foreground, fontFamily: look.tokens.fontUi, fontWeight: "600" }]}>{line.text}</Text>;
+                  return <View key={index} style={{ flexDirection: "row", alignItems: "flex-start", gap: space.sm }}>
+                    <View style={{ width: 5, height: 5, borderRadius: 3, marginTop: Math.round((look.tokens.typography.ui.size - 1) * 1.4 / 2 - 2.5), backgroundColor: look.tokens.foregroundMuted }} />
+                    <Text style={{ flex: 1, minWidth: 0, color: look.tokens.foreground, fontFamily: look.tokens.fontUi, ...settingsTextStyle(look.tokens, -1) }}>{line.text}</Text>
+                  </View>;
+                })}
               </View>
             </View>)}
           </View>
@@ -703,6 +865,7 @@ function VersionSection({ look, language, version, autoUpdateCheck, native }: { 
           </Text>}
     </View>
   </Section> : null}
+  <AgentVersionSection look={look} agents={agents} host={host} />
   </>;
 }
 
@@ -711,11 +874,16 @@ export function BetterPaseoSettingsPage({ theme, layout, host }: PluginSurfacePr
   const preferences = useEnhancerPreferences();
   // The selected settings section persists across page mounts.
   const tab = useSettingsTab();
-  const version = useVersionCheck();
-  const updateAvailable = version.state.state !== "starting" && hasUpdate(version.state);
+  const [translationTarget] = useState(translationSettingsTarget);
+  useEffect(() => { if (translationTarget) clearTranslationSettingsTarget(); }, [translationTarget]);
+  const version = useVersionCheck(host.id);
+  const knownUpdate = useKnownPluginUpdate(host.id);
+  const agents = useAgentUpdates(host.id);
+  const updateAvailable = knownUpdate || hasAgentUpdate(agents.state);
   // The settings screen reads (and, through the store, saves) the daemon
   // record itself, so it works with no chat open.
   const sync = usePreferenceSettings();
+  const installedEditors = useInstalledFileOpenApps();
   // "Follow Paseo" on iOS and Android learns the host's language a turn later.
   useHostLanguageVersion();
   const t = SETTINGS_STRINGS[resolveLanguage(preferences.language)];
@@ -746,6 +914,7 @@ export function BetterPaseoSettingsPage({ theme, layout, host }: PluginSurfacePr
   const nativeChoices = platform === "web" ? [] : NATIVE_MONO_CHOICES[platform];
   const previews = preferences.hoverPreview;
   const chat = preferences.chatEnabled;
+  const [showTools, setShowTools] = useState(false);
 
   // The web page also previews a phone: iOS rows at a phone's width, with
   // the platform monospace and inline code without a fill.
@@ -806,7 +975,39 @@ export function BetterPaseoSettingsPage({ theme, layout, host }: PluginSurfacePr
           look={look}
           stacked
         />
+        <SettingRow
+          title={t.fileOpenTitle}
+          description={t.fileOpenDescription}
+          control={sync.status === "invalid"
+            ? <Text accessibilityRole="alert" style={[settingsTextStyle(tokens, -1), { color: tokens.warning, fontFamily: tokens.fontUi }]}>{t.fileOpenUnavailable}</Text>
+            : (
+              <FileOpenChoices
+                label={t.fileOpenTitle}
+                systemLabel={t.fileOpenSystem}
+                value={preferences.fileOpenApp}
+                available={installedEditors}
+                onChange={(fileOpenApp) => updateEnhancerPreferences({ fileOpenApp })}
+                look={look}
+              />
+            )}
+          look={look}
+          stacked
+        />
+        {chat ? <SettingRow title={t.timelineTitle} description={t.timelineDescription} look={look} stacked
+          control={<View accessibilityRole="radiogroup" accessibilityLabel={t.timelineTitle} style={{ width: look.compact ? "100%" : 300, maxWidth: "100%", flexDirection: "row", gap: space.sm }}>
+            {([ ["simple", t.timelineSimple, t.timelineSimpleDescription], ["standard", t.timelineStandard, t.timelineStandardDescription], ["detailed", t.timelineDetailed, t.timelineDetailedDescription] ] as const).map(([value, label, description]) => (
+              <Pressable key={value} accessibilityRole="radio" aria-checked={preferences.timelineLevel === value} accessibilityState={{ checked: preferences.timelineLevel === value }} onPress={() => updateEnhancerPreferences({ timelineLevel: value })}
+                style={{ flex: 1, minWidth: 0, padding: space.sm, gap: space.sm, borderWidth: 1, borderRadius: radiusV2.card, borderColor: preferences.timelineLevel === value ? tokens.accent : tokens.v2.border }}>
+                <TimelineLevelIllustration level={value} tokens={tokens} />
+                <Text style={[settingsTextStyle(tokens), { color: tokens.foreground, fontFamily: tokens.fontUi }]}>{label}{value === "standard" ? ` · ${t.timelineDefault}` : ""}</Text>
+                <Text style={[settingsTextStyle(tokens, -1), { color: tokens.foregroundMuted, fontFamily: tokens.fontUi }]}>{description}</Text>
+              </Pressable>
+            ))}
+          </View>} /> : null}
       </Section>
+
+      {/* Translation also serves the Tasks board, which does not depend on the chat switch. */}
+      {!translationTarget ? <TimelineTranslationSettings look={look} /> : null}
 
       <Section title={t.sectionAppearance} look={look}>
         <SettingRow
@@ -907,7 +1108,10 @@ export function BetterPaseoSettingsPage({ theme, layout, host }: PluginSurfacePr
         {hostTypography ? null : <SectionNote text={native ? t.paseoFontsNative : t.paseoFontsWeb} look={look} />}
       </View>
 
-      <Section title={t.sectionTools} look={look} hidden={!chat}>
+      {chat && preferences.timelineLevel === "simple" && !showTools ? <Section title={t.sectionTools} look={look}>
+        <SettingRow title={t.timelineSimple} description={t.toolsSimpleNote} control={<PlainButton label={t.toolsAdjust} look={look} onPress={() => setShowTools(true)} />} look={look} first />
+      </Section> : null}
+      <Section title={t.sectionTools} look={look} hidden={!chat || (preferences.timelineLevel === "simple" && !showTools)}>
         <SettingRow
           title={t.blockSizeTitle}
           description={t.blockSizeDescription(BLOCK_FONT_SIZE_MIN, BLOCK_FONT_SIZE_MAX)}
@@ -1033,6 +1237,21 @@ export function BetterPaseoSettingsPage({ theme, layout, host }: PluginSurfacePr
             />
           }
           look={look}
+        />
+        <SettingRow
+          title={t.liveUiTitle}
+          description={t.liveUiDescription}
+          control={
+            <Toggle
+              value={preferences.liveUiReplies}
+              onChange={(liveUiReplies) => updateEnhancerPreferences({ liveUiReplies })}
+              label={t.liveUiTitle}
+              look={look}
+              disabled={!preferences.assistantMarkdown}
+            />
+          }
+          look={look}
+          disabled={!preferences.assistantMarkdown}
         />
         <SettingRow
           title={t.markdownStyleTitle}
@@ -1218,8 +1437,9 @@ export function BetterPaseoSettingsPage({ theme, layout, host }: PluginSurfacePr
         ) : null}
       </View>
 
+      {tab === "display" && translationTarget ? <TimelineTranslationSettings look={look} /> : null}
       {tab === "version" ? (
-        <VersionSection look={look} language={resolveLanguage(preferences.language)} version={version} autoUpdateCheck={preferences.autoUpdateCheck} native={native} />
+        <VersionSection key={host.id} look={look} language={resolveLanguage(preferences.language)} version={version} autoUpdateCheck={preferences.autoUpdateCheck} native={native} agents={agents} host={host} knownUpdate={knownUpdate} />
       ) : tab === "tasks" ? (
         <TasksSettingsPanel look={look} theme={theme} side={side} hostId={host?.id} />
       ) : side ? (
@@ -1245,7 +1465,6 @@ const TWO_COLUMN_MIN = 960;
 const PREVIEW_MIN_HEIGHT = 320;
 /** Window height the side preview leaves for Paseo's header and the page's own padding. */
 const PREVIEW_WINDOW_MARGIN = 140;
-const RESET_ARM_MS = 4000;
 /** React Native's types lack `sticky`; React Native Web passes it through to CSS. */
 const stickyColumn = (Platform.OS === "web" ? { position: "sticky", top: space.lg } : null) as ViewStyle | null;
 
@@ -1277,6 +1496,18 @@ const styles = {
     optionsColumn: { flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0, gap: space.xl },
     previewColumn: { flexGrow: 0, flexShrink: 0, flexBasis: "44%", minWidth: 380, maxWidth: 640 },
     options: { gap: space.xl },
+    versionLines: { flexDirection: "row", flexWrap: "wrap", columnGap: space.xl, rowGap: space.sm },
+    versionLine: { flexDirection: "row", flexWrap: "wrap", alignItems: "baseline", gap: space.sm, minWidth: 0, maxWidth: "100%", flexShrink: 1 },
+    agentSummary: { flexDirection: "row", alignItems: "center", paddingHorizontal: space.lg, gap: space.sm, minHeight: 68 },
+    agentLogo: { width: 26, flexShrink: 0, alignItems: "center" },
+    agentIdentity: { flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0, gap: space.xs },
+    agentNameLine: { flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 7 },
+    agentName: { flexShrink: 1 },
+    agentMethod: { borderWidth: 1, borderRadius: radiusV2.chip, paddingHorizontal: space.xs, paddingVertical: 2 },
+    agentState: { maxWidth: "38%", flexShrink: 0, gap: 2 },
+    agentDetails: { paddingHorizontal: space.lg, paddingBottom: space.lg, gap: space.sm },
+    agentDetailLine: { flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: space.sm },
+    agentColumns: { flexDirection: "row", alignItems: "center", gap: space.sm, paddingHorizontal: space.lg, paddingRight: 38, paddingVertical: space.sm },
     sectionWithNote: { gap: space.sm },
     controlLine: { flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: space.md },
     stepper: { flexDirection: "row", alignItems: "center", gap: space.xs },
@@ -1338,6 +1569,5 @@ const styles = {
       borderRadius: radiusV2.bubble,
       padding: space.lg,
     },
-    reset: { gap: space.sm },
   }),
 };

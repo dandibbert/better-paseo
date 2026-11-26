@@ -1,11 +1,11 @@
 import React, { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { Platform, Pressable, View } from "react-native";
 import type { PluginTheme } from "@getpaseo/plugin";
-import { Icon } from "@getpaseo/plugin/client/react-native";
+import { Icon } from "@getpaseo/plugin/client/ui";
 import { TaskText as Text, HOST_FONT as F, HOST_LINE, useTasksFontScale, taskControlHeight } from "../typography";
 import type { TasksLanguage } from "../i18n";
 import type { TaskChild } from "../model";
-import { subagentFacts, subagentTypeIcon } from "../subagent-type";
+import { subagentFacts, subagentModel, subagentTypeIcon } from "../subagent-type";
 import { useHover } from "../../ui/use-hover";
 import { mix, withAlpha } from "../../components/theme-tokens";
 import { useTitleUndoState, useTitleUpdateState, type TitleUpdateControl } from "../actions/title-update";
@@ -24,6 +24,7 @@ import { modeIcon, THINKING_ICON } from "./mode-icons";
 import { cardStrings } from "./strings";
 import type { TaskTokens } from "./tokens";
 import { bindContextMenu } from "../../web";
+import { hoverFill } from "../hover-fill";
 
 /** One design for expanded board cards, the details sidebar and the mobile sheet. */
 export interface SubtaskRowProps extends TimeSource {
@@ -49,6 +50,7 @@ export interface SubtaskRowProps extends TimeSource {
   onOpen?(): void;
   onContextMenu?(point: { x: number; y: number }): void;
   titleUpdates?: TitleUpdateControl;
+  unifiedUndo?: boolean;
 }
 
 export function SubtaskRow(props: SubtaskRowProps) {
@@ -60,7 +62,8 @@ export function SubtaskRow(props: SubtaskRowProps) {
   const web = Platform.OS === "web";
   const showOpen = !!props.onOpen && (touch || !web || hovered || child.kind === "provider");
   const prefix = props.testIDPrefix ?? "subtask";
-  const fill = hovered && props.onPress ? tokens.card.controlHover : props.backdrop;
+  const [pressed, setPressed] = useState(false);
+  const fill = hoverFill(props.backdrop, tokens.foreground, hovered && !!props.onPress, pressed && !!props.onPress);
   const line = Math.round(HOST_LINE.smRead * scale);
   const target = touch ? 32 : 22;
   const titleUpdate = useTitleUpdateState(props.titleUpdates, child.id);
@@ -90,6 +93,8 @@ export function SubtaskRow(props: SubtaskRowProps) {
       {...tipProps(props.onPress ? props.pressTip : undefined)}
       disabled={!props.onPress && !props.onOpen}
       onPress={props.onPress}
+      onPressIn={() => setPressed(true)}
+      onPressOut={() => setPressed(false)}
       onLongPress={props.onLongPress}
       delayLongPress={450}
       ref={rowRef}
@@ -146,7 +151,7 @@ export function SubtaskRow(props: SubtaskRowProps) {
         ) : null}
         {(undoVisible || undoSlot) ? (
           <View pointerEvents="box-none" style={{ position: "absolute", right: props.onOpen ? target + 4 : 0, top: (line - taskControlHeight(touch ? 44 : 30, scale)) / 2 }}>
-            <TitleUndo agentId={child.id} control={props.titleUpdates} tokens={tokens} language={props.language} touch={touch} fadeColor={fill} fadeHeight={line} />
+            <TitleUndo agentId={child.id} control={props.titleUpdates} tokens={tokens} language={props.language} touch={touch} fadeColor={fill} fadeHeight={line} unifiedHover={props.unifiedUndo} />
           </View>
         ) : null}
       </View>
@@ -169,10 +174,13 @@ export function SubtaskMetadata(props: TimeSource & { child: TaskChild; tokens: 
   const timed = child.lane && child.timing ? { lane: child.lane, timing: child.timing, waitingOnSubtasks: child.waitingOnSubtasks } : null;
   const start = useTime(props, (now) => !hideRunTime && timed ? cardStart(timed, now) ?? "" : "");
   const timer = useTime(props, (now) => !hideRunTime && timed ? cardTimer(timed, now, language, true)?.text ?? "" : "");
+  const subagent = child.kind === "provider" ? subagentModel(child.subtitle, child.subagentType) : null;
+  const modelLabel = child.modelLabel ?? subagent?.model;
+  const thinkingLabel = child.thinkingLabel ?? subagent?.thinking;
   // Timer ticks update the existing probe; remounting it would flash full labels every second.
-  const measureKey = JSON.stringify([scale, language, child.kind, child.subtitle, child.subagentType, child.modelLabel, child.thinkingLabel, child.modeLabel, status, ratio !== null, !!start, !!timer]);
+  const measureKey = JSON.stringify([scale, language, child.kind, child.subtitle, child.subagentType, modelLabel, thinkingLabel, child.modeLabel, status, ratio !== null, !!start, !!timer]);
   const canFoldMode = !!child.modeLabel;
-  const needsMeasurement = canFoldMode || !!child.thinkingLabel;
+  const needsMeasurement = canFoldMode || !!thinkingLabel;
   const overflowing = width !== null && width > 0 && measured?.key === measureKey && measured.width > width;
   const compactLabels = narrow || overflowing;
   const iconSize = 12;
@@ -198,14 +206,14 @@ export function SubtaskMetadata(props: TimeSource & { child: TaskChild; tokens: 
   };
   const parts: ReactNode[] = [];
   // The provider and status are already combined in the row's ChildMark.
-  if (child.kind === "provider") {
+  if (child.kind === "provider" && !modelLabel && !thinkingLabel) {
     const facts = subagentFacts(child.subtitle, child.subagentType);
     parts.push(part("facts", facts.text ?? "", icon(subagentTypeIcon(child.subagentType))));
   }
-  if (child.modelLabel) parts.push(part("model", child.modelLabel));
-  if (child.thinkingLabel) {
-    const label = overflowing ? formatThinkingLevel(child.thinkingLabel) : child.thinkingLabel;
-    parts.push(part("thinking", label, icon(THINKING_ICON), muted, true, child.thinkingLabel));
+  if (modelLabel) parts.push(part("model", modelLabel));
+  if (thinkingLabel) {
+    const label = overflowing ? formatThinkingLevel(thinkingLabel) : thinkingLabel;
+    parts.push(part("thinking", label, icon(THINKING_ICON), muted, true, thinkingLabel));
   }
   if (child.modeLabel) {
     const mode = modeIcon(child.provider ?? "", child.modeLabel);

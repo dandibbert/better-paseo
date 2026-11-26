@@ -10,10 +10,10 @@ vi.mock("../../client/ui/use-input-capabilities", () => ({
 }));
 vi.mock("react-native", async () => ({ ...await import("./helpers/rn-mock"), UIManager: { hasViewManagerConfig: () => true } }));
 vi.mock("../../client/ui/use-copy", () => ({ useCopy: () => ({ copy }) }));
-vi.mock("@getpaseo/plugin/client/react-native", async () => {
+vi.mock("@getpaseo/plugin/client/ui", async () => {
   const rn = await import("./helpers/rn-mock");
   return { Icon: (props: object) => React.createElement("Icon", props), ScrollView: rn.ScrollView,
-    Modal: rn.View, TextInput: rn.TextInput, useRevealedText: (text: string) => text };
+    Modal: rn.View, TextInput: rn.TextInput };
 });
 vi.mock("@getpaseo/plugin/client", () => ({ useSettings: () => ({ data: undefined }), useRpc: () => async () => null }));
 await import("./helpers/quiet-renderer");
@@ -61,6 +61,12 @@ describe("native prose source", () => {
     expect(source.markdown).toContain("[**docs**](bc-prose://0)");
     expect(source.markdown).toContain("[`src/a.ts:42`](bc-prose://1)");
     expect(source.markdown).not.toContain("![");
+  });
+  it("links a CJK path code span like an ASCII one", () => {
+    const path = "output/pdf/第4课冀中的地道战与园地四_词语整理_A4.pdf";
+    const source = nativeProseSource(inline(`PDF 已放在 \`${path}\`。`));
+    expect(source.links).toEqual([{ kind: "path", target: path }]);
+    expect(source.markdown).toContain(`[\`${path}\`](bc-prose://0)`);
   });
   it("bounds paragraph grouping and leaves code fences, tables and local images separate", () => {
     const paragraphs = Array.from({ length: 9 }, (_, index) => `Paragraph ${index}\n\n`);

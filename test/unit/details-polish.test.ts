@@ -1,15 +1,20 @@
 import { createElement } from "react";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import TestRenderer, { act } from "react-test-renderer";
 import "./helpers/quiet-renderer";
 
 vi.mock("react-native", () => import("./helpers/rn-mock"));
-vi.mock("@getpaseo/plugin/client/react-native", async () => {
+vi.mock("@getpaseo/plugin/client/ui", async () => {
   const rn = await import("./helpers/rn-mock");
   return { Icon: rn.View, ScrollView: rn.ScrollView, TextInput: rn.TextInput,
-    copyText: vi.fn(async () => {}), useToast: () => ({ show: vi.fn(), error: vi.fn() }), useRevealedText: (text: string) => text };
+    copyText: vi.fn(async () => {}), useToast: () => ({ show: vi.fn(), error: vi.fn() }) };
 });
-import { ANDROID_NAV_FALLBACK, androidBottomInset } from "../../client/details/shell/safe-area";
+const input = vi.hoisted(() => ({ hover: false }));
+vi.mock("../../client/ui/use-input-capabilities", () => ({
+  useInputCapabilities: () => ({ hover: input.hover, touch: !input.hover, compact: false, native: false }),
+}));
+import { ANDROID_NAV_FALLBACK, androidBottomInset, androidContentBottomPad } from "../../client/details/shell/safe-area";
+import { TurboModuleRegistry } from "react-native";
 import { RowMenu } from "../../client/details/row-menu";
 import { buildThemeTokens } from "../../client/components/theme-tokens";
 import { Dimensions } from "./helpers/rn-mock";
@@ -36,6 +41,43 @@ describe("Android bottom inset", () => {
   it("falls back to the gesture bar when an edge-to-edge window leaves nothing out", () => {
     expect(androidBottomInset(844, 844, 844, 24)).toBe(ANDROID_NAV_FALLBACK);
     expect(ANDROID_NAV_FALLBACK).toBe(24);
+  });
+});
+
+describe("Android sheet pad from the system inset", () => {
+  const originalGet = TurboModuleRegistry.get;
+  afterEach(() => {
+    TurboModuleRegistry.get = originalGet;
+    delete (globalThis as { __rnMockOS?: string }).__rnMockOS;
+  });
+
+  function os(name: string) {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = name;
+  }
+
+  function inset(bottom: number | null) {
+    TurboModuleRegistry.get = ((moduleName: string) => {
+      if (moduleName !== "RNCSafeAreaContext" || bottom === null) return null;
+      return { getConstants: () => ({ initialWindowMetrics: { insets: { bottom } } }) };
+    }) as typeof TurboModuleRegistry.get;
+  }
+
+  it("uses the measured navigation bar on Android and keeps at least the design pad", () => {
+    os("android");
+    inset(48);
+    expect(androidContentBottomPad()).toBe(48);
+    inset(0);
+    expect(androidContentBottomPad()).toBe(4);
+    inset(null);
+    expect(androidContentBottomPad()).toBe(ANDROID_NAV_FALLBACK);
+  });
+
+  it("leaves iOS and web on the design pad", () => {
+    inset(34);
+    os("ios");
+    expect(androidContentBottomPad()).toBe(4);
+    os("web");
+    expect(androidContentBottomPad()).toBe(4);
   });
 });
 
@@ -69,6 +111,25 @@ describe("row menu", () => {
     const scroller = renderer.root.findAll((node) => (node.type as unknown) === "ScrollView")[0]!;
     expect(scroller.props.showsVerticalScrollIndicator).toBe(false);
     act(() => renderer.unmount());
+  });
+
+  it.each([["side", true], [undefined, false]] as const)("asks for form %s from the menu (pointer = %s)", (form, hover) => {
+    input.hover = hover;
+    const onOpen = vi.fn();
+    const onClose = vi.fn();
+    let renderer!: ReturnType<typeof TestRenderer.create>;
+    act(() => {
+      renderer = TestRenderer.create(createElement(RowMenu, {
+        anchor: { x: 0, y: 300, width: 390, height: 28 }, title: "npm test", hasBody: true,
+        copyItems: [], tokens, onOpen, onToggle() {}, onClose,
+      }));
+    });
+    const item = renderer.root.findAll((node) => node.props.accessibilityLabel === "Open details" && node.props.accessibilityRole === "menuitem")[0]!;
+    act(() => item.props.onPress());
+    expect(onClose).toHaveBeenCalledOnce();
+    expect(onOpen).toHaveBeenCalledWith(form);
+    act(() => renderer.unmount());
+    input.hover = false;
   });
 
   function menuLabels(props: Partial<Parameters<typeof RowMenu>[0]>) {

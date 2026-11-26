@@ -1,9 +1,12 @@
 import React from "react";
 import { Platform, Text, View } from "react-native";
 import type { MarkedToken, Token, Tokens } from "../../../vendor/marked";
-import { Icon } from "@getpaseo/plugin/client/react-native";
+import { Icon } from "@getpaseo/plugin/client/ui";
 import type { MathToken } from "../lex";
 import type { InsightToken } from "../insight";
+import type { CodexToken } from "../codex";
+import { lexBlock } from "../lex";
+import { CodexBlock } from "./codex-block";
 import { CodeBlock } from "./code-block";
 import type { RenderContext } from "./context";
 import { codeSurface } from "../../host-font-escape";
@@ -25,6 +28,9 @@ import {
 } from "./styles";
 import { MdTable } from "./table";
 import { reuseNode, type NodeReuse } from "./reuse";
+import { blockSelectionText } from "./block-selection";
+import { ToolbarCopyButton } from "../../../ui/toolbar-button";
+import { space } from "../../theme-tokens";
 
 export interface BlockOptions {
   /** The first block of the message: a heading there takes no top margin. */
@@ -83,6 +89,12 @@ function renderBlock(
 ): React.ReactNode {
   const { styles, metrics } = context;
 
+  if (generic.type === "codex") {
+    if (options.inQuote) return <MarkdownProse key={key} context={context} style={styles.quoteText} text={generic.raw} />;
+    return <CodexBlock key={key} token={generic as unknown as CodexToken} context={context}
+      renderBody={(body) => renderBlocks(lexBlock(body, false, false), context, `${key}-body`, { first: true, open: false })} />;
+  }
+
   if (generic.type === "insight") {
     const insight = generic as unknown as InsightToken;
     const insightContext = {
@@ -92,12 +104,14 @@ function renderBlock(
     return (
       <View key={key} style={styles.insight}>
         <View style={styles.insightHeader}>
-          <MarkdownProse context={context} style={styles.insightTitle} text="✦ Insight" />
+          <MarkdownProse context={context} style={styles.insightTitle} text="Insight" />
           <CopyButton text={insight.text.trim()} tokens={context.tokens} label="Copy section" />
         </View>
-        {renderBlocks(insight.tokens, insightContext, `${key}i`, {
-          ...options, first: true, open: options.open && !insight.closed,
-        })}
+        <View style={styles.insightBody}>
+          {renderBlocks(insight.tokens, insightContext, `${key}i`, {
+            ...options, first: true, open: options.open && !insight.closed,
+          })}
+        </View>
       </View>
     );
   }
@@ -171,11 +185,7 @@ function renderBlock(
       return renderList(token, context, key, options);
 
     case "blockquote":
-      return (
-        <View key={key} style={styles.quote}>
-          {renderBlocks(token.tokens, context, key, { ...options, first: false, inQuote: true })}
-        </View>
-      );
+      return <QuoteBlock key={key} token={token} context={context} prefix={key} options={options} />;
 
     case "code":
       return <CodeBlock key={key} token={token} context={context} open={options.open} />;
@@ -202,6 +212,20 @@ function renderBlock(
         <MarkdownProse key={key} context={context} {...(codeSurface as object)} style={styles.plain} text={token.raw} />
       );
   }
+}
+
+function QuoteBlock({ token, context, prefix, options }: {
+  token: Tokens.Blockquote; context: RenderContext; prefix: string; options: BlockOptions;
+}) {
+  const text = blockSelectionText(token.tokens, true);
+  return <View style={[context.styles.quote, { flexDirection: "row", alignItems: "flex-start" }]}>
+    <View style={{ flex: 1, minWidth: 0, gap: space.xs }}>
+      {renderBlocks(token.tokens, { ...context, literalCodex: true }, prefix, { ...options, first: false, inQuote: true })}
+    </View>
+    <View style={{ flexDirection: "row", flexShrink: 0 }}>
+      <ToolbarCopyButton text={text} label="Copy quote" tokens={context.tokens} align="end" />
+    </View>
+  </View>;
 }
 
 interface ListRow {

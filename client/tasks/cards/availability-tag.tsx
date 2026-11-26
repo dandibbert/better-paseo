@@ -1,6 +1,7 @@
+import { useHomeDirectory } from "../../state/home-directory";
 import React, { useEffect, useRef, useState } from "react";
 import { Platform, Pressable, View, type ViewStyle } from "react-native";
-import { Icon } from "@getpaseo/plugin/client/react-native";
+import { Icon } from "@getpaseo/plugin/client/ui";
 import type { PluginTheme } from "@getpaseo/plugin";
 import type { TaskIssue } from "../../../shared/task-availability";
 import type { TasksLanguage } from "../i18n";
@@ -17,13 +18,13 @@ const labels: Record<TasksLanguage, Record<TaskIssue["code"], string>> = {
     checking: "正在检查可用性", host_unavailable: "主机暂时不可用", unsupported: "操作不可用", agent_missing: "任务已不存在",
     directory_missing: "工作目录不存在", directory_not_directory: "工作路径无效", directory_inaccessible: "目录无法访问",
     workspace_unavailable: "工作区已不可用", workspace_archived: "工作区已归档，请先取消归档", project_unavailable: "项目归属不可用", title_settings_invalid: "标题生成配置无效",
-    provider_unavailable: "Provider 不可用", model_unavailable: "标题模型不可用",
+    provider_unavailable: "Provider 不可用", provider_unrestricted: "该 Provider 无法禁止工具调用，请在设置中更换标题模型", model_unavailable: "标题模型不可用",
   },
   en: {
     checking: "Checking availability", host_unavailable: "Host temporarily unavailable", unsupported: "Operation unavailable", agent_missing: "Task no longer exists",
     directory_missing: "Working directory missing", directory_not_directory: "Invalid working path", directory_inaccessible: "Directory inaccessible",
     workspace_unavailable: "Workspace unavailable", workspace_archived: "Workspace archived; unarchive it first", project_unavailable: "Project unavailable", title_settings_invalid: "Invalid title settings",
-    provider_unavailable: "Provider unavailable", model_unavailable: "Title model unavailable",
+    provider_unavailable: "Provider unavailable", provider_unrestricted: "This provider cannot be kept from running tools; choose another title model in settings", model_unavailable: "Title model unavailable",
   },
 };
 
@@ -83,6 +84,7 @@ export function AvailabilityCorner(props: {
   onOpenChange?(open: boolean): void;
 }) {
   const { issue, language, hit } = props;
+  const home = useHomeDirectory();
   const [pinned, setPinned] = useState(false);
   const [focusShown, setFocusShown] = useState(false);
   const [hoverShown, setHoverShown] = useState(false);
@@ -122,7 +124,7 @@ export function AvailabilityCorner(props: {
     };
   }, [open]);
   const label = labels[language][issue.code];
-  const detail = issue.detail ? tildePath(issue.detail) : null;
+  const detail = issue.detail ? tildePath(issue.detail, home) : null;
   const accessibilityLabel = [label, detail, NOTE[language]].filter(Boolean).join("\n");
   // The rotated square's lower-left half, inside the clip, is the hit triangle.
   const diamond = hit * Math.SQRT2;

@@ -1,6 +1,6 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Animated, Modal, Platform, Pressable, ScrollView, StyleSheet, Text, View, useWindowDimensions } from "react-native";
-import { Icon } from "@getpaseo/plugin/client/react-native";
+import { Icon } from "@getpaseo/plugin/client/ui";
 import type { ExtendedThemeTokens } from "../components/theme-tokens";
 import { toolbarLabel } from "../i18n/toolbar-strings";
 import { useCopy } from "../ui/use-copy";
@@ -8,7 +8,7 @@ import { useReducedMotion } from "../ui/use-reduced-motion";
 import { useHover } from "../ui/use-hover";
 import { useInputCapabilities } from "../ui/use-input-capabilities";
 import { useEnhancerPreferences } from "../preferences";
-import type { CopyItem } from "./contracts";
+import type { CopyItem, DetailsForm } from "./contracts";
 import { detailsForm } from "./layout-model";
 import { DROPDOWN_REVEAL } from "../ui/tokens/motion";
 
@@ -28,7 +28,8 @@ export interface RowMenuProps {
   /** The row is the one the details panel shows: no "Open details". */
   detailsOpen?: boolean;
   tokens: ExtendedThemeTokens;
-  onOpen(): void;
+  /** Under a pointer the menu asks for the side form, which docks the panel beside the timeline. */
+  onOpen(form?: DetailsForm): void;
   onToggle(): void;
   onViewImage?(): void;
   onClose(): void;
@@ -69,7 +70,7 @@ export function RowMenu(props: RowMenuProps) {
     copies.filter((item) => item.text).map((item) => ({ ...item, run: () => void copy(item.text, { feedback: "toast", label: item.label }) })),
     [
       ...(props.readsImage && props.onViewImage ? [{ id: "viewer", label: "View image", icon: "Image", run: props.onViewImage }] : []),
-      ...(props.hasBody && !props.detailsOpen ? [{ id: "details", label: "Open details", icon: !capabilities.hover && bottomPanel ? "BottomSheet" : "PanelRight", run: props.onOpen }] : []),
+      ...(props.hasBody && !props.detailsOpen ? [{ id: "details", label: "Open details", icon: !capabilities.hover && bottomPanel ? "BottomSheet" : "PanelRight", run: () => props.onOpen(capabilities.hover ? "side" : undefined) }] : []),
       ...(props.hasBody ? [props.expanded
         ? { id: "collapse", label: "Collapse in timeline", icon: "ChevronUp", run: props.onToggle }
         : { id: "expand", label: "Expand in timeline", icon: "ChevronDown", run: props.onToggle }] : []),
@@ -159,7 +160,7 @@ function RowMenuItem(props: { label: string; icon: string; height: number; iconS
   const block = tokens.typography.block;
   return (
     <Pressable ref={ref} accessibilityRole="menuitem" accessibilityLabel={props.label} onPress={props.onPress} {...hoverProps}
-      style={({ pressed }) => ({ height: props.height, marginHorizontal: 6, paddingHorizontal: 8, borderRadius: 6,
+      style={({ pressed }) => ({ height: props.height, marginHorizontal: 6, paddingHorizontal: 8, borderRadius: props.height / 2,
         flexDirection: "row", alignItems: "center", gap: 8,
         backgroundColor: pressed || hovered ? tokens.v2.surface2 : "transparent" })}>
       <View style={{ flexShrink: 0 }}>{props.icon === "BottomSheet" ? (

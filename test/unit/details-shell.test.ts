@@ -13,6 +13,9 @@ const screen = vi.hoisted(() => ({ width: 390, height: 844 }));
 const caps = vi.hoisted(() => ({ hover: false, touch: true }));
 const motion = vi.hoisted(() => ({ reduced: false }));
 const timings = vi.hoisted(() => [] as { toValue: number; duration: number; native?: boolean }[]);
+const heldMotion = vi.hoisted(() => ({ enabled: false, pending: [] as {
+  toValue: number; duration: number; stopped: boolean; finish(): void;
+}[] }));
 
 vi.mock("react-native", async () => {
   const rn = await import("./helpers/rn-mock");
@@ -28,10 +31,16 @@ vi.mock("react-native", async () => {
       timing: (value: { setValue(next: number): void }, config: { toValue: number; duration: number; useNativeDriver: boolean }) => ({
         start(done?: (result: { finished: boolean }) => void) {
           timings.push({ toValue: config.toValue, duration: config.duration, native: config.useNativeDriver });
+          if (heldMotion.enabled && (config.duration === 240 || config.duration === 180)) {
+            const pending = { toValue: config.toValue, duration: config.duration, stopped: false,
+              finish() { if (!pending.stopped) { value.setValue(config.toValue); done?.({ finished: true }); } } };
+            heldMotion.pending.push(pending);
+            return;
+          }
           value.setValue(config.toValue);
           done?.({ finished: true });
         },
-        stop() {},
+        stop() { const pending = heldMotion.pending.findLast((item) => item.toValue === config.toValue && item.duration === config.duration && !item.stopped); if (pending) pending.stopped = true; },
       }),
     },
   };
@@ -45,10 +54,12 @@ vi.mock("../../client/ui/use-input-capabilities", () => ({
   },
 }));
 const clipboard = vi.hoisted(() => ({ copyText: vi.fn(async (_text: string) => {}) }));
-vi.mock("@getpaseo/plugin/client/react-native", async () => {
+vi.mock("../../client/state/home-directory", () => ({ useHomeDirectory: () => "/home/test" }));
+
+vi.mock("@getpaseo/plugin/client/ui", async () => {
   const rn = await import("./helpers/rn-mock");
   return { Icon: rn.View, ScrollView: rn.ScrollView, TextInput: rn.TextInput,
-    copyText: clipboard.copyText, useToast: () => ({ show: vi.fn(), error: vi.fn() }), useRevealedText: (text: string) => text };
+    copyText: clipboard.copyText, useToast: () => ({ show: vi.fn(), error: vi.fn() }) };
 });
 vi.mock("@getpaseo/plugin/client", () => ({
   useAgent: () => undefined, useWorkspace: () => undefined,
@@ -64,7 +75,7 @@ const fake = vi.hoisted(() => {
   const listeners = new Set<() => void>();
   const emit = () => listeners.forEach((listener) => listener());
   const box = {
-    state: { openId: null, form: "drawer", detent: "fit", fullscreen: false, lingerId: null } as State,
+    state: { openId: null, independent: false, form: "drawer", detent: "fit", fullscreen: false, lingerId: null } as State,
     blocks: [] as Entry[],
   };
   const set = (patch: Partial<State>) => {
@@ -73,7 +84,10 @@ const fake = vi.hoisted(() => {
   };
   const navigable = () => box.blocks.filter((entry) => entry.navigable && entry.hasBody);
   const api = {
-    open: vi.fn((_agent: string, id: string, options?: { detent?: "fit" | "full" }) => set({ openId: id, detent: options?.detent ?? "fit", fullscreen: false })),
+    open: vi.fn((_agent: string, id: string, options?: { detent?: "fit" | "full"; form?: State["form"] }) => set({
+      openId: id, detent: options?.detent ?? "fit", fullscreen: false,
+      docked: options?.form !== undefined ? options.form === "side" : box.state.openId !== null && box.state.docked === true,
+    })),
     close: vi.fn(() => set({ openId: null, lingerId: box.state.openId })),
     step: vi.fn((_agent: string, direction: -1 | 1) => {
       const list = navigable();
@@ -110,7 +124,7 @@ const fake = vi.hoisted(() => {
       return () => listeners.delete(listener);
     },
     reset() {
-      box.state = { openId: null, form: "drawer", detent: "fit", fullscreen: false, lingerId: null };
+      box.state = { openId: null, independent: false, form: "drawer", detent: "fit", fullscreen: false, lingerId: null };
       box.blocks = [];
       queue.length = 0;
     },
@@ -121,7 +135,9 @@ vi.mock("../../client/details/details-store", async () => {
   const { useSyncExternalStore } = await import("react");
   return {
     detailsApi: fake.api,
+    closeDetailsIfCurrent: (_agent: string, id: string) => { if (fake.box.state.openId === id) fake.api.close(); },
     useDetails: () => useSyncExternalStore(fake.subscribe, () => fake.box.state, () => fake.box.state),
+    useIndependentDetails: () => useSyncExternalStore(fake.subscribe, () => fake.box.state.independent, () => fake.box.state.independent),
     useMarkerPhase: () => "off",
     claimHostLease: fake.claim,
   };
@@ -141,6 +157,7 @@ vi.mock("../../client/details/block-registry", async () => {
 import { buildThemeTokens } from "../../client/components/theme-tokens";
 import { DetailsHostSlot } from "../../client/details/shell/details-host-slot";
 import { DetailsShellContext, type DetailsShellValue } from "../../client/details/contracts";
+import { TranslationSettingsParentCloseContext } from "../../client/translation/navigation";
 import { HoverPreviewContext, PreviewActionsContext, PreviewChromeContext, type PreviewActions } from "../../client/ui/hover-preview";
 import { getEnhancerPreferences, resetEnhancerPreferences, subscribeEnhancerPreferences, updateEnhancerPreferences } from "../../client/preferences";
 import { TextZoomContext } from "../../client/ui/text-zoom";
@@ -151,12 +168,13 @@ import { hasActiveDetailsKeyboard } from "../../client/details/keyboard";
 import { useDetailsBodyScroll, type DetailsBodyReport } from "../../client/details/shell/body-handover";
 import { claimContentTouch, contentOwnsTouch, resetContentTouches } from "../../client/details/touch-claim";
 import { CONTENT_HOLD_MS } from "../../client/details/shell/gestures";
-import { HoverPreviewBody } from "../../client/ui/hover-preview";
+import { HoverPreviewBody, HoverPreviewHeader } from "../../client/ui/hover-preview";
 import { ProseRedrawContext } from "../../client/ui/prose-text";
 import { useLineSelection } from "../../client/ui/line-selection";
 import { MarkdownView } from "../../client/components/markdown/markdown-view";
 import { PreviewLines } from "../../client/ui/preview-lines";
 import { DiffPreview, ToolOutput } from "../../client/components/tool-output";
+import { sidebarSurface } from "../../client/ui/tokens/sidebar-shadow";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 const tokens = buildThemeTokens({ surface0: "#fff", surface1: "#eee", surface2: "#ddd", border: "#ccc",
@@ -171,6 +189,7 @@ const seen = {
   chrome: "",
   inPreview: false,
   body: undefined as DetailsBodyReport | undefined,
+  closeForSettings: null as (() => void) | null,
 };
 function Probe({ id }: { id: string }) {
   seen.shell = useContext(DetailsShellContext);
@@ -178,6 +197,7 @@ function Probe({ id }: { id: string }) {
   seen.chrome = useContext(PreviewChromeContext);
   seen.inPreview = useContext(HoverPreviewContext);
   seen.body = useDetailsBodyScroll();
+  seen.closeForSettings = useContext(TranslationSettingsParentCloseContext);
   return createElement("Text", { testID: `content-${id}` }, id);
 }
 
@@ -195,6 +215,7 @@ function block(id: string, at: number, patch: Partial<Entry> = {}): Entry {
 // Web: every host node is this element; the layer binds Escape on its window.
 const web = {
   keydown: [] as ((event: unknown) => void)[],
+  outside: new Map<string, Set<(event: unknown) => void>>(),
   openPreviews: [] as unknown[],
   hidden: false,
   /** Where a native body was scrolled to. */
@@ -203,6 +224,8 @@ const web = {
   glides: [] as number[],
   row: 0,
   pane: null as { left: number; right: number; contentRight: number } | null,
+  reserveHost: false,
+  timelinePadding: "16px",
   /** Each node's inline `-webkit-app-region`, by test ID. */
   appRegion: new Map<string, string>(),
 };
@@ -229,17 +252,33 @@ function fakeElement(testID?: string): unknown {
   };
   const scroller = {
     parentElement: null, ownerDocument: null as unknown,
+    matches: () => web.reserveHost,
+    firstElementChild: null as unknown,
     scrollTop: 0, scrollHeight: 3000, clientHeight: 750,
     getBoundingClientRect: () => ({ top: 100, bottom: 850, height: 750, left: web.pane!.left, right: web.pane!.right }),
   };
-  const column = { ownerDocument: null as unknown, parentElement: scroller, getBoundingClientRect: () => ({ right: web.pane!.contentRight }) };
+  const column = { ownerDocument: null as unknown, parentElement: scroller, matches: () => false, getBoundingClientRect: () => ({ right: web.pane!.contentRight }) };
+  const content = { ownerDocument: null as unknown, style: {
+    getPropertyValue: () => "16px", getPropertyPriority: () => "",
+    setProperty: (_name: string, value: string) => { web.timelinePadding = value; },
+    removeProperty: () => { web.timelinePadding = ""; },
+  } };
+  scroller.firstElementChild = content;
   view.getComputedStyle = ((element: unknown) => ({
     overflowY: element === scroller ? "auto" : "visible",
     maxWidth: element === column ? "720px" : "none",
+    paddingRight: "16px",
   })) as typeof view.getComputedStyle;
-  const doc = { defaultView: view, querySelectorAll: () => web.openPreviews, addEventListener() {}, removeEventListener() {} };
+  const doc = { defaultView: view, querySelectorAll: () => web.openPreviews,
+    addEventListener(type: string, listener: (event: unknown) => void) {
+      if (!web.outside.has(type)) web.outside.set(type, new Set());
+      web.outside.get(type)!.add(listener);
+    },
+    removeEventListener(type: string, listener: (event: unknown) => void) { web.outside.get(type)?.delete(listener); },
+  };
   scroller.ownerDocument = doc;
   column.ownerDocument = doc;
+  content.ownerDocument = doc;
   return {
     setAttribute() {}, ownerDocument: doc, parentElement: testID === "details-pane-probe" && web.pane ? column : null,
     style: {
@@ -359,9 +398,12 @@ beforeEach(() => {
   caps.touch = true;
   motion.reduced = false;
   web.keydown = [];
+  web.outside.clear();
   web.openPreviews = [];
   web.hidden = false;
   web.pane = null;
+  web.reserveHost = false;
+  web.timelinePadding = "16px";
   web.appRegion.clear();
   web.scrolls = [];
   web.glides = [];
@@ -369,17 +411,58 @@ beforeEach(() => {
   timings.length = 0;
   seen.shell = null;
   seen.actions = null;
+  seen.closeForSettings = null;
   (globalThis as { __rnMockOS?: string }).__rnMockOS = "ios";
   fake.box.blocks = [block("a", 1), block("b", 2), block("c", 3)];
 });
 afterEach(() => {
+  heldMotion.enabled = false;
+  heldMotion.pending.length = 0;
   act(() => mounted.splice(0).forEach((renderer) => renderer.unmount()));
   delete (globalThis as { document?: unknown }).document;
   delete (globalThis as { __rnMockOS?: string }).__rnMockOS;
+  delete (globalThis as { __rnMockIsPad?: boolean }).__rnMockIsPad;
   vi.useRealTimers();
 });
 
 describe("DetailsHostSlot", () => {
+  it("closes a work side panel on an outside click and detaches its listener", async () => {
+    vi.useFakeTimers();
+    webDesktop();
+    web.pane = { left: 240, right: 1440, contentRight: 1000 };
+    fake.box.blocks = [block("work", 1, { dismissOnOutside: true })];
+    const renderer = render(slot());
+    await act(async () => fake.set({ openId: "work", independent: true }));
+    expect(byTestId(renderer, "details-side")).not.toBeNull();
+    const event = { button: 0, clientX: 10, clientY: 10, target: {}, composedPath: () => [] };
+    act(() => { web.outside.get("pointerdown")?.forEach((fn) => fn(event)); web.outside.get("click")?.forEach((fn) => fn(event)); });
+    expect(fake.api.close).not.toHaveBeenCalled();
+    act(() => { vi.advanceTimersByTime(0); });
+    expect(fake.api.close).toHaveBeenCalledOnce();
+    expect(fake.box.state.openId).toBeNull();
+    expect(web.outside.get("click")?.size ?? 0).toBe(0);
+  });
+  it("closes an ordinary block side panel on an outside click", async () => {
+    vi.useFakeTimers();
+    webDesktop();
+    web.pane = { left: 240, right: 1440, contentRight: 1000 };
+    fake.box.blocks = [block("a", 1)];
+    render(slot());
+    await act(async () => fake.set({ openId: "a" }));
+    const event = { button: 0, clientX: 10, clientY: 10, target: {}, composedPath: () => [] };
+    act(() => { web.outside.get("pointerdown")?.forEach((fn) => fn(event)); web.outside.get("click")?.forEach((fn) => fn(event)); });
+    act(() => { vi.advanceTimersByTime(0); });
+    expect(fake.box.state.openId).toBeNull();
+  });
+  it("lets translation settings close the containing details drawer", () => {
+    render(slot());
+    open("a");
+    expect(seen.closeForSettings).not.toBeNull();
+    act(() => seen.closeForSettings!());
+    expect(fake.api.close).toHaveBeenCalledWith(AGENT);
+    expect(fake.box.state.openId).toBeNull();
+  });
+
   it("draws nothing and claims no lease with block details off", () => {
     updateEnhancerPreferences({ blockDetails: false });
     fake.set({ openId: "a" });
@@ -423,7 +506,182 @@ describe("DetailsHostSlot", () => {
 });
 
 describe("form", () => {
-  it.each([1280, 1400, 1560, 1799, 1800, 1920])("uses only measured empty space for a side panel at %i px", async (width) => {
+  it("slides the desktop side panel out and reverses an interrupted close", async () => {
+    webDesktop();
+    web.pane = { left: 240, right: 1440, contentRight: 1000 };
+    fake.box.blocks = [block("work", 1, { dismissOnOutside: true })];
+    heldMotion.enabled = true;
+    const renderer = render(slot());
+    await act(async () => fake.api.open(AGENT, "work"));
+    expect(heldMotion.pending.map(({ toValue, duration }) => [toValue, duration])).toContainEqual([1, 240]);
+    act(() => heldMotion.pending.at(-1)!.finish());
+    act(() => fake.api.close());
+    const closing = heldMotion.pending.at(-1)!;
+    expect([closing.toValue, closing.duration]).toEqual([0, 180]);
+    expect(byTestId(renderer, "details-side")).not.toBeNull();
+    expect(byTestId(renderer, "details-side")!.props).toMatchObject({ pointerEvents: "none", "aria-hidden": true });
+    act(() => fake.api.open(AGENT, "work"));
+    expect(closing.stopped).toBe(true);
+    expect(byTestId(renderer, "details-side")!.props).toMatchObject({ pointerEvents: "auto", "aria-hidden": false });
+    expect(heldMotion.pending.at(-1)).toMatchObject({ toValue: 1, duration: 240 });
+    act(() => closing.finish());
+    expect(byTestId(renderer, "details-side")).not.toBeNull();
+    act(() => fake.api.close());
+    act(() => heldMotion.pending.at(-1)!.finish());
+    expect(byTestId(renderer, "details-side")).toBeNull();
+  });
+
+  it("closes the desktop side panel immediately with reduced motion", async () => {
+    webDesktop();
+    web.pane = { left: 240, right: 1440, contentRight: 1000 };
+    motion.reduced = true;
+    fake.box.blocks = [block("work", 1)];
+    const renderer = render(slot());
+    await act(async () => fake.api.open(AGENT, "work"));
+    expect(byTestId(renderer, "details-side")).not.toBeNull();
+    act(() => fake.api.close());
+    expect(byTestId(renderer, "details-side")).toBeNull();
+  });
+
+  it("reserves the desktop timeline for work details, aligns the chrome and restores it on close", async () => {
+    webDesktop();
+    screen.width = 1280;
+    web.reserveHost = true;
+    web.pane = { left: 240, right: 1280, contentRight: 1280 };
+    fake.box.blocks = [block("work", 1, { reserveTimeline: true, render: () => createElement(React.Fragment, null,
+      createElement(HoverPreviewHeader, { tokens, icon: "List" }),
+      createElement(HoverPreviewBody, null, createElement(Probe, { id: "work" }))) })];
+    const renderer = render(slot());
+    await act(async () => fake.api.open(AGENT, "work"));
+    expect(byTestId(renderer, "details-side")).not.toBeNull();
+    expect(byTestId(renderer, "details-floating")).toBeNull();
+    expect(web.timelinePadding).toBe("calc(16px + 420px)");
+    expect(flat(byTestId(renderer, "details-header")!.props.style)).toMatchObject({
+      minHeight: 36, paddingVertical: 0, borderBottomWidth: 1, borderBottomColor: tokens.border,
+    });
+    expect(flat(byTestId(renderer, "details-toolbar")!.props.style)).toMatchObject({
+      minHeight: 36, borderBottomWidth: 1, borderBottomColor: tokens.border,
+    });
+    expect(flat(byTestId(renderer, "details-side")!.props.style)).toMatchObject(sidebarSurface(tokens.surface0, tokens.isDark));
+    expect(flat(byTestId(renderer, "hover-preview-body")!.props.style).marginTop).toBe(0);
+    act(() => seen.shell!.toggleFullscreen!());
+    expect(web.timelinePadding).toBe("calc(16px + 624px)");
+    act(() => fake.api.close());
+    expect(web.timelinePadding).toBe("16px");
+  });
+
+  it("docks an ordinary detail opened in the panel beside the timeline even without an empty gutter", async () => {
+    webDesktop();
+    screen.width = 1280;
+    web.reserveHost = true;
+    web.pane = { left: 240, right: 1280, contentRight: 1280 };
+    fake.box.blocks = [block("a", 1)];
+    const renderer = render(slot());
+    await act(async () => fake.api.open(AGENT, "a", { form: "side" }));
+    expect(byTestId(renderer, "details-side")).not.toBeNull();
+    expect(byTestId(renderer, "details-floating")).toBeNull();
+    expect(web.timelinePadding).toBe("calc(16px + 420px)");
+    act(() => fake.api.close());
+    expect(web.timelinePadding).toBe("16px");
+    // A plain open of the same detail keeps the floating form.
+    await act(async () => fake.api.open(AGENT, "a"));
+    expect(byTestId(renderer, "details-floating")).not.toBeNull();
+    expect(web.timelinePadding).toBe("16px");
+  });
+
+  it("keeps the floating form without reserving the timeline when the desktop pane is too narrow", async () => {
+    webDesktop();
+    screen.width = 1000;
+    web.reserveHost = true;
+    web.pane = { left: 240, right: 1000, contentRight: 1000 };
+    fake.box.blocks = [block("work", 1, { reserveTimeline: true })];
+    const renderer = render(slot());
+    await act(async () => fake.api.open(AGENT, "work"));
+    expect(byTestId(renderer, "details-floating")).not.toBeNull();
+    expect(web.timelinePadding).toBe("16px");
+  });
+
+  it("releases the reserved timeline when switching from work to another detail", async () => {
+    webDesktop();
+    screen.width = 1280;
+    web.reserveHost = true;
+    web.pane = { left: 240, right: 1280, contentRight: 1280 };
+    fake.box.blocks = [block("work", 1, { reserveTimeline: true }), block("other", 2)];
+    const renderer = render(slot());
+    await act(async () => fake.api.open(AGENT, "work"));
+    expect(web.timelinePadding).toBe("calc(16px + 420px)");
+    await act(async () => fake.api.open(AGENT, "other"));
+    expect(web.timelinePadding).toBe("16px");
+    expect(byTestId(renderer, "details-floating")).not.toBeNull();
+  });
+
+  it("updates reserved space when the timeline pane narrows and widens", async () => {
+    webDesktop();
+    screen.width = 1280;
+    web.reserveHost = true;
+    web.pane = { left: 240, right: 1280, contentRight: 1280 };
+    let changed!: () => void;
+    vi.stubGlobal("ResizeObserver", class {
+      constructor(callback: () => void) { changed = callback; }
+      observe() {}
+      disconnect() {}
+    });
+    try {
+      fake.box.blocks = [block("work", 1, { reserveTimeline: true })];
+      const renderer = render(slot());
+      await act(async () => fake.api.open(AGENT, "work"));
+      expect(web.timelinePadding).toBe("calc(16px + 420px)");
+      web.pane.left = 500;
+      await act(async () => changed());
+      expect(byTestId(renderer, "details-floating")).not.toBeNull();
+      expect(web.timelinePadding).toBe("16px");
+      web.pane.left = 240;
+      await act(async () => changed());
+      expect(byTestId(renderer, "details-side")).not.toBeNull();
+      expect(web.timelinePadding).toBe("calc(16px + 420px)");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it.each([[1000, "details-side"], [1100, "details-floating"]] as const)("waits for desktop space before mounting %s", async (contentRight, panel) => {
+    webDesktop();
+    web.pane = { left: 240, right: 1440, contentRight };
+    const renderer = render(slot());
+    open("a");
+    expect(byTestId(renderer, "details-floating")).toBeNull();
+    await act(async () => {});
+    expect(byTestId(renderer, panel)).not.toBeNull();
+  });
+  it.each([[1440, 1000, "details-side"], [1280, 1000, "details-floating"]] as const)(
+    "shows independent work in %s px layout with ordinary details disabled", async (width, contentRight, panel) => {
+      webDesktop();
+      screen.width = width;
+      web.pane = { left: 240, right: width, contentRight };
+      updateEnhancerPreferences({ blockDetails: false });
+      const renderer = render(slot());
+      await act(async () => fake.set({ openId: "a", independent: true }));
+      expect(byTestId(renderer, panel)).not.toBeNull();
+      expect(byTestId(renderer, "content-a")).not.toBeNull();
+    },
+  );
+  it("exposes the resize handle on an iPad side panel but not on an iPhone", () => {
+    (globalThis as { __rnMockIsPad?: boolean }).__rnMockIsPad = true;
+    screen.width = 1194;
+    screen.height = 834;
+    const renderer = render(slot());
+    open("a");
+    expect(byTestId(renderer, "details-side-native-edge")).not.toBeNull();
+    act(() => renderer.unmount());
+    (globalThis as { __rnMockIsPad?: boolean }).__rnMockIsPad = false;
+    screen.width = 844;
+    screen.height = 390;
+    const phone = render(slot());
+    open("a");
+    expect(byTestId(phone, "details-side")).not.toBeNull();
+    expect(byTestId(phone, "details-side-native-edge")).toBeNull();
+  });
+  it.each([1280, 1400, 1560, 1799, 1800, 1920])("starts in empty space and widens on request at %i px", async (width) => {
     webDesktop();
     screen.width = width;
     web.pane = { left: 240, right: width, contentRight: (width + 240 + 720) / 2 };
@@ -436,9 +694,12 @@ describe("form", () => {
       return;
     }
     const panelWidth = () => Number(flat(byTestId(renderer, "details-side")!.props.style).width);
-    expect(panelWidth()).toBeLessThanOrEqual(space);
+    const initial = panelWidth();
+    expect(initial).toBeLessThanOrEqual(space);
     act(() => seen.shell!.toggleFullscreen!());
-    expect(panelWidth()).toBeLessThanOrEqual(space);
+    expect(panelWidth()).toBe(Math.max(initial, Math.round((width - 240) * 0.6)));
+    act(() => seen.shell!.toggleFullscreen!());
+    expect(panelWidth()).toBe(initial);
   });
 
   it("remeasures the pane and column without a window resize and releases its observer", async () => {
@@ -514,7 +775,7 @@ describe("form", () => {
     { os: "ios", width: 834, height: 1194, hover: false, form: "floating" },
     { os: "ios", width: 1194, height: 834, hover: false, form: "side" },
     { os: "web", width: 1440, height: 900, hover: true, form: "floating" },
-  ])("$width×$height draws the $form", ({ os, width, height, hover, form }) => {
+  ])("$width×$height draws the $form", async ({ os, width, height, hover, form }) => {
     (globalThis as { __rnMockOS?: string }).__rnMockOS = os;
     screen.width = width;
     screen.height = height;
@@ -522,6 +783,7 @@ describe("form", () => {
     caps.touch = !hover;
     const renderer = render(slot());
     open("a");
+    await act(async () => {});
     expect(byTestId(renderer, `details-${form}`)).not.toBeNull();
     expect(seen.shell!.form).toBe(form);
     expect(fake.box.state.form).toBe(form);
@@ -846,10 +1108,11 @@ describe("tablet swipe hints", () => {
     act(() => seen.shell!.close());
   });
 
-  it("does not add swipe hints to a pointer-only desktop panel", () => {
+  it("does not add swipe hints to a pointer-only desktop panel", async () => {
     webDesktop();
     const renderer = render(slot());
     open("b");
+    await act(async () => {});
     expect(byTestId(renderer, "details-swipe-previous")).toBeNull();
     expect(byTestId(renderer, "details-swipe-next")).toBeNull();
     act(() => seen.shell!.close());
@@ -1077,6 +1340,7 @@ describe("closing", () => {
     const keys = webDesktop();
     render(slot());
     open("b");
+    await act(async () => {});
     keys.press("ArrowRight");
     expect(fake.api.step).toHaveBeenCalledWith(AGENT, 1);
     expect(seen.shell!.entry.id).toBe("c");
@@ -1448,7 +1712,7 @@ describe("content gestures in the drawer", () => {
       && typeof node.props.onTouchStart === "function" && typeof node.props.onMoveShouldSetResponder === "function")[0]!.props as Handlers;
     const touch = (pageX: number, pageY: number, timestamp: number) => ({ nativeEvent: { pageX, pageY, timestamp, touches: [{}] } });
     const highlighted = () => renderer.root.findAll((node) => (node.type as unknown) === "Text"
-      && node.props.testID === "markdown-table-cell" && flat(node.props.style).backgroundColor === tokens.selectionFill).length;
+      && node.props.testID === "markdown-table-cell" && flat(node.props.style).backgroundColor === tokens.textSelection).length;
     web.row = 0;
     act(() => {
       panel.onTouchStartCapture!(event(10, 440, 1000));
@@ -1807,7 +2071,7 @@ describe("iOS text after the slide in", () => {
 
 describe("a pinch in the phone drawer", () => {
   type Handlers = Record<string, (...args: unknown[]) => unknown>;
-  const zooms: number[] = [];
+  const zooms: (number | { scale: number })[] = [];
   let zoomMounts = 0;
   function ZoomProbe() {
     const zoom = useContext(TextZoomContext);
@@ -1960,7 +2224,7 @@ describe("a pinch in the phone drawer", () => {
     expect(web.scrolls.at(-1)).toBe(4575);
   });
 
-  it("keeps the saved size within 12 and 26 points", () => {
+  it("keeps the saved size within 9 and 26 points", () => {
     const { panel, shown } = drawer("pinch-far");
     act(() => {
       panel().onTouchStart!(fingers(500, 600));
@@ -1973,8 +2237,8 @@ describe("a pinch in the phone drawer", () => {
       panel().onTouchMove!(fingers(545, 555));
       panel().onTouchEnd!(fingers());
     });
-    expect(getEnhancerPreferences().detailsFontSize).toBe(12);
-    expect(shown()).toBe("14");
+    expect(getEnhancerPreferences().detailsFontSize).toBe(9);
+    expect(shown()).toBe(String(Math.round(16 * 9 / 14)));
   });
 
   it("lets go of the drawer's pull once a second finger comes down", () => {
@@ -2000,7 +2264,7 @@ describe("a pinch in the phone drawer", () => {
     expect(fake.api.close).not.toHaveBeenCalled();
   });
 
-  it("draws the saved size in the drawer, and leaves web unchanged", () => {
+  it("draws the saved size in the drawer and scales web details", async () => {
     updateEnhancerPreferences({ detailsFontSize: 19 });
     const { panel, shown } = drawer("pinch-saved");
     expect(shown()).toBe("22");
@@ -2010,8 +2274,55 @@ describe("a pinch in the phone drawer", () => {
     fake.box.blocks = [block("pinch-side", 1, { render: zoomed })];
     const side = render(slot());
     open("pinch-side");
-    expect(byTestId(side, "zoom-probe")!.props.children).toBe("0");
+    await act(async () => {});
+    expect(zooms.at(-1)).toEqual({ scale: 19 / 14 });
+    act(() => updateEnhancerPreferences({ detailsFontSize: 14 }));
+    expect(zooms.at(-1)).toBe(0);
     expect(byTestId(side, "details-body")!.props.onTouchStart).toBeUndefined();
+  });
+
+  it("applies desktop toolbar changes and keeps the size when changing blocks", async () => {
+    webDesktop();
+    const renderBlock = () => createElement(React.Fragment, null,
+      createElement(HoverPreviewHeader, { tokens, icon: "FileText" }), zoomed());
+    fake.box.blocks = [block("zoom-a", 1, { render: renderBlock }), block("zoom-b", 2, { render: renderBlock })];
+    const renderer = render(slot());
+    open("zoom-a");
+    await act(async () => {});
+    const button = (label: string) => renderer.root.find((node) => typeof node.type === "string" && node.props.accessibilityLabel === label);
+    act(() => button("Increase text size").props.onPress());
+    expect(getEnhancerPreferences().detailsFontSize).toBe(15);
+    expect(zooms.at(-1)).toEqual({ scale: 15 / 14 });
+    act(() => fake.api.open(AGENT, "zoom-b"));
+    expect(zooms.at(-1)).toEqual({ scale: 15 / 14 });
+    act(() => button("Decrease text size").props.onPress());
+    expect(zooms.at(-1)).toBe(0);
+    act(() => button("Increase text size").props.onPress());
+    act(() => button("Reset zoom").props.onPress());
+    expect(getEnhancerPreferences().detailsFontSize).toBe(14);
+    expect(zooms.at(-1)).toBe(0);
+  });
+
+  it("changes and resets desktop text size from the keyboard within its bounds", async () => {
+    const keys = webDesktop();
+    fake.box.blocks = [block("keyboard-zoom", 1, { render: zoomed })];
+    render(slot());
+    open("keyboard-zoom");
+    await act(async () => {});
+    keys.press("+");
+    expect(getEnhancerPreferences().detailsFontSize).toBe(15);
+    expect(zooms.at(-1)).toEqual({ scale: 15 / 14 });
+    keys.press("-");
+    expect(getEnhancerPreferences().detailsFontSize).toBe(14);
+    act(() => updateEnhancerPreferences({ detailsFontSize: 26 }));
+    keys.press("+");
+    expect(getEnhancerPreferences().detailsFontSize).toBe(26);
+    act(() => updateEnhancerPreferences({ detailsFontSize: 9 }));
+    keys.press("-");
+    expect(getEnhancerPreferences().detailsFontSize).toBe(9);
+    keys.press("0");
+    expect(getEnhancerPreferences().detailsFontSize).toBe(14);
+    expect(zooms.at(-1)).toBe(0);
   });
 
   it.each([
@@ -2065,6 +2376,59 @@ describe("a pinch in the phone drawer", () => {
     expect(byTestId(renderer, "details-zoom-badge")).not.toBeNull();
     press("reset");
     expect(byTestId(renderer, "details-zoom-reset")).not.toBeNull();
+  });
+
+  it.each(["ios", "android"])("offers phone text size steps in the %s drawer toolbar, folding them where the copies need room", async (os) => {
+    vi.useFakeTimers();
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = os;
+    screen.width = 390;
+    screen.height = 844;
+    updateEnhancerPreferences({ detailsFontSize: 14 });
+    const renderBlock = () => createElement(React.Fragment, null,
+      createElement(HoverPreviewHeader, { tokens, icon: "FileText" }), zoomed());
+    fake.box.blocks = [block("phone-toolbar-zoom", 1, { render: renderBlock })];
+    const renderer = render(slot());
+    open("phone-toolbar-zoom");
+    await act(async () => {});
+    expect(byTestId(renderer, "details-drawer")).not.toBeNull();
+    const button = (label: string) => renderer.root.findAll((node) => typeof node.type === "string" && node.props.accessibilityLabel === label)[0];
+    const startLabels = () => byTestId(renderer, "details-toolbar-zoom")!.findAll((node) => typeof node.type === "string"
+      && typeof node.props.accessibilityLabel === "string").map((node) => node.props.accessibilityLabel);
+    const size = () => byTestId(renderer, "details-toolbar-zoom")!.findAll((node) => typeof node.props.children === "number")[0]!.props.children;
+    expect(startLabels()).toEqual(["Decrease text size", "Reset zoom", "Increase text size"]);
+    expect(size()).toBe(14);
+    act(() => button("Increase text size")!.props.onPress());
+    // The toolbar counts the step at once and saves it once the presses pause; the badge stays down.
+    expect(size()).toBe(15);
+    expect(byTestId(renderer, "details-zoom-badge")).toBeNull();
+    act(() => { vi.advanceTimersByTime(150); });
+    expect(getEnhancerPreferences().detailsFontSize).toBe(15);
+    expect(byTestId(renderer, "zoom-probe")!.props.children).toBe(String(Math.round(16 * 15 / 14)));
+    act(() => button("Reset zoom")!.props.onPress());
+    act(() => { vi.advanceTimersByTime(150); });
+    expect(getEnhancerPreferences().detailsFontSize).toBe(14);
+    act(() => updateEnhancerPreferences({ detailsFontSize: 9 }));
+    expect(button("Decrease text size")!.props.accessibilityState?.disabled ?? button("Decrease text size")!.props.disabled).toBe(true);
+    act(() => updateEnhancerPreferences({ detailsFontSize: 14 }));
+
+    // A toolbar too narrow for − / size / + and one more button keeps one text size button.
+    const layout = (id: string, width: number) => act(() => byTestId(renderer, id)!.props.onLayout({ nativeEvent: { layout: { width, height: 44 } } }));
+    // Line wrap, then the three controls; the copies need at least one 36 button after them.
+    layout("details-toolbar-start", 36 + 3 * 36 + 2 * 4);
+    layout("details-toolbar-zoom", 3 * 36 + 2 * 4);
+    layout("details-toolbar", 2 * 4 + 36 + 3 * 36 + 2 * 4 + 8 + 36);
+    expect(startLabels()).toEqual(["Decrease text size", "Reset zoom", "Increase text size"]);
+    layout("details-toolbar", 2 * 4 + 36 + 3 * 36 + 2 * 4 + 8 + 35);
+    expect(startLabels()).toEqual(["Text size"]);
+    // Folded, the measured group is narrower; the choice does not flip back.
+    layout("details-toolbar-zoom", 36);
+    layout("details-toolbar-start", 36 + 36);
+    expect(startLabels()).toEqual(["Text size"]);
+    act(() => button("Text size")!.props.onPress());
+    expect(byTestId(renderer, "details-zoom-badge")).not.toBeNull();
+    act(() => byTestId(renderer, "details-zoom-increase")!.props.onPress());
+    act(() => { vi.advanceTimersByTime(150); });
+    expect(getEnhancerPreferences().detailsFontSize).toBe(15);
   });
 
   it("keeps tablet zoom across a side-to-floating layout change", () => {

@@ -1,3 +1,4 @@
+vi.mock("../../client/state/home-directory", () => ({ useHomeDirectory: () => undefined }));
 import { afterEach, describe, expect, it, vi } from "vitest";
 import React from "react";
 import TestRenderer, { act, type ReactTestInstance } from "react-test-renderer";
@@ -11,7 +12,7 @@ vi.mock("react-native", async () => {
   const rn = await import("./helpers/rn-mock");
   return { ...rn, Platform: { ...rn.Platform, get OS() { return rn.Platform.OS; }, get isPad() { return device.tablet; } } };
 });
-vi.mock("@getpaseo/plugin/client/react-native", () => ({
+vi.mock("@getpaseo/plugin/client/ui", () => ({
   Icon: (props: Record<string, unknown>) => React.createElement("Icon", props),
   copyText: async () => {},
   useToast: () => ({ show() {}, error() {} }),
@@ -26,6 +27,9 @@ import { CARD_PRESETS } from "../../shared/tasks-settings";
 import { BOARD_STRINGS } from "../../client/tasks/board/strings";
 import { permissionButtons } from "../../client/tasks/actions";
 import { TasksTypographyScale } from "../../client/tasks/typography";
+import { RoundButton } from "../../client/tasks/board/board-parts";
+import { hoverFill } from "../../client/tasks/hover-fill";
+import { HoverControl } from "../../client/tasks/hover-control";
 
 const motion = vi.hoisted(() => ({ reduced: false }));
 vi.mock("../../client/ui/use-reduced-motion", () => ({
@@ -85,6 +89,45 @@ function hold(button: ReactTestInstance, ms = 100) {
 function release(button: ReactTestInstance) {
   act(() => { button.props.onPressOut?.({}); button.props.onTouchEnd?.({}); });
 }
+
+describe("shared Tasks feedback", () => {
+  it.each([
+    ["light", "#ffffff", "#1b1b1f"],
+    ["dark", "#303033", "#f0f0f0"],
+    ["selected", "#dfe8ff", "#1b1b1f"],
+  ])("mixes the actual %s surface on hover and press", async (_name, base, foreground) => {
+    const root = await render(<HoverControl base={base} foreground={foreground} rest={base} onPress={() => {}} />);
+    const button = root.findByType(Pressable);
+    expect(style(button, false).backgroundColor).toBe(base);
+    act(() => button.props.onHoverIn({}));
+    expect(style(button, false).backgroundColor).toBe(hoverFill(base, foreground, true, false));
+    expect(style(button, true).backgroundColor).toBe(hoverFill(base, foreground, true, true));
+    act(() => button.props.onHoverOut({}));
+    expect(style(button, false).backgroundColor).toBe(base);
+  });
+  it("does not paint feedback on disabled controls", async () => {
+    const root = await render(<HoverControl base="#ffffff" foreground="#1b1b1f" disabled onPress={() => {}} />);
+    const button = root.findByType(Pressable);
+    act(() => button.props.onHoverIn({}));
+    expect(style(button, true).backgroundColor).toBe("transparent");
+  });
+});
+
+describe("mobile toolbar feedback", () => {
+  it.each(["ios", "android"])("uses the shared press fill without scaling under reduced motion on %s", async (os) => {
+    vi.stubGlobal("__rnMockOS", os);
+    vi.useFakeTimers();
+    motion.reduced = true;
+    const onPress = vi.fn();
+    const root = await render(<RoundButton icon="Search" label="Search" theme={theme} borderless onPress={onPress} />);
+    const button = root.findByType(Pressable);
+    hold(button);
+    expect(StyleSheet.flatten(button.props.style).transform).toBeUndefined();
+    expect(StyleSheet.flatten(button.find((node) => (node.type as unknown) === "View").props.style).backgroundColor).toBe(hoverFill(theme.colors.surface0, theme.colors.foreground, false, true));
+    release(button);
+    expect(StyleSheet.flatten(button.find((node) => (node.type as unknown) === "View").props.style).boxShadow).toBeFalsy();
+  });
+});
 
 describe("mobile card action feedback", () => {
   it.each(["scroll", "pan", "cancel"])("suppresses a %s gesture and accepts the next quick tap", async (kind) => {
@@ -306,23 +349,36 @@ describe("mobile card action feedback", () => {
 
 describe("phone sheet action size", () => {
   it.each([
-    { os: "web", sidebar: true, font: 12, height: 36, radius: 8, icon: 14 },
-    { os: "web", sidebar: false, font: 12, height: 40, radius: 10, icon: 16 },
-    { os: "ios", sidebar: true, font: 12, height: 36, radius: 8, icon: 14 },
-  ])("sizes archive and open labels for $os sidebar=$sidebar", async ({ os, sidebar, font, height, radius, icon }) => {
+    { os: "web", sidebar: true, font: 12, height: 34, radius: 8, icon: 14 },
+    { os: "web", sidebar: false, font: 12, height: 34, radius: 10, icon: 14 },
+    { os: "ios", sidebar: true, font: 12, height: 36, radius: 8, icon: 16 },
+    { os: "android", sidebar: true, smallTablet: true, font: 12, height: 36, radius: 10, icon: 16 },
+    { os: "android", sidebar: true, smallTablet: false, font: 12, height: 36, radius: 10, icon: 16 },
+    { os: "android", sidebar: false, font: 12, height: 36, radius: 10, icon: 16 },
+  ])("sizes archive and open labels for $os sidebar=$sidebar", async ({ os, sidebar, smallTablet, font, height, radius, icon }) => {
     vi.stubGlobal("__rnMockOS", os);
     device.tablet = os === "ios";
     const card = sample("sample-done");
     const root = await render(<DetailActionBar card={card} theme={theme} language="zh" strings={BOARD_STRINGS.zh.sidebar}
-      sidebar={sidebar} archive={{ pending: () => false, press() {} }} onOpen={() => {}} />);
+      sidebar={sidebar} smallTablet={smallTablet} archive={{ pending: () => false, press() {} }} onOpen={() => {}} />);
     const buttons = root.findAllByType(Pressable);
     expect(buttons).toHaveLength(2);
     for (const button of buttons) {
       expect(style(button, false)).toMatchObject({ height, borderRadius: radius });
+      if (os === "android" && button.props.testID === "detail-bar-open") expect(style(button, false)).toMatchObject({ flexGrow: 1, paddingHorizontal: 12 });
       expect(button.findAll((node) => (node.type as unknown) === "Icon").every((mark) => mark.props.size === icon)).toBe(true);
       const label = button.find((node) => (node.type as unknown) === "Text");
       expect(StyleSheet.flatten(label.props.style).fontSize).toBe(font);
     }
+  });
+
+  it("keeps the Android sidebar's icon-only open action at the touch size", async () => {
+    vi.stubGlobal("__rnMockOS", "android");
+    const card = sample("sample-input");
+    const root = await render(<DetailActionBar card={card} theme={theme} language="en" strings={BOARD_STRINGS.en.sidebar}
+      sidebar smallTablet onOpen={() => {}} onPermission={() => {}} permissionButtons={permissionButtons(card.permission!, "en")} />);
+    const open = root.findAllByType(Pressable).find((button) => button.props.testID === "detail-bar-open")!;
+    expect(style(open, false)).toMatchObject({ width: 36, height: 36 });
   });
 
   it.each([1, 1.5])("uses smaller iPad archive and open actions at font scale %s", async (factor) => {
@@ -337,8 +393,8 @@ describe("phone sheet action size", () => {
     const buttons = root.findAllByType(Pressable);
     expect(buttons).toHaveLength(2);
     for (const button of buttons) {
-      expect(style(button, false)).toMatchObject({ height: Math.round(36 * factor), borderRadius: 8, paddingHorizontal: 10, gap: 5 });
-      expect(button.findAll((node) => (node.type as unknown) === "Icon").every((icon) => icon.props.size === 14)).toBe(true);
+      expect(style(button, false)).toMatchObject({ height: Math.round(36 * factor), borderRadius: 8, paddingHorizontal: 10, gap: 4 });
+      expect(button.findAll((node) => (node.type as unknown) === "Icon").every((icon) => icon.props.size === 16)).toBe(true);
       const label = button.find((node) => (node.type as unknown) === "Text");
       expect(StyleSheet.flatten(label.props.style).fontSize).toBe(Math.round(12 * factor));
       button.props.onPress();
@@ -391,21 +447,21 @@ describe("phone sheet action size", () => {
     vi.useFakeTimers();
     for (const button of buttons) {
       const rest = StyleSheet.flatten(button.props.style);
-      expect(rest).toMatchObject({ height: Math.round((tablet ? 36 : 40) * factor), borderRadius: tablet ? 8 : 10 });
+      expect(rest).toMatchObject({ height: Math.round(36 * factor), borderRadius: tablet ? 8 : 10 });
       expect(rest.boxShadow).toBeFalsy();
-      // A finger held still: a bar button wider than it shows the raised shadow; the square Open is covered.
+      // A finger held still receives the same theme-relative fill on every control.
       hold(button);
       const held = StyleSheet.flatten(button.props.style);
-      expect(held.backgroundColor).toBe(rest.backgroundColor);
-      expect(held.boxShadow).toBe(button.props.testID === "detail-bar-open" ? undefined : tokens.card.buttonShadowHover);
+      expect(held.backgroundColor).toBe(hoverFill(tokens.card.background, tokens.foreground, false, true));
+      expect(held.boxShadow ?? "").not.toContain(tokens.card.buttonShadowHover);
       release(button);
-      expect(StyleSheet.flatten(button.props.style).boxShadow).toBeFalsy();
+      expect(StyleSheet.flatten(button.props.style).backgroundColor).toBe(rest.backgroundColor);
       const icons = button.findAll((node) => (node.type as unknown) === "Icon");
-      expect(icons.every((icon) => icon.props.size === (tablet ? 14 : 16))).toBe(true);
+      expect(icons.every((icon) => icon.props.size === 16)).toBe(true);
     }
     vi.useRealTimers();
     const open = buttons.find((button) => button.props.testID === "detail-bar-open")!;
-    expect(style(open, false).width).toBe(Math.round((tablet ? 36 : 40) * factor));
+    expect(style(open, false).width).toBe(Math.round(36 * factor));
     const allow = buttons.find((button) => button.props.accessibilityLabel === "Allow")!;
     expect(style(allow, false).paddingHorizontal).toBe(tablet ? 10 : 12);
     const label = allow.find((node) => (node.type as unknown) === "Text");

@@ -2,11 +2,22 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { PaseoApi } from "@getpaseo/client";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createTitleGenerator, registerTitleGeneration } from "../../server/tasks/title-generation";
+import { helperRestrictionsFor, restrictedHelperConfig } from "../../server/helper-restrictions";
 import { DEFAULT_TITLE_PROMPT, titleGenerationSettingsSchema, titleModelsRpc } from "../../shared/title-generation";
 
+// Codex helpers read the user's Codex config; keep tests off the real one.
+beforeEach(() => { vi.stubEnv("CODEX_HOME", "/nonexistent/better-paseo-test-codex-home"); });
+afterEach(() => { vi.unstubAllEnvs(); });
+
 const directories: string[] = [];
+// The restriction fields every helper config carries; the fixture lists no modes.
+const restricted = (provider: string) => {
+  const restrictions = helperRestrictionsFor(provider, []);
+  if (!restrictions.supported) throw new Error(`${provider} is not restricted`);
+  return restrictedHelperConfig(restrictions);
+};
 afterEach(async () => {
   for (const directory of directories.splice(0)) await rm(directory, { recursive: true, force: true });
 });
@@ -21,7 +32,7 @@ async function fixture() {
     live.handler = handler;
     return Object.assign(live.unsubscribe, { ready: Promise.resolve() });
   });
-  const create = vi.fn(async () => ({ id: "helper", run, timeline: { subscribe } }));
+  const create = vi.fn(async () => ({ id: "helper", run, timeline: { subscribe }, waitForFinish: run, respondToPermission: vi.fn(async () => {}), refresh: vi.fn(async () => null) }));
   const workspace = vi.fn(async () => ({ agents: { create }, archive }));
   const original = { project: { projectKey: "source-project" } as { projectKey: string } | null, agent: { title: "Original", cwd: directory, workspaceId: "source-ws", archivedAt: null as string | null,
     provider: "codex", model: "gpt-5.5" as string | null, thinkingOptionId: "high" as string | null, effectiveThinkingOptionId: "xhigh" as string | null } };
@@ -45,8 +56,9 @@ async function fixture() {
   ] }));
   const refreshWorkspace = vi.fn(async (): Promise<{ projectId: string; name: string } | null> => ({ projectId: "source-project", name: "Other workspace" }));
   const setTitle = vi.fn(async (_title: string) => ({ title: _title }));
-  const snapshot = vi.fn(async () => ({ entries: [{ provider: "codex", enabled: true, status: "ready" }, { provider: "claude", enabled: true, status: "ready" }] }));
-  const api = { providers: { listModels, snapshot }, agents: { ref: vi.fn(() => ({ refresh, timeline: { refetch: timeline } })) }, workspaces: { create: workspace, ref: () => ({ refresh: refreshWorkspace, setTitle }) } } as unknown as PaseoApi;
+  const snapshot = vi.fn(async (): Promise<{ entries: Array<{ provider: string; enabled: boolean; status: string; modes?: unknown[] }> }> => ({ entries: [{ provider: "codex", enabled: true, status: "ready" }, { provider: "claude", enabled: true, status: "ready" }] }));
+  const listModes = vi.fn(async (_provider: string): Promise<{ error: string | null; modes?: unknown[] }> => ({ error: null, modes: [] }));
+  const api = { providers: { listModels, listModes, snapshot }, agents: { ref: vi.fn(() => ({ refresh, timeline: { refetch: timeline } })) }, workspaces: { create: workspace, ref: () => ({ refresh: refreshWorkspace, setTitle }) } } as unknown as PaseoApi;
   const values = titleGenerationSettingsSchema.parse({ customModel: true, disableThinking: false, provider: "claude", model: "claude-haiku-5-5", prompt: "Use an actionable title" });
   const read = vi.fn(async () => ({ status: "ready" as const, revision: "1", values }));
   const rename = vi.fn(async () => ({ ok: true, error: null as string | null }));
@@ -57,7 +69,7 @@ async function fixture() {
   const state = (mode: "apply" | "preview" = "apply") => service.request({ agentId: "source", action: "status", mode }, api);
   const start = (mode: "apply" | "preview" = "apply") => service.request({ agentId: "source", action: "start", mode }, api);
   const settle = async (mode: "apply" | "preview" = "apply") => { await expect.poll(() => state(mode).state).not.toBe("running"); return state(mode); };
-  return { api, service, directory, run, archive, create, live, subscribe, workspace, original, refresh, refreshWorkspace, setTitle, timeline, listModels, snapshot, values, read, rename, canRename, deleteHelper, delay, state, start, settle };
+  return { api, service, directory, run, archive, create, live, subscribe, workspace, original, refresh, refreshWorkspace, setTitle, timeline, listModels, listModes, snapshot, values, read, rename, canRename, deleteHelper, delay, state, start, settle };
 }
 
 describe("background title generation", () => {
@@ -203,7 +215,7 @@ describe("background title generation", () => {
     expect(await f.settle()).toMatchObject({ state: "done" });
     expect(f.listModels).toHaveBeenCalledExactlyOnceWith("claude");
     expect(f.create).toHaveBeenCalledWith(expect.objectContaining({ config: {
-      provider: "claude/claude-haiku-5-5", systemPrompt: expect.any(String), ...(expected ? { thinkingOptionId: expected } : {}),
+      ...restricted("claude"), provider: "claude/claude-haiku-5-5", systemPrompt: expect.any(String), ...(expected ? { thinkingOptionId: expected } : {}),
     } }));
   });
 
@@ -279,14 +291,14 @@ describe("background title generation", () => {
     registerTitleGeneration({ registerSettings: vi.fn(), handle, on: vi.fn() } as unknown as Parameters<typeof registerTitleGeneration>[0], vi.fn(), () => true, vi.fn());
     const models = handle.mock.calls.find(([contract]) => contract.name === titleModelsRpc.name)![1];
     const paseo = { providers: {
-      snapshot: async () => ({ entries: [{ provider: "claude", enabled: true }, { provider: "cursor", enabled: false }] }),
+      snapshot: async () => ({ entries: [{ provider: "claude", enabled: true, label: "Claude" }, { provider: "codex-newapi", enabled: true, label: "Codex (NewAPI)" }, { provider: "omp", enabled: true }, { provider: "cursor", enabled: false, label: "Cursor" }] }),
       listModels: async () => ({ error: null, models: [
         { id: "haiku", label: "Haiku", thinkingOptions: [{ id: "off", label: "Off", description: "No thinking" }], defaultThinkingOptionId: "off" },
         { id: "old", label: "Old" },
         { id: "hidden", label: "Hidden", isSelectable: false },
       ] }),
     } };
-    expect(await models({ provider: "claude" }, { paseo })).toEqual({ providers: ["claude"], models: [
+    expect(await models({ provider: "claude" }, { paseo })).toEqual({ providers: ["claude", "codex-newapi", "omp"], providerLabels: { claude: "Claude", "codex-newapi": "Codex (NewAPI)" }, models: [
       { id: "haiku", label: "Haiku", thinkingOptions: [{ id: "off", label: "Off" }], defaultThinkingOptionId: "off" },
       { id: "old", label: "Old", thinkingOptions: [], defaultThinkingOptionId: null },
     ], error: null });
@@ -308,7 +320,7 @@ describe("background title generation", () => {
     expect(f.start()).toEqual({ state: "running" });
     expect(await f.settle()).toEqual({ state: "done", title: "Updated 中文 title", previousTitle: "Original" });
     expect(f.workspace).toHaveBeenCalledExactlyOnceWith({ source: { kind: "directory", path: f.directory, projectId: "source-project" }, background: true, title: "Title generation" });
-    expect(f.create).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ config: { provider: "claude/claude-haiku-5-5", systemPrompt: expect.stringContaining("Do not use tools") } }));
+    expect(f.create).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ config: { ...restricted("claude"), provider: "claude/claude-haiku-5-5", systemPrompt: expect.stringContaining("Do not use tools") } }));
     expect(f.run.mock.calls[0]).toEqual([expect.stringContaining("Use an actionable title"), { timeoutMs: 60_000 }]);
     expect(f.run.mock.calls[0]?.[0]).toContain("Fix the card title");
     expect(f.run.mock.calls[0]?.[0]).not.toContain("PRIVATE_TOOL_OUTPUT");
@@ -614,7 +626,7 @@ describe("title when the first message starts", () => {
     f.original.agent.title = "Fix the card title";
     f.timeline.mockResolvedValue({ error: null, hasOlder: false, hasNewer: false, endCursor: null, startCursor: null, entries: entries.map((entry, index) => ({ ...entry, seqStart: index + 1 })) } as never);
     const started = (turnId: string | null = "t1", cwd = "/projects/app") =>
-      f.service.afterTurnStart({ agent: { id: "source", workspaceId: "source-ws", parentAgentId: null, provider: "codex", cwd, title: f.original.agent.title }, turnId }, f.api);
+      f.service.afterTurnStart({ agent: { id: "source", workspaceId: "source-ws", parentAgentId: null, provider: "codex", cwd, title: f.original.agent.title, background: false, metadata: {} }, turnId }, f.api);
     return { ...f, started };
   }
 
@@ -770,5 +782,60 @@ describe("title when the first message starts", () => {
     registerTitleGeneration({ registerSettings: vi.fn(() => ({ read: async () => ({ status: "ready", revision: "1", values: titleGenerationSettingsSchema.parse({}) }) })), handle: vi.fn(), on } as unknown as Parameters<typeof registerTitleGeneration>[0], vi.fn(), () => true, vi.fn());
     expect(on.mock.calls.map(([name]) => name)).toEqual(["agent.turn_started"]);
     expect(on.mock.calls[0]![1]({ agent: { id: "a", cwd: "/x", provider: "codex" }, turnId: "t1" }, { paseo: {} })).toBeUndefined();
+  });
+});
+
+describe("title helper restrictions", () => {
+  const claudeModes = [
+    { id: "plan", label: "Plan Mode", colorTier: "planning" },
+    { id: "default", label: "Always Ask", colorTier: "safe" },
+    { id: "bypassPermissions", label: "Bypass", colorTier: "dangerous" },
+  ];
+  const helperConfig = (f: Awaited<ReturnType<typeof fixture>>) =>
+    (f.create.mock.calls[0] as unknown as [{ config: Record<string, unknown> }])[0].config;
+
+  it("starts a Claude title helper in plan mode with tools denied and a sandbox", async () => {
+    const f = await fixture();
+    f.snapshot.mockResolvedValue({ entries: [{ provider: "claude", enabled: true, status: "ready", modes: claudeModes }] });
+    f.start();
+    expect(await f.settle()).toMatchObject({ state: "done" });
+    expect(helperConfig(f)).toMatchObject({ modeId: "plan", options: { disallowedTools: expect.arrayContaining(["Bash"]), sandbox: { enabled: true } } });
+    expect(f.listModes).not.toHaveBeenCalled();
+  });
+
+  it("starts a custom Codex title helper in the read-only sandbox", async () => {
+    const f = await fixture();
+    Object.assign(f.values, { provider: "codex", model: "gpt-5.5" });
+    f.listModes.mockResolvedValue({ error: null, modes: [
+      { id: "auto", label: "Default Permissions", colorTier: "moderate" },
+      { id: "auto-review", label: "Auto-review", colorTier: "moderate" },
+      { id: "full-access", label: "Full Access", colorTier: "dangerous" },
+    ] });
+    f.start();
+    expect(await f.settle()).toMatchObject({ state: "done" });
+    expect(helperConfig(f)).toMatchObject({ modeId: "auto", options: { sandbox_mode: "read-only", approval_policy: "never", web_search: "disabled" } });
+    expect(f.listModes).toHaveBeenCalledExactlyOnceWith("codex");
+  });
+
+  it("leaves a title helper that follows the card's agent unrestricted, Pi included", async () => {
+    const f = await fixture();
+    f.values.customModel = false;
+    f.original.agent.provider = "pi";
+    f.snapshot.mockResolvedValue({ entries: [{ provider: "pi", enabled: true, status: "ready", modes: [] }] });
+    f.start();
+    expect(await f.settle()).toMatchObject({ state: "done" });
+    expect(helperConfig(f)).not.toHaveProperty("modeId");
+    expect(helperConfig(f)).not.toHaveProperty("options");
+    expect(f.listModes).not.toHaveBeenCalled();
+  });
+
+  it("refuses a custom Pi model before reading the conversation or creating a helper", async () => {
+    const f = await fixture();
+    Object.assign(f.values, { provider: "pi", model: "pi-model" });
+    f.snapshot.mockResolvedValue({ entries: [{ provider: "pi", enabled: true, status: "ready", modes: [] }] });
+    f.start();
+    expect(await f.settle()).toEqual({ state: "error", error: "Task operation unavailable (provider_unrestricted): pi" });
+    expect(f.timeline).not.toHaveBeenCalled();
+    expect(f.workspace).not.toHaveBeenCalled();
   });
 });

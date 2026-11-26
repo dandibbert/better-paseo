@@ -1,19 +1,35 @@
-import React, { createContext, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Pressable, StyleSheet, Text, View, type GestureResponderEvent } from "react-native";
-import { Icon } from "@getpaseo/plugin/client/react-native";
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
+import { Platform, Pressable, StyleSheet, Text, View, type GestureResponderEvent } from "react-native";
+import { Icon } from "@getpaseo/plugin/client/ui";
 import type { Token, Tokens } from "../../../vendor/marked";
 import type { ExtendedThemeTokens } from "../../theme-tokens";
 import { useCopy } from "../../../ui/use-copy";
 import { useScrollDismiss } from "../../../ui/scroll-anchor";
-import { FLOAT, floatPressed } from "../../../ui/tokens/float";
+import { floatPressed } from "../../../ui/tokens/float";
 import { useEnhancerPreferences } from "../../../preferences";
 import { toolbarLabel } from "../../../i18n/toolbar-strings";
+import { SelectionTranslationContext, selectionViewLoading, useSelectionTranslation, type SelectionTranslationScopeValue } from "../../../translation/selection";
+import { SelectionTranslationPanel, TranslationSheet, TRANSLATE_ICON } from "../../../translation/ui";
+import { useTranslationSettingsState } from "../../../translation/settings-store";
+import { SpinnerRing } from "../../../tasks/cards/status-icon";
 import { inlineText } from "./inline";
 import { localImagePath } from "./local-path";
+
+/**
+ * iOS and Android: a double tap selects one block. Both observe touches
+ * without becoming the responder, so the platform's own long-press range
+ * selection and the list's scrolling keep working; while a block is selected
+ * its prose stops being natively selectable, which also drops the word a
+ * double tap may have selected natively.
+ */
+export function blockSelectionPlatform(os: string = Platform.OS): boolean {
+  return os === "ios" || os === "android";
+}
 
 const DOUBLE_TAP_MS = 300;
 const TAP_MS = 250;
 const MOVE_SLOP = 10;
+const MENU_ICON_SIZE = 13;
 interface Tap { time: number; x: number; y: number }
 
 let active: { cancel(): void } | null = null;
@@ -39,13 +55,19 @@ export function selectableBlock(blocks: readonly Token[]): boolean {
 }
 
 /** Visible prose only: formatting delimiters, link targets and UI labels stay out. */
-export function blockSelectionText(blocks: readonly Token[]): string {
+export function blockSelectionText(blocks: readonly Token[], literalCodex = false): string {
   return blocks.map((block): string => {
     switch (block.type) {
       case "space": return "";
-      case "paragraph": case "text": case "heading": return inlineText(block.tokens ?? [block]);
-      case "blockquote": return blockSelectionText((block as Tokens.Blockquote).tokens);
-      case "list": return (block as Tokens.List).items.map((item) => blockSelectionText(item.tokens)).join("\n");
+      case "paragraph": case "text": case "heading": return inlineText(block.tokens ?? [block], literalCodex);
+      case "blockquote": return blockSelectionText((block as Tokens.Blockquote).tokens, true);
+      case "list": return (block as Tokens.List).items.map((item) => blockSelectionText(item.tokens, literalCodex)).join("\n");
+      case "codex": return literalCodex ? block.raw : "";
+      case "code": return (block as Tokens.Code).text;
+      case "table": {
+        const table = block as Tokens.Table;
+        return [table.header, ...table.rows].map((row) => row.map((cell) => inlineText(cell.tokens, literalCodex)).join("\t")).join("\n");
+      }
       case "html": return block.raw.replace(/\n+$/, "");
       case "math": return String((block as Tokens.Generic).text ?? "");
       default: return "";
@@ -101,41 +123,84 @@ export function BlockSelection({ source, blocks, tokens, children }: {
           setChosen(source);
         } else previous.current = end;
       }}>
+      {/* Behind the text, as a native selection is drawn: on top it tinted the glyphs. */}
+      {selected ? <View pointerEvents="none" testID="markdown-block-highlight"
+        style={[StyleSheet.absoluteFill, { backgroundColor: tokens.textSelection }]} /> : null}
       {children}
-      {selected ? <>
-        <View pointerEvents="none" testID="markdown-block-highlight"
-          style={[StyleSheet.absoluteFill, { backgroundColor: tokens.accentBg }]} />
-        <BlockCopyMenu text={blockSelectionText(blocks)} tokens={tokens} dismiss={cancel} />
-      </> : null}
+      {selected ? <BlockCopyMenu text={blockSelectionText(blocks)} tokens={tokens} dismiss={cancel} /> : null}
     </View>
   </BlockSelectionContext.Provider>;
 }
 
 function BlockCopyMenu({ text, tokens, dismiss }: { text: string; tokens: ExtendedThemeTokens; dismiss(): void }) {
+  const scope = useContext(SelectionTranslationContext);
+  const settings = useTranslationSettingsState();
+  // Off in settings hides Translate; any other state explains itself in the popup.
+  const translatable = scope !== null && !(settings.status === "ready" && !settings.values.enabled);
   // Only a selected block observes the list: idle blocks keep their streamed reuse.
-  useScrollDismiss(true, dismiss);
+  useScrollDismiss(!translatable, dismiss);
   const { copy } = useCopy();
   const { language } = useEnhancerPreferences();
   const mounted = useRef(true);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
+  const copyButton = <Pressable accessibilityRole="button" accessibilityLabel="Copy selected block"
+    style={({ pressed }) => [styles.item, pressed && { backgroundColor: floatPressed(tokens) }]}
+    onPress={() => { void copy(text, { feedback: "toast" }).then((ok) => { if (ok && mounted.current) dismiss(); }); }}>
+    <Icon name="Copy" size={MENU_ICON_SIZE} color={tokens.foregroundMuted} />
+    <Text selectable={false} style={[styles.label, { color: tokens.foreground, fontFamily: tokens.fontUi }]}>
+      {toolbarLabel("Copy selected", language)}
+    </Text>
+  </Pressable>;
+  const menuStyle = [styles.menu, tokens.v2.elevation.overlay, { backgroundColor: tokens.surface0, borderColor: tokens.v2.border }];
   return <View style={styles.slot} onTouchStart={(event) => event.stopPropagation()}>
-    <Pressable accessibilityRole="button" accessibilityLabel="Copy selected block"
-      style={({ pressed }) => [styles.menu, tokens.v2.elevation.overlay, {
-        backgroundColor: pressed ? floatPressed(tokens) : tokens.surface0, borderColor: tokens.v2.border,
-      }]}
-      onPress={() => { void copy(text, { feedback: "toast" }).then((ok) => { if (ok && mounted.current) dismiss(); }); }}>
-      <Icon name="Copy" size={FLOAT.iconSize} color={tokens.foregroundMuted} />
-      <Text selectable={false} style={[styles.label, { color: tokens.foreground, fontFamily: tokens.fontUi }]}>
-        {toolbarLabel("Copy selected", language)}
-      </Text>
-    </Pressable>
+    {translatable ? <BlockTranslate scope={scope} text={text} tokens={tokens} dismiss={dismiss} copyButton={copyButton} menuStyle={menuStyle} />
+      : <View testID="markdown-block-menu" style={menuStyle}>{copyButton}</View>}
   </View>;
+}
+
+function BlockTranslate({ scope, text, tokens, dismiss, copyButton, menuStyle }: {
+  scope: SelectionTranslationScopeValue;
+  text: string;
+  tokens: ExtendedThemeTokens;
+  dismiss(): void;
+  copyButton: React.ReactNode;
+  menuStyle: React.ComponentProps<typeof View>["style"];
+}) {
+  const { language } = useEnhancerPreferences();
+  const { view, start } = useSelectionTranslation(scope, text);
+  const loading = selectionViewLoading(view);
+  // Once shown, the sheet stays through Retry and closes with the selection.
+  const [opened, setOpened] = useState(false);
+  const sheet = view !== null && (opened || !loading);
+  if (sheet && !opened) setOpened(true);
+  // The sheet covers the list; the list moving under it (a reply streaming) keeps it open.
+  useScrollDismiss(!sheet, dismiss);
+  return <>
+    {!sheet ? <View testID="markdown-block-menu" style={menuStyle}>
+      {copyButton}
+      <View testID="translation-menu-separator" accessible={false} style={[styles.separator, { backgroundColor: tokens.v2.border }]} />
+      <Pressable accessibilityRole="button" accessibilityLabel="Translate selected block" accessibilityState={{ busy: loading }}
+        style={({ pressed }) => [styles.item, pressed && { backgroundColor: floatPressed(tokens) }]}
+        onPress={loading ? undefined : start}>
+        {loading ? <SpinnerRing size={MENU_ICON_SIZE} color={tokens.foregroundMuted} testID="selected-block-translate-spinner" />
+          : <Icon icon={TRANSLATE_ICON} size={MENU_ICON_SIZE} color={tokens.foregroundMuted} />}
+        <Text selectable={false} style={[styles.label, { color: tokens.foreground, fontFamily: tokens.fontUi }]}>
+          {toolbarLabel("Translate", language)}
+        </Text>
+      </Pressable>
+    </View> : null}
+    {sheet ? <TranslationSheet close={dismiss}>
+      <SelectionTranslationPanel original={text} view={view} tokens={tokens} onRetry={start} onClose={dismiss} sheet />
+    </TranslationSheet> : null}
+  </>;
 }
 
 const styles = StyleSheet.create({
   block: { position: "relative" },
   slot: { position: "absolute", top: 0, right: 0, zIndex: 2 },
-  menu: { minHeight: 40, borderWidth: 1, borderRadius: FLOAT.radius, paddingHorizontal: 12,
-    flexDirection: "row", alignItems: "center", gap: FLOAT.iconText },
-  label: { fontSize: 13, fontWeight: "500" },
+  menu: { minHeight: 34, padding: 2, borderWidth: StyleSheet.hairlineWidth, borderRadius: 10,
+    flexDirection: "row", alignItems: "stretch" },
+  separator: { width: StyleSheet.hairlineWidth, height: 12, alignSelf: "center" },
+  item: { paddingHorizontal: 8, paddingVertical: 4, borderRadius: 7, flexDirection: "row", alignItems: "center", gap: 4 },
+  label: { fontSize: 12, fontWeight: "500" },
 });

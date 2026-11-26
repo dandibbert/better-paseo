@@ -1,4 +1,5 @@
 import { TITLE_HELPER_LABEL, TITLE_HELPER_PURPOSE } from "../../../shared/title-generation";
+import { TRANSLATION_HELPER_LABEL, TRANSLATION_HELPER_PURPOSE } from "../../../shared/timeline-translation";
 import { useLayoutEffect, useMemo, useSyncExternalStore } from "react";
 import type {
   PaseoAgent,
@@ -18,8 +19,7 @@ import type { ParentOrigin, ProviderSubagent } from "../../../shared/tasks-rpc";
 import { footerModel } from "../../state/footer-model";
 import { MARK_IDS } from "../../components/marks";
 import { normalizeProvider } from "../../components/provider-logo";
-import { classifyTool } from "../../tools/classify";
-import { readUserQuestions } from "../../tools/user-questions";
+import { parseTaskQuestions } from "../question-form";
 import { classifyAgent } from "../agent-state-bucket";
 import { resolveTasksLanguage } from "../i18n";
 import { fallbackLabelColor } from "../label-colors";
@@ -65,6 +65,7 @@ export interface TasksOptions {
 export interface CountScope {
   filters: BoardFilters;
   firstMessage?: (card: TaskCard) => string | undefined;
+  home?: string;
 }
 
 /** The sidebar row's numbers. */
@@ -75,6 +76,7 @@ export interface SidebarCounts {
   /** False until the first active snapshot arrives. */
   ready: boolean;
   hidden?: TaskCard[];
+  questions?: TaskCard[];
 }
 
 export interface TasksSnapshot {
@@ -115,6 +117,8 @@ export interface TasksHandle extends TasksSnapshot {
   refreshParent(agentId: string): Promise<boolean | null>;
   /** Read the server's read marks again, as after a Mark read. */
   refreshReads(): void;
+  /** Read the server's unread marks again, as after a Mark unread. */
+  refreshUnreads(): void;
   /** Fetch the icon for a visible card's project. */
   requestProjectIcon(projectId: string): void;
 }
@@ -180,6 +184,8 @@ interface OwnedSubscriptionLike {
 interface StoreSubscription {
   stopObserver: () => void;
   release: () => void;
+  /** Called once it is stopped or let go, so a wait on its pages ends at once. */
+  stopped?: () => void;
 }
 
 interface ProjectIconValue {
@@ -204,8 +210,62 @@ const STATUS_FILTER: PaseoAgentListOptions["filter"] = { statuses: ["running", "
  */
 const ATTENTION_KEY = "active-attention";
 const ATTENTION_FILTER: PaseoAgentListOptions["filter"] = { requiresAttention: true, includeBackground: true };
+/** Thrown by the client when a list asks for background workspaces before the host has advertised them. */
+const BACKGROUND_WORKSPACES_GATE = "Update the host to use background workspaces.";
+
+function isBackgroundWorkspacesGate(caught: unknown): boolean {
+  return (caught instanceof Error ? caught.message : String(caught)) === BACKGROUND_WORKSPACES_GATE;
+}
+
+function withoutBackground<T extends { includeBackground?: boolean }>(filter: T): Omit<T, "includeBackground"> {
+  const { includeBackground: _includeBackground, ...rest } = filter;
+  return rest;
+}
+
 const DONE_SUBSCRIPTION = "done-first";
 const PAGE_SIZE = 50;
+/** The old first page's members a refreshed one pushed out, held as a done page until the rereads land (`done-page-` so they replace it). */
+const DONE_PAGE_CARRY = "done-page-carry";
+/** Whether a snapshot whose pages were read may land: now, or once a newer one on the other subscription lands or goes. */
+interface LandingGate {
+  landable(): boolean;
+  whenLandable(): Promise<boolean>;
+}
+
+/** A list's later pages: all of them, a failure, or a read a newer one replaced. */
+type PageRead<T> = { kind: "read"; entries: T[] } | { kind: "failed"; error: unknown } | { kind: "stale" };
+
+/**
+ * A list's pages after the first, from its cursor, until it has no more.
+ * `alive` is checked before every request and after every answer, so a read
+ * a newer snapshot or a closed board replaced stops at once.
+ */
+async function readPages<T>(
+  cursor: string | null | undefined,
+  alive: () => boolean,
+  read: (cursor: string) => Promise<{ entries: T[]; pageInfo?: { hasMore?: boolean; nextCursor?: string | null } | null }>,
+): Promise<PageRead<T>> {
+  const entries: T[] = [];
+  let next = cursor ?? null;
+  for (let page = 0; next; page++) {
+    if (page >= LIST_PAGE_LIMIT) return { kind: "failed", error: new Error(`The list has more than ${LIST_PAGE_LIMIT} pages`) };
+    if (!alive()) return { kind: "stale" };
+    try {
+      const result = await read(next);
+      if (!alive()) return { kind: "stale" };
+      entries.push(...result.entries);
+      next = result.pageInfo?.hasMore ? result.pageInfo.nextCursor ?? null : null;
+    } catch (error) {
+      return alive() ? { kind: "failed", error } : { kind: "stale" };
+    }
+  }
+  return { kind: "read", entries };
+}
+
+/** The daemon's largest list page; a subscription's snapshot is one such page. */
+const LIST_PAGE_SIZE = 200;
+/** Pages read after the first before a list counts as unread (40 000 entries). */
+const LIST_PAGE_LIMIT = 200;
 const DONE_SORT: PaseoAgentListOptions["sort"] = [{ key: "updated_at", direction: "desc" }];
 /** A refresh still waiting this long (a dropped connection holds a list's ready) ends as failed, so it can be asked again. */
 const REFRESH_TIMEOUT_MS = 30_000;
@@ -342,9 +402,47 @@ function taskLabels(workspace: PaseoWorkspace | undefined, colorNames: ReadonlyM
     .map((name) => ({ name, color: colorNames.get(name) ?? fallbackLabelColor(name) }));
 }
 
+/**
+ * A plan's text, as the request carries it: Claude's ExitPlanMode and Codex's
+ * plan approval both put the Markdown in `input.plan` (and `metadata.planText`).
+ */
+function planText(permission: PaseoAgent["pendingPermissions"][number]): string | null {
+  if (permission.kind !== "plan") return null;
+  const input = permission.input as Record<string, unknown> | undefined;
+  const metadata = (permission as { metadata?: Record<string, unknown> }).metadata;
+  for (const text of [input?.plan, metadata?.planText]) if (typeof text === "string" && text.trim()) return text;
+  return null;
+}
+
+/**
+ * A plan's title: its first line, without the heading's "#", a list item's
+ * marker or emphasis. "# Ship it" reads "Ship it".
+ */
+export function planTitle(text: string): string | null {
+  const line = text.split(/\r?\n/).find((value) => value.trim())?.trim();
+  if (!line) return null;
+  const title = line
+    .replace(/^#{1,6}\s+/, "")
+    .replace(/\s+#+\s*$/, "")
+    .replace(/^(?:[-*+]|\d+[.)])\s+/, "")
+    .replace(/(\*\*|__|`)/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return title || null;
+}
+
+/** The question's tool call id: Claude names it in the metadata, Codex builds the request id from it. */
+function questionCallId(permission: PaseoAgent["pendingPermissions"][number]): string | undefined {
+  const toolUseId = permission.metadata?.toolUseId;
+  if (typeof toolUseId === "string" && toolUseId) return toolUseId;
+  return permission.id.startsWith("permission-") ? permission.id.slice("permission-".length) : undefined;
+}
+
 function firstPermissionSummary(permission: PaseoAgent["pendingPermissions"][number]): string | null {
   const input = permission.input as Record<string, unknown> | undefined;
   const detail = permission.detail as Record<string, unknown> | undefined;
+  const plan = planText(permission);
+  if (plan) return planTitle(plan);
   if (permission.kind === "question" && Array.isArray(input?.questions)) {
     const questions = input.questions.flatMap((value: unknown) => {
       if (!value || typeof value !== "object" || Array.isArray(value)) return [];
@@ -371,6 +469,14 @@ const LAST_TURN_BATCH = 200;
 const TURN_END_ASK_DELAY_MS = 1_500;
 /** When a closed agent is looked up for a delete: soon after it closed, then once more for a slow delete. */
 const GONE_CHECK_DELAYS_MS = [1_000, 3_000];
+/** A read by id that failed is tried again after each of these. */
+const CONFIRM_RETRY_DELAYS_MS = [2_000, 5_000, 15_000];
+/**
+ * A list whose subscription could not be made (its first request failed) has
+ * no live updates: the board refreshes itself after these waits (the last
+ * repeating) until every list is live again.
+ */
+export const LIST_RECOVERY_DELAYS_MS = [2_000, 5_000, 15_000, 60_000];
 
 /** `contribute` sets the loader, since only the plugin context can call RPCs outside a component. */
 export function setLastTurnLoader(next: LastTurnLoader | null): void {
@@ -407,6 +513,15 @@ const SUBAGENT_SETTLE_MS = 1_500;
  */
 export const START_IDLE_HOLD_MS = 1_000;
 /**
+ * Archiving an unread agent, Paseo 0.15 first clears its attention, with the
+ * same `updatedAt`, and sends the archived snapshot about a millisecond
+ * later. Applied, the clear took the card from review to done for a render
+ * and flew it on to archived. A clear that only drops the attention waits
+ * this long for an archive; a read on another device looks the same and
+ * lands after it.
+ */
+export const ATTENTION_CLEAR_HOLD_MS = 150;
+/**
  * A new agent's first snapshot, `initializing`, waits this long for the next:
  * its turn starts some 10 ms later, and the card drawn as starting up was
  * drawn again whole as running as it came in (a second commit and text layout
@@ -431,6 +546,26 @@ let readMarksLoader: ReadMarksLoader | null = null;
 /** `contribute` sets the loader; the marks are read with the subagents and after a Mark read. */
 export function setReadMarksLoader(next: ReadMarksLoader | null): void {
   readMarksLoader = next;
+}
+
+/** `tasks.unreads`: the agents marked unread from a board, with when. */
+export type UnreadMarksLoader = () => Promise<Array<{ agentId: string; unreadAt: string }>>;
+
+let unreadMarksLoader: UnreadMarksLoader | null = null;
+
+/** `contribute` sets the loader; the marks are read with the subagents and after a Mark unread. */
+export function setUnreadMarksLoader(next: UnreadMarksLoader | null): void {
+  unreadMarksLoader = next;
+}
+
+/** `tasks.unread-clear`: drop these agents' unread marks, as the board opened them. Rejects on failure. */
+export type UnreadClearer = (agentIds: string[]) => Promise<void>;
+
+let unreadClearer: UnreadClearer | null = null;
+
+/** `contribute` sets the clearer; `openedTask` calls it each time the board opens an agent. */
+export function setUnreadClearer(next: UnreadClearer | null): void {
+  unreadClearer = next;
 }
 
 /** `tasks.parent-origins`: the parents whose archive detached a child, or null while `since` is still the server's version. */
@@ -469,15 +604,11 @@ function epoch(value: string | null | undefined): number {
 }
 
 /**
- * A parent's provider subagents worth a row: the running ones, and the
- * failures since its latest prompt. A prompt after a failure is the person
- * acting on it, so the failure leaves the card then.
+ * A parent's retained provider subagents, ordered by creation time.
  */
-export function shownSubagents(subagents: readonly ProviderSubagent[] | undefined, lastUserMessageAt: string | null): ProviderSubagent[] {
+export function shownSubagents(subagents: readonly ProviderSubagent[] | undefined): ProviderSubagent[] {
   if (!subagents?.length) return [];
-  const prompted = epoch(lastUserMessageAt);
-  return subagents
-    .filter((subagent) => subagent.status === "running" || epoch(subagent.updatedAt) > prompted)
+  return [...subagents]
     .sort((left, right) => epoch(left.createdAt) - epoch(right.createdAt));
 }
 
@@ -494,12 +625,12 @@ function subagentChild(subagent: ProviderSubagent, parent: TaskCard): TaskChild 
   return {
     id: subagent.id,
     title: subagent.description?.trim() || subagent.title?.trim() || "Subagent",
-    status: running ? "running" : "failed",
+    status: running ? "running" : subagent.status === "failed" ? "failed" : "done",
     kind: "provider",
     subtitle: subagent.subtitle,
     subagentType: subagentType(subagent.title, subagent.subtitle),
     provider: parent.provider,
-    lane: running ? "running" : "review",
+    lane: running ? "running" : subagent.status === "failed" ? "review" : "done",
     timing: {
       createdAt: subagent.createdAt,
       updatedAt: subagent.updatedAt,
@@ -519,9 +650,9 @@ function subagentChild(subagent: ProviderSubagent, parent: TaskCard): TaskChild 
  * its rows say what failed.
  */
 export function withSubagents(card: TaskCard, subagents: readonly ProviderSubagent[] | undefined): TaskCard {
-  const shown = shownSubagents(subagents, card.timing.lastUserMessageAt);
+  const shown = shownSubagents(subagents);
   if (shown.length === 0) return card;
-  const failed = shown.filter((subagent) => subagent.status === "failed").length;
+  const failed = shown.filter((subagent) => subagent.status === "failed" && epoch(subagent.updatedAt) > epoch(card.timing.lastUserMessageAt)).length;
   const finished = card.lane === "review" || card.lane === "done";
   return {
     ...card,
@@ -544,6 +675,17 @@ function timestamp(value: string | null, missing: number): number {
  * `updatedAt` stands in (archiving sets it, and a later touch must not
  * outrank a newer archive).
  */
+/**
+ * The time the archived lane's window counts from. A task archived with its
+ * workspace keeps its own `updatedAt`, the key the done list pages by: a
+ * workspace's archive time can be newer than every page the board read, so
+ * windowing by it showed such a task or not depending on how far the lane
+ * had paged and whether this board saw the workspace while it archived.
+ */
+function archivedWindowAt(card: TaskCard): string {
+  return card.archived === "workspace" ? card.timing.updatedAt : archivedOrderAt(card);
+}
+
 function archivedOrderAt(card: TaskCard): string {
   return card.timing.archivedAt ?? card.timing.updatedAt;
 }
@@ -695,6 +837,19 @@ export function withReadMark(card: TaskCard, readAt: number | undefined, failedA
 }
 
 /**
+ * The card with its unread mark. A mark taken since the latest prompt, and
+ * since any read mark, moves a done card back to review. Archive and a
+ * running child still win, because they are applied after this. A review
+ * card is left as it is: clearing its read mark already put a failure back.
+ */
+export function withUnreadMark(card: TaskCard, unreadAt: number | undefined, readAt: number | undefined): TaskCard {
+  if (unreadAt === undefined || card.lane !== "done" || card.archived) return card;
+  if (unreadAt < epoch(card.timing.lastUserMessageAt)) return card;
+  if (readAt !== undefined && readAt >= unreadAt) return card;
+  return { ...card, lane: "review", status: "unread", readable: true };
+}
+
+/**
  * A finished parent whose subtasks still run or wait for input is not done:
  * it moves to the running lane with the running ring, so the board does not
  * read it as finished while its work goes on. Its own turn has ended
@@ -744,6 +899,8 @@ function buildBaseCard(
     requiresAttention: agent.requiresAttention,
     attentionReason: agent.attentionReason,
     lastError: agent.lastError,
+    lastUserMessageAt: agent.lastUserMessageAt,
+    hasActiveTurn: agent.activeTurn != null,
   });
   const workspaceTitle = workspace?.title?.trim() || workspace?.name || placement?.workspaceName || null;
   const projectName = workspace?.projectCustomName?.trim() || workspace?.projectDisplayName ||
@@ -775,6 +932,7 @@ function buildBaseCard(
   const hasGitState = workspace ? workspace.gitRuntime != null : placement?.checkout.isGit === true;
   const pullRequest = workspace?.githubRuntime?.pullRequest;
   const permission = pendingPermissions[0];
+  const plan = permission ? planText(permission) : null;
 
   return {
     id: agent.id,
@@ -843,7 +1001,8 @@ function buildBaseCard(
             : "other",
           title: permission.title ?? permission.name,
           summary: firstPermissionSummary(permission),
-          ...(permission.kind === "question" ? { questions: readUserQuestions(classifyTool({ name: permission.name, status: "running", detail: { type: "unknown", input: permission.input } }))?.questions } : {}),
+          ...(plan ? { body: plan } : {}),
+          ...(permission.kind === "question" ? { name: permission.name, callId: questionCallId(permission), questions: parseTaskQuestions(permission.input) } : {}),
           actions: (permission.actions ?? []).map((action) => ({
             id: action.id,
             label: action.label,
@@ -876,6 +1035,8 @@ interface SnapshotCache {
 interface TasksDemand {
   board: boolean;
   done: boolean;
+  /** A mounted board or a hold inheriting its data needs a history scan. */
+  historyScan?: "board" | "hold";
   /** The unread and failed agents without a board; a board always has them. */
   attention?: boolean;
 }
@@ -889,7 +1050,7 @@ interface TasksDemand {
  */
 interface Run {
   generation: number;
-  tier: "base" | "attention" | "board" | "done";
+  tier: "base" | "workspaces" | "attention" | "board" | "done";
   tierRun: number;
   /** A refresh's request: cancelled with it, so an answer after a timeout or a close applies nothing. */
   refresh?: RefreshToken;
@@ -897,6 +1058,9 @@ interface Run {
 
 interface RefreshToken {
   cancelled: boolean;
+  cancelledSignal: Promise<void>;
+  signalCancellation: () => void;
+  listsReady?: Promise<Landing[]>;
 }
 
 /** How a list's open ended: applied, failed, or overtaken by a close or a newer open of its tier. */
@@ -911,22 +1075,27 @@ export type TasksHoldReason = "intent" | "linger";
 interface WarmHold {
   release: () => void;
   timer: ReturnType<typeof setTimeout> | null;
+  historyScan: boolean;
 }
 
 interface TaskStore {
   subscribe(listener: () => void, demand: TasksDemand): () => void;
+  setHistoryWindow(owner: object, window: DoneWindow | undefined): void;
   /** Keep the board's subscriptions open for `reason`: until `ms` from now, or with no deadline when null. */
   hold(reason: TasksHoldReason, ms: number | null): void;
   hasHold(reason: TasksHoldReason): boolean;
   dropHolds(): void;
   getSnapshot(options: TasksOptions): TasksHandle;
   getCounts(scope?: CountScope): SidebarCounts;
+  getQuestionCounts(scope?: CountScope): SidebarCounts;
   refresh(): Promise<TasksRefreshResult>;
   setArchivedLane(on: boolean): void;
   loadMoreDone(window: DoneWindow): void;
   resolveParent(id: string): void;
   refreshParent(id: string): Promise<boolean | null>;
   refreshReads(): void;
+  refreshUnreads(): void;
+  openedAgent(id: string): void;
   requestProjectIcon(projectId: string): void;
 }
 
@@ -941,6 +1110,19 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
   const listeners = new Set<() => void>();
   const entries = new Map<string, AgentEntry>();
   const sourceMembers = new Map<string, Set<string>>();
+  const historyScanKey = "history-scan";
+  const historyPendingKey = "history-scan-pending";
+  const historyWindows = new Map<object, DoneWindow>();
+  let retainedHistoryWindows: DoneWindow[] = ["7d"];
+  /** Done-list removes must not be undone from a retained, unconfirmed record. */
+  const pendingHistoryRemovals = new Set<string>();
+  let historyScanSequence = 0;
+  let pendingHistoryScan: number | null = null;
+  let currentHistoryScan: Promise<Landing> | null = null;
+  /** How `currentHistoryScan` ended, set in the same step as its last state change; null while it runs. */
+  let historyScanResult: Landing | null = null;
+  let historyScanOwner: RefreshToken | undefined;
+  const historyScanWaiters = new Set<() => void>();
   const workspaces = new Map<string, PaseoWorkspace>();
   /**
    * Archive time of a workspace that has since left the list. The list drops
@@ -991,8 +1173,19 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
   const latestUpdates = new Map<string, number>();
   /** Agents being read again by id after a stale update (`confirmAgent`). */
   const confirmChecks = new Set<string>();
+  /** Reads by id asked for while one was out: each runs once that one answers. */
+  const confirmAgain = new Set<string>();
   /** A starting agent's snapshot held for its first turn (`START_INIT_HOLD_MS`, `START_IDLE_HOLD_MS`). */
-  const startIdles = new Map<string, { sourceKey: string; update: AgentUpdateEnvelope; status: string; updatedAt: number; timer: ReturnType<typeof setTimeout> }>();
+  const startIdles = new Map<string, {
+    sourceKey: string;
+    update: AgentUpdateEnvelope;
+    status: string;
+    updatedAt: number;
+    timer: ReturnType<typeof setTimeout>;
+    kind: "start" | "clear";
+    /** A list that held the agent removed it after it was held: an archive or a delete may have followed it. */
+    removedFromSource?: boolean;
+  }>();
   /** Provider subagents by parent, as `tasks.subagents` last answered. */
   const subagentsByParent = new Map<string, ProviderSubagent[]>();
   let subagentVersion: string | undefined;
@@ -1000,6 +1193,10 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
   let subagentReading = false;
   /** The server's read marks (`tasks.reads`), as epoch ms by agent. */
   const readMarks = new Map<string, number>();
+  /** The server's unread marks (`tasks.unreads`), as epoch ms by agent. */
+  const unreadMarks = new Map<string, number>();
+  /** Agents the board opened whose unread clear is still out (`openedAgent`). */
+  const clearingUnreads = new Map<string, number>();
   /** Failed parents asked for by id, once per version of the list. */
   const subagentParentsAsked = new Set<string>();
   const subscriptions = new Map<string, StoreSubscription>();
@@ -1007,6 +1204,28 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
   const replacements = new Map<string, StoreSubscription>();
   /** The refresh in flight, which a second ask joins, and how to end it. */
   let refreshing: { promise: Promise<TasksRefreshResult>; token: RefreshToken; end(result: TasksRefreshResult): void } | null = null;
+  /** The refresh queued to bring back a list whose subscription failed, and how many have failed in a row. */
+  let recoveryTimer: ReturnType<typeof setTimeout> | null = null;
+  let recoveryAttempts = 0;
+  /** The lists left with no live subscription (a first request, or a reconnect's re-subscribe, failed). */
+  const listsToRecover = new Set<string>();
+  /**
+   * Lists served without background workspaces because the host gate refused
+   * the inclusive one. The board keeps this subscription, and still owes the
+   * inclusive list: a host that has the feature advertises it again after hello.
+   */
+  const backgroundFallbacks = new Set<string>();
+  /**
+   * An inclusive list (agents or workspaces) has landed since the board
+   * opened: the host has the feature, and the store holds background records.
+   * A later gate refusal is the client's hello flag going away for a moment,
+   * not a host without the feature, so no list without the flag replaces them.
+   */
+  let backgroundProven = false;
+  /** Set while a recovery refresh is reading, so its own fallback does not arm a second timer. */
+  let recoveryRunning = false;
+  /** Bumped when recovery is cancelled, so an older refresh cannot clear a newer one's flag. */
+  let recoveryEpoch = 0;
   const projectUnsubscribes: Array<() => void> = [];
   /** The providers enabled in Paseo, by id, with their names: the Agent filter lists them all, cards or not. */
   const enabledProviders = new Map<string, string>();
@@ -1015,17 +1234,133 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
   let attentionConsumers = 0;
   let boardConsumers = 0;
   let doneConsumers = 0;
+  let historyConsumers = 0;
   let generation = 0;
   let baseRun = 0;
+  /**
+   * The workspace list's own run, apart from the status list's: a refresh
+   * moves it only when it reads the workspaces again, so a first workspace
+   * list still loading when a refresh starts is not dropped as stale.
+   */
+  let workspaceRun = 0;
   let attentionRun = 0;
   let boardRun = 0;
   let doneRun = 0;
   let statusReady = false;
   let attentionReady = false;
   let workspacesReady = false;
-  /** The workspace list itself arrived, not a failed read: only then does a missing workspace mean archived. */
+  /**
+   * The whole workspace list arrived, every page of it (the subscription's,
+   * or a full read to place an agent's workspace), not a failed read: only
+   * then does the board hide a task of a workspace it has not placed while
+   * it reads the list again.
+   */
   let workspacesListed = false;
+  /**
+   * Workspaces known to be archived (or deleted): the daemon removed them, or
+   * a complete list that answered after the board knew an agent of theirs
+   * left them out. Only these, and those listed with archivingAt, archive a
+   * task by its workspace.
+   */
+  const knownGoneWorkspaces = new Set<string>();
+  /** When the board learned each agent's workspace, on the record clock: a list asked later knew of that workspace. */
+  const agentSeenAt = new Map<string, number>();
+  /** When the board last learned whether each workspace exists, on the record clock: a list asked earlier cannot overrule it. */
+  const workspaceStamps = new Map<string, number>();
+  /** The generation whose full read of the workspace list is queued or running, to settle agents whose workspace the board has not placed. */
+  let workspaceCheckRun: number | null = null;
+  /**
+   * Live workspace updates, for each workspace snapshot whose later pages are
+   * still loading: those pages are older, so they neither replace an upsert
+   * nor bring back a removed workspace.
+   */
+  const workspaceListUpdates = new Set<Map<string, "upsert" | "remove">>();
+  /** Agents a live update moved, by list, for each snapshot of it whose later pages are still loading. */
+  const agentListUpdates = new Map<string, Set<Set<string>>>();
+  /** The lists whose last snapshot could not read every page, with the error the board shows for it. */
+  const pageErrors = new Map<string, string>();
+  /**
+   * A clock that ticks whenever a record is applied or removed, and each
+   * agent's tick. A read that started (a read by id, a page) before an
+   * agent's record changed answers with an older state of it: that agent is
+   * left as it is, not set back (`confirmed` skips the time check, and a
+   * removed record has nothing left to compare against).
+   */
+  let recordClock = 0;
+  const recordStamps = new Map<string, number>();
+  /** Each parent's latest read: an older answer does not overwrite a newer one. */
+  const parentReadSeqs = new Map<string, number>();
+  /** How many times the done list started over from its first page: a later page belongs to one of them. */
+  let doneSnapshots = 0;
+  /**
+   * A list's copy of an agent whose snapshot is held (a new agent starting up,
+   * an attention clear): the same state waits with the hold (true), anything
+   * else (a turn, a permission request, an error, an archive) lets the hold
+   * go and applies.
+   */
+  function waitsForHeldClear(agent: PaseoAgent): boolean {
+    // Either kind: a new agent's start-up hold, or an attention clear.
+    const held = startIdles.get(agent.id);
+    if (!held) return false;
+    // The same state, not just the same time: a permission request or an
+    // error can come with an unchanged updatedAt, and must show at once.
+    const heldAgent = held.update.payload?.agent;
+    if (heldAgent && laneStateOf(heldAgent) === laneStateOf(agent)) return true;
+    if (epoch(agent.updatedAt) < held.updatedAt) return true;
+    dropHeldSnapshot(agent.id);
+    return false;
+  }
+
+  /** What decides an agent's lane, as one comparable string; a list snapshot and a live update may differ elsewhere. */
+  function laneStateOf(agent: PaseoAgent): string {
+    return JSON.stringify([
+      agent.status,
+      Boolean(agent.requiresAttention),
+      agent.attentionReason ?? null,
+      (agent.pendingPermissions ?? []).map((permission) => permission.id),
+      agent.lastError ?? null,
+      agent.archivedAt ?? null,
+      agent.activeTurn ? agent.activeTurn.turnId : null,
+      agent.updatedAt,
+    ]);
+  }
+
+  /** An agent confirmed archived or gone: what a hold kept of it must not land later. */
+  function dropHeldSnapshot(id: string) {
+    const held = startIdles.get(id);
+    if (!held) return;
+    clearTimeout(held.timer);
+    startIdles.delete(id);
+  }
+
+  /** The agent's record changed since `asked` (a `recordClock` reading). */
+  function changedSince(id: string, asked: number): boolean {
+    return (recordStamps.get(id) ?? 0) > asked;
+  }
+  /**
+   * When the done list last removed each agent, on the same clock. A done
+   * page read before it may still carry the agent (archived, or running
+   * again) though the board never held it, so no record changed: such a page
+   * leaves it out. Only the done list's removes count (the daemon removes an
+   * agent from every list it stops matching, so a status or attention remove
+   * says nothing about done), and only the done pages ask.
+   */
+  const removeStamps = new Map<string, number>();
+  function removedSince(id: string, asked: number): boolean {
+    return (removeStamps.get(id) ?? 0) > asked;
+  }
+  /** Snapshots of each list by arrival, from any of its subscriptions, and the latest of them that landed. */
+  const snapshotArrivals = new Map<string, number>();
+  const snapshotLandings = new Map<string, number>();
+  /** Whether that latest landing read every page: a snapshot it superseded did not land in full either. */
+  const snapshotOutcomes = new Map<string, "landed" | "failed">();
+  /** Each subscription's latest snapshot arrival, by list: only subscriptions still serving it. */
+  const arrivalOwners = new Map<string, Map<StoreSubscription, number>>();
+  /** Waits on a list's later pages, woken by any landing of that list, from either of its subscriptions. */
+  const landingWaiters = new Map<string, Set<() => void>>();
   let countsCache: SidebarCounts | null = null;
+  let questionCountsCache: SidebarCounts | null = null;
+  let countQuestions: TaskCard[] = [];
   let countsDirty = true;
   let countsScope: CountScope | undefined;
   let loadingDone = false;
@@ -1035,6 +1370,8 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
   /** The done run a refresh is reading again; no next page is fetched while it is the current one. */
   let doneRefreshRun = -1;
   let doneReady = false;
+  /** The archived lane's first history scan has either completed or reported an error. */
+  let archivedHistoryReady = false;
   /**
    * The archived lane is asked for: the done list includes archived agents,
    * whose records stay. Kept while the board closes, so a warm hold reads
@@ -1088,7 +1425,7 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
   function hasActiveBackgroundChildren(id: string): boolean {
     return [...childrenByParent.get(id) ?? []].some((childId) => {
       const child = cards.get(childId) ?? baseCards.get(childId);
-      return child !== undefined && inBackgroundWorkspace(child) && (child.status === "running" || child.status === "needs_input");
+      return child !== undefined && isBackground(child) && (child.status === "running" || child.status === "needs_input");
     });
   }
 
@@ -1098,7 +1435,9 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
   }
 
   function dropIfUnreferenced(id: string) {
-    if (memberSetsContaining(id).length > 0 || hasActiveBackgroundChildren(id)) return;
+    // A held snapshot's wait decides (a read by id once it is over): the card
+    // stays as it is until then rather than leave and come back.
+    if (memberSetsContaining(id).length > 0 || hasActiveBackgroundChildren(id) || startIdles.has(id)) return;
     removeRecord(id);
   }
 
@@ -1111,13 +1450,145 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
    */
   function inArchivedWorkspace(id: string): boolean {
     const workspaceId = entries.get(id)?.agent.workspaceId;
-    if (!workspacesListed || !workspaceId) return false;
+    if (!workspaceId) return false;
+    // Only what says so: a workspace listed as archiving, or one known gone.
     const workspace = workspaces.get(workspaceId);
-    return !workspace || Boolean(workspace.archivingAt);
+    if (workspace) return Boolean(workspace.archivingAt);
+    return knownGoneWorkspaces.has(workspaceId);
   }
 
-  /** Background agents contribute to their parent's state, but never get standalone cards. */
-  function inBackgroundWorkspace(card: TaskCard): boolean {
+  /**
+   * An agent whose workspace the board has neither listed nor knows gone:
+   * new (made while disconnected, its workspace on a page or an update still
+   * to come) or of a workspace archived out of the board's sight. Which one
+   * is not guessed from a list that may predate it: the card waits off the
+   * board while a full read of the workspace list settles it.
+   */
+  function awaitsWorkspace(id: string): boolean {
+    const workspaceId = entries.get(id)?.agent.workspaceId;
+    if (!workspaceId || workspaces.has(workspaceId) || knownGoneWorkspaces.has(workspaceId)) return false;
+    if (!workspacesListed) {
+      // The first list is still loading: the card shows as it is meanwhile.
+      // If that list failed, nothing will place the card: read it again.
+      if (workspacesReady) queueWorkspaceCheck();
+      return false;
+    }
+    queueWorkspaceCheck();
+    return true;
+  }
+
+  function queueWorkspaceCheck(delay = 0) {
+    if (workspaceCheckRun === generation) return;
+    const run = generation;
+    workspaceCheckRun = run;
+    setTimeout(() => {
+      if (run !== generation) { endWorkspaceCheck(run); return; }
+      void checkWorkspaces(run);
+    }, delay);
+  }
+
+  /** Queue a full read of the workspace list if any agent's workspace is unplaced. */
+  function checkUnplacedWorkspaces() {
+    for (const id of entries.keys()) {
+      const workspaceId = entries.get(id)?.agent.workspaceId;
+      if (workspaceId && !workspaces.has(workspaceId) && !knownGoneWorkspaces.has(workspaceId)) {
+        queueWorkspaceCheck();
+        return;
+      }
+    }
+  }
+
+  function endWorkspaceCheck(run: number) {
+    if (workspaceCheckRun === run) workspaceCheckRun = null;
+  }
+
+  /** One pass of the workspace list. `includeBackground` is false after the host gate refused it. */
+  async function readWorkspaceList(includeBackground: boolean, alive: () => boolean): Promise<PaseoWorkspace[] | "stale"> {
+    const first = await api.workspaces.list({ filter: includeBackground ? { includeBackground: true } : {}, page: { limit: LIST_PAGE_SIZE } });
+    if (!alive()) return "stale";
+    const rest = first.pageInfo?.hasMore ? await readWorkspacePages(first.pageInfo.nextCursor, alive, includeBackground) : { kind: "read" as const, entries: [] as PaseoWorkspace[] };
+    if (rest.kind === "stale" || !alive()) return "stale";
+    if (rest.kind === "failed") throw rest.error;
+    return [...first.entries, ...rest.entries];
+  }
+
+  /** Read the whole workspace list now: place the workspaces it has, and know gone those of agents seen before it answered. */
+  async function checkWorkspaces(run: number) {
+    const asked = recordClock;
+    const alive = () => run === generation && consumers > 0;
+    let all: PaseoWorkspace[];
+    try {
+      const read = await readWorkspaceList(true, alive);
+      if (read === "stale") { endWorkspaceCheck(run); return; }
+      backgroundProven = true;
+      all = read;
+    } catch (caught) {
+      if (!alive()) { endWorkspaceCheck(run); return; }
+      // A host that has not advertised the feature still has a complete list without it.
+      // Asking again with the flag would toast, and would never place an archived workspace.
+      if (!isBackgroundWorkspacesGate(caught)) {
+        endWorkspaceCheck(run);
+        pageError("workspaces-check", caught);
+        queueWorkspaceCheck(5_000);
+        return;
+      }
+      // The host had the feature: a list without it would know the background workspaces gone. Ask again later.
+      if (backgroundProven) {
+        endWorkspaceCheck(run);
+        queueWorkspaceCheck(5_000);
+        return;
+      }
+      try {
+        const read = await readWorkspaceList(false, alive);
+        if (read === "stale") { endWorkspaceCheck(run); return; }
+        all = read;
+      } catch (again) {
+        endWorkspaceCheck(run);
+        if (!alive()) return;
+        pageError("workspaces-check", again);
+        queueWorkspaceCheck(5_000);
+        return;
+      }
+    }
+    endWorkspaceCheck(run);
+    clearPageError("workspaces-check");
+    // Read whole, it settles what a failed read of the subscription's pages left open.
+    clearPageError("workspaces");
+    const listed = new Map(all.map((workspace) => [workspace.id, workspace]));
+    batchUpdates(() => {
+      // A complete list: from now on a workspace the board has not placed is settled the same way.
+      workspacesListed = true;
+      for (const workspace of listed.values()) {
+        if (!workspaces.has(workspace.id) && !knownGoneWorkspaces.has(workspace.id)) updateWorkspace(workspace);
+      }
+      const gone = new Set<string>();
+      for (const [id, entry] of entries) {
+        const workspaceId = entry.agent.workspaceId;
+        if (!workspaceId || workspaces.has(workspaceId) || listed.has(workspaceId) || knownGoneWorkspaces.has(workspaceId)) continue;
+        // Seen only after the list was asked for: its workspace may be newer than the list.
+        if ((agentSeenAt.get(id) ?? Number.POSITIVE_INFINITY) > asked) continue;
+        gone.add(workspaceId);
+      }
+      for (const workspaceId of gone) {
+        knownGoneWorkspaces.add(workspaceId);
+        workspaceStamps.set(workspaceId, ++recordClock);
+      }
+      for (const [id, entry] of entries) if (entry.agent.workspaceId && gone.has(entry.agent.workspaceId)) refreshWithKin(id);
+      notify();
+    });
+    // Agents seen while it read wait for the next check (every earlier one is settled now).
+    for (const id of entries.keys()) {
+      if ((agentSeenAt.get(id) ?? 0) > asked && awaitsWorkspace(id)) break;
+    }
+  }
+
+  /**
+   * Background agents contribute to their parent's state, but never get standalone cards.
+   * An agent is background when it was created so (Paseo 0.16) or its workspace is, as the
+   * daemon decides; an older daemon's snapshot has no flag of its own.
+   */
+  function isBackground(card: TaskCard): boolean {
+    if (entries.get(card.id)?.agent.background === true) return true;
     return Boolean(card.location.workspaceId && workspaces.get(card.location.workspaceId)?.background);
   }
 
@@ -1129,7 +1600,11 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
 
   /** Has a card on the board: a record, not archived unless the archived lane is on. */
   function onBoard(id: string): boolean {
-    return baseCards.has(id) && (archivedLane || !archivedRecord(id));
+    if (!baseCards.has(id)) return false;
+    const entry = entries.get(id);
+    // Archived itself: its workspace does not matter.
+    if (entry && isArchived(entry.agent)) return archivedLane;
+    return !awaitsWorkspace(id) && (archivedLane || !inArchivedWorkspace(id));
   }
 
   /** A card, its parent's list of children, and its children's parent row. */
@@ -1168,7 +1643,8 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
         ? isArchived(parentEntry.agent) ? "agent" : inArchivedWorkspace(parentAgentId) ? "workspace" : null
         : resolvedParents.get(parentAgentId)?.archived ? "agent" : null;
     const childIds = childrenByParent.get(id);
-    const next: TaskCard = withArchived(withActiveSubtasks(withReadMark(withSubagents({
+    const readAt = readMarks.get(id);
+    const next: TaskCard = withArchived(withActiveSubtasks(withUnreadMark(withReadMark(withSubagents({
       ...withTurnError(base, turnErrors.get(id)),
       usage: withRecordedCost(base.usage, turnCosts.get(id)),
       timing: withLastTurn({ ...base.timing, archivedAt }, lastTurns.get(id), base.lane === "running" || base.lane === "needs_input"),
@@ -1206,7 +1682,9 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
             .filter((child): child is TaskChild => child !== null)
             .sort((left, right) => compareText(left.title, right.title))
         : [],
-    }, subagentsByParent.get(id)), readMarks.get(id), latestFailure(id))), archivedKind);
+    }, subagentsByParent.get(id)), readAt, latestFailure(id)), unreadMarks.get(id), readAt)), archivedKind);
+    const failureAt = latestFailure(id);
+    if (Number.isFinite(failureAt)) next.errorOccurredAt = failureAt;
     const previous = cards.get(id);
     if (shallowCardEqual(previous, next)) return false;
     cards.set(id, next);
@@ -1266,9 +1744,25 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
   function updateRecord(agent: PaseoAgent, placement: AgentPlacement, confirmed = false) {
     // Independently bootstrapped lists and pages can arrive after a newer live update.
     if (!confirmed && isStaleAgent(agent)) return;
+    pendingHistoryRemovals.delete(agent.id);
+    // A daemon snapshot is positive evidence: retain a history candidate before
+    // a later first-page replacement can discard its only list membership.
+    if (historyConsumers > 0 && historyCandidate(agent, historyWindowSet(), archivedAsked)) {
+      const members = sourceMembers.get(historyScanKey) ?? new Set<string>();
+      members.add(agent.id);
+      sourceMembers.set(historyScanKey, members);
+    } else {
+      sourceMembers.get(historyScanKey)?.delete(agent.id);
+    }
+    if (pendingHistoryScan !== null && isDone(agent) && (!isArchived(agent) || archivedAsked)) {
+      const pending = sourceMembers.get(historyPendingKey) ?? new Set<string>();
+      pending.add(agent.id);
+      sourceMembers.set(historyPendingKey, pending);
+    }
     const updatedAt = epoch(agent.updatedAt);
     latestUpdates.set(agent.id, confirmed ? updatedAt : Math.max(updatedAt, latestUpdates.get(agent.id) ?? updatedAt));
     if (isArchived(agent) && !keepsArchived(agent)) {
+      dropHeldSnapshot(agent.id);
       for (const members of sourceMembers.values()) members.delete(agent.id);
       removeRecord(agent.id);
       return;
@@ -1282,6 +1776,14 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
     const resent = previous !== undefined
       && JSON.stringify(previous.agent) === JSON.stringify(agent)
       && JSON.stringify(previous.placement) === JSON.stringify(placement);
+    // Only a change ticks the clock: the same snapshot again, from another list, changes nothing a read could set back.
+    if (!resent) {
+      recordStamps.set(agent.id, ++recordClock);
+      if (!agentSeenAt.has(agent.id) || previous?.agent.workspaceId !== agent.workspaceId) agentSeenAt.set(agent.id, recordClock);
+      // A newer state stands in for what the failed reads were to find out.
+      clearPageError(`read:${agent.id}`);
+      clearPageError(`gone:${agent.id}`);
+    }
     const oldParent = parentByChild.get(agent.id) ?? null;
     const wasActive = cards.get(agent.id)?.status === "running" || cards.get(agent.id)?.status === "needs_input";
     // A turn seen ending: the update that ends it carries its end. The agent
@@ -1329,6 +1831,11 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
   }
 
   function removeRecord(id: string) {
+    // A read that started before this removal answers with an older state.
+    recordStamps.set(id, ++recordClock);
+    // Its gone check and reads by id have nothing left to report.
+    clearPageError(`gone:${id}`);
+    clearPageError(`read:${id}`);
     const existed = entries.has(id);
     if (!existed) return;
     entries.delete(id);
@@ -1349,6 +1856,13 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
     return archivedAsked && doneConsumers > 0 && isDone(agent);
   }
 
+  /** Whether an active list (status, attention) holds this record; undefined for any other list. */
+  function belongsToActiveList(key: string, agent: PaseoAgent): boolean | undefined {
+    if (key === STATUS_KEY) return !isArchived(agent) && ["running", "initializing", "error"].includes(agent.status);
+    if (key === ATTENTION_KEY) return !isArchived(agent) && Boolean(agent.requiresAttention);
+    return undefined;
+  }
+
   function reconcileActiveMembers(agent: PaseoAgent) {
     if (isArchived(agent)) {
       for (const key of [STATUS_KEY, ATTENTION_KEY]) sourceMembers.get(key)?.delete(agent.id);
@@ -1363,11 +1877,27 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
   }
 
   /**
-   * A snapshot that only says the agent has not started its first turn yet:
-   * a new agent's `initializing`, or the idle after it, with nothing that asks
-   * for the user. How long it waits for the turn, or null when it does not.
+   * The shown record unread, and this snapshot the same but read: an
+   * archive's first step, or a read elsewhere. Anything else that changed
+   * (a permission request, an error, a turn) is applied at once.
+   */
+  function clearsOnlyAttention(agent: PaseoAgent): boolean {
+    const shown = entries.get(agent.id)?.agent;
+    if (!shown?.requiresAttention || agent.requiresAttention || agent.attentionReason || agent.archivedAt || shown.archivedAt) return false;
+    if ((agent.pendingPermissions ?? []).length > 0 || (shown.pendingPermissions ?? []).length > 0) return false;
+    if (agent.activeTurn || (agent.lastError ?? null) !== (shown.lastError ?? null)) return false;
+    return epoch(agent.updatedAt) === epoch(shown.updatedAt) && agent.status === shown.status;
+  }
+
+  /**
+   * A snapshot held back for the one that usually follows within moments:
+   * one that only says the agent has not started its first turn yet (a new
+   * agent's `initializing`, or the idle after it, with nothing that asks for
+   * the user), or one that only clears its attention, ahead of an archive.
+   * How long it waits, or null when it does not.
    */
   function startingHold(agent: PaseoAgent): number | null {
+    if (clearsOnlyAttention(agent)) return ATTENTION_CLEAR_HOLD_MS;
     if (agent.lastUserMessageAt || agent.activeTurn || agent.requiresAttention || agent.lastError) return null;
     if ((agent.pendingPermissions ?? []).length > 0) return null;
     const shown = entries.get(agent.id)?.agent.status;
@@ -1379,6 +1909,8 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
 
   function applyAgentUpdate(sourceKey: string, update: AgentUpdateEnvelope, released = false) {
     if (update.type !== "agent_update" || !update.payload) return;
+    const touchedId = update.payload.agent?.id ?? update.payload.agentId;
+    if (touchedId) for (const touched of agentListUpdates.get(sourceKey) ?? []) touched.add(touchedId);
     // A subagent's start or end usually moves its parent too.
     scheduleSubagents(SUBAGENT_SETTLE_MS);
     const payload = update.payload;
@@ -1397,14 +1929,24 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
       }
       if (hold !== null) {
         const run = generation;
+        // Not applied yet, but news: a read by id asked before it answers with an older state.
+        recordStamps.set(agent.id, ++recordClock);
         startIdles.set(agent.id, {
+          kind: clearsOnlyAttention(agent) ? "clear" : "start",
           sourceKey,
           update,
           status: agent.status,
           updatedAt: epoch(agent.updatedAt),
           timer: setTimeout(() => {
-            if (run !== generation || startIdles.get(agent.id)?.update !== update) return;
+            const held = startIdles.get(agent.id);
+            if (run !== generation || held?.update !== update) return;
             startIdles.delete(agent.id);
+            // Its list let it go since: what it held may be stale (archived,
+            // deleted), so read the agent rather than apply it.
+            if (held.removedFromSource) {
+              confirmAgent(agent.id);
+              return;
+            }
             batchUpdates(() => applyAgentUpdate(sourceKey, update, true));
           }, hold),
         });
@@ -1428,7 +1970,32 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
       return;
     }
     if (payload.kind === "remove" && payload.agentId) {
-      const wasMember = sourceMembers.get(sourceKey)?.delete(payload.agentId);
+      // The daemon sends a remove to every list the agent no longer matches;
+      // only the done list's means it left done (archived, running, deleted).
+      if (sourceKey === DONE_SUBSCRIPTION) {
+        removeStamps.set(payload.agentId, ++recordClock);
+        pendingHistoryRemovals.add(payload.agentId);
+      }
+      // A held read can be the first step of an archive the board hears of only
+      // as removes (its archived lane off): applied after them, it brought the
+      // archived task back as done. Let it go and read the agent instead.
+      // A held snapshot sits out its wait: the archive it may precede comes
+      // within moments, and a read now would only see the same ambiguous
+      // state. A remove from a list that held the agent (for a start-up hold,
+      // its own list; the SDK also replays removes from lists that never had
+      // it) only marks it, and once the wait is over the agent is read by id
+      // instead of applying what was held.
+      const held = startIdles.get(payload.agentId);
+      // A clear hold's own list has not registered the agent yet (what it sent is held), so its remove counts too.
+      if (held && (held.sourceKey === sourceKey || (held.kind === "clear" && sourceMembers.get(sourceKey)?.has(payload.agentId)))) {
+        held.removedFromSource = true;
+      }
+      const wasHistory = sourceKey === DONE_SUBSCRIPTION && sourceMembers.get(historyScanKey)?.delete(payload.agentId);
+      const wasPending = sourceKey === DONE_SUBSCRIPTION && sourceMembers.get(historyPendingKey)?.delete(payload.agentId);
+      const wasMember = sourceMembers.get(sourceKey)?.delete(payload.agentId) || wasHistory || wasPending;
+      // A list that held the agent let it go (archived, read, running): a read
+      // by id asked before this would set its memberships back.
+      if (wasMember) recordStamps.set(payload.agentId, ++recordClock);
       // Held for a subagent failure, it stays; the list it left had its latest state, so read it again.
       if (sourceMembers.get(SUBAGENT_KEY)?.has(payload.agentId)) fetchSubagentParent(payload.agentId, generation);
       if (wasMember && memberSetsContaining(payload.agentId).length === 0 && doneConsumers > 0) {
@@ -1444,11 +2011,15 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
   // Confirm it before discarding the card.
   function confirmRemovedAgent(id: string) {
     const run = generation;
+    const asked = recordClock;
     void api.agents.ref(id).refresh().then((result) => {
       if (run !== generation || memberSetsContaining(id).length > 0) return;
+      // A newer state landed while the read was out; a later remove reads again.
+      if (changedSince(id, asked)) return;
       // Still starting: the held idle decides, after its wait.
       if (result && startIdles.has(id) && startingHold(result.agent) !== null) return;
       if (!result || (isArchived(result.agent) && !keepsArchived(result.agent))) {
+        dropHeldSnapshot(id);
         dropIfUnreferenced(id);
         return;
       }
@@ -1458,8 +2029,17 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
         updateRecord(result.agent, result.project ?? null);
         dropIfUnreferenced(id);
       });
-    }).catch(() => {
-      if (run === generation) dropIfUnreferenced(id);
+    }).catch((caught: unknown) => {
+      if (run !== generation || memberSetsContaining(id).length > 0 || changedSince(id, asked) || !entries.has(id)) return;
+      // Unconfirmed, the card stays as it was: say so, and read it again
+      // (with the board's other reads by id, which retry and settle it).
+      pageError(`read:${id}`, caught);
+      const delay = CONFIRM_RETRY_DELAYS_MS[0];
+      if (delay !== undefined) {
+        setTimeout(() => {
+          if (run === generation && entries.has(id)) confirmAgent(id, 1);
+        }, delay);
+      }
     });
   }
 
@@ -1474,7 +2054,7 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
    * card a done page read still holds is let go when the look finds it
    * archived.
    */
-  function checkGone(id: string, attempt = 0) {
+  function checkGone(id: string, attempt = 0, failures = 0) {
     if (goneChecks.has(id)) return;
     goneChecks.add(id);
     const run = generation;
@@ -1482,11 +2062,21 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
       if (run !== generation) return;
       if (!entries.has(id)) {
         goneChecks.delete(id);
+        // Already taken off (a snapshot no longer had it): nothing is left to check.
+        clearPageError(`gone:${id}`);
         return;
       }
+      const asked = recordClock;
       void api.agents.ref(id).refresh().then((result) => {
         if (run !== generation) return;
         goneChecks.delete(id);
+        clearPageError(`gone:${id}`);
+        // Restored, prompted or archived again meanwhile: the newer state
+        // stands; still closed, it is checked again from that state.
+        if (changedSince(id, asked)) {
+          if (entries.get(id)?.agent.status === "closed") checkGone(id, attempt);
+          return;
+        }
         if (result && !isArchived(result.agent)) {
           if (result.agent.status === "closed" && attempt + 1 < GONE_CHECK_DELAYS_MS.length) checkGone(id, attempt + 1);
           return;
@@ -1496,10 +2086,30 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
           updateRecord(result.agent, result.project ?? null);
           return;
         }
+        dropHeldSnapshot(id);
+        removeStamps.set(id, ++recordClock);
         for (const members of sourceMembers.values()) members.delete(id);
         removeRecord(id);
-      }).catch(() => {
-        if (run === generation) goneChecks.delete(id);
+      }).catch((caught: unknown) => {
+        if (run !== generation) return;
+        goneChecks.delete(id);
+        // Taken off meanwhile: nothing is left to report.
+        if (!entries.has(id)) return;
+        // Its record changed since (running again, archived): this read no
+        // longer decides anything; still closed, check again from that state.
+        if (changedSince(id, asked)) {
+          if (entries.get(id)?.agent.status === "closed") checkGone(id, attempt);
+          return;
+        }
+        // The card stays as it was (an archive may be waiting on this read):
+        // say so, and check again a little later.
+        pageError(`gone:${id}`, caught);
+        const delay = CONFIRM_RETRY_DELAYS_MS[failures];
+        if (delay !== undefined) {
+          setTimeout(() => {
+            if (run === generation) checkGone(id, attempt, failures + 1);
+          }, delay);
+        }
       });
     }, GONE_CHECK_DELAYS_MS[attempt]);
   }
@@ -1513,46 +2123,162 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
    * the done lane meanwhile. The agent is read again by id, and its record
    * and lists follow what it is now.
    */
-  function confirmAgent(id: string) {
-    if (confirmChecks.has(id)) return;
+  function applyConfirmedAgent(id: string, agent: PaseoAgent | null, placement: AgentPlacement) {
+    if (!agent || (isArchived(agent) && !keepsArchived(agent))) {
+      dropHeldSnapshot(id);
+      if (!agent) {
+        removeStamps.set(id, ++recordClock);
+        if (!entries.has(id)) recordStamps.set(id, recordClock);
+      }
+      if (entries.has(id)) {
+        batchUpdates(() => {
+          for (const members of sourceMembers.values()) members.delete(id);
+          removeRecord(id);
+        });
+      }
+      return;
+    }
+    if (isArchived(agent)) dropHeldSnapshot(id);
+    else if (waitsForHeldClear(agent)) return;
+    batchUpdates(() => {
+      reconcileActiveMembers(agent);
+      for (const [key, members] of sourceMembers) {
+        if (key === DONE_SUBSCRIPTION && isDone(agent)) members.add(agent.id);
+        else if (key.startsWith("done-page-") || key === DONE_SUBSCRIPTION) members.delete(agent.id);
+      }
+      updateRecord(agent, placement, true);
+      dropIfUnreferenced(agent.id);
+    });
+  }
+
+  function confirmAgent(id: string, attempt = 0) {
+    // One read at a time; one asked for meanwhile runs once that answers, so
+    // it sees the state of after it was asked, not the earlier read's.
+    if (confirmChecks.has(id)) {
+      confirmAgain.add(id);
+      return;
+    }
     confirmChecks.add(id);
     const run = generation;
+    const asked = recordClock;
+    const again = () => {
+      if (run === generation && confirmAgain.delete(id)) confirmAgent(id);
+    };
     void api.agents.ref(id).refresh().then((result) => {
       if (run !== generation) return;
       confirmChecks.delete(id);
-      if (!result || (isArchived(result.agent) && !keepsArchived(result.agent))) return;
-      const agent = result.agent;
-      batchUpdates(() => {
-        reconcileActiveMembers(agent);
-        for (const [key, members] of sourceMembers) {
-          if (key === DONE_SUBSCRIPTION && isDone(agent)) members.add(agent.id);
-          else if (key.startsWith("done-page-") || key === DONE_SUBSCRIPTION) members.delete(agent.id);
-        }
-        updateRecord(agent, result.project ?? null, true);
-        dropIfUnreferenced(agent.id);
-      });
-    }).catch(() => {
-      if (run === generation) confirmChecks.delete(id);
-    });
+      clearPageError(`read:${id}`);
+      // A newer state landed while the read was out: it is the one to keep.
+      if (changedSince(id, asked)) return;
+      applyConfirmedAgent(id, result?.agent ?? null, result?.project ?? null);
+    }).catch((caught: unknown) => {
+      if (run !== generation) return;
+      confirmChecks.delete(id);
+      // Its record changed since (archived and taken off, a newer update), or
+      // the board holds no card for it: this read no longer decides anything
+      // shown, so its failure says nothing.
+      if (changedSince(id, asked) || !entries.has(id)) return;
+      // The card may be left as it was (a hold's wait ended on this read):
+      // say so, and read it again a little later.
+      pageError(`read:${id}`, caught);
+      const delay = CONFIRM_RETRY_DELAYS_MS[attempt];
+      if (delay !== undefined) {
+        setTimeout(() => {
+          if (run === generation) confirmAgent(id, attempt + 1);
+        }, delay);
+      }
+    }).finally(again);
+  }
+
+  async function confirmHistoryAgent(id: string, alive: () => boolean): Promise<Landing> {
+    const asked = recordClock;
+    try {
+      const result = await api.agents.ref(id).refresh();
+      if (!alive()) return "stale";
+      clearPageError(`read:${id}`);
+      if (!changedSince(id, asked)) applyConfirmedAgent(id, result?.agent ?? null, result?.project ?? null);
+      return "landed";
+    } catch (caught) {
+      if (!alive()) return "stale";
+      if (changedSince(id, asked) || !entries.has(id)) return "landed";
+      pageError(`read:${id}`, caught);
+      const delay = CONFIRM_RETRY_DELAYS_MS[0];
+      if (delay !== undefined) setTimeout(() => { if (alive()) confirmAgent(id, 1); }, delay);
+      return "failed";
+    }
   }
 
   function matchingEntries(result: PaseoAgentListResult | { entries: PaseoAgentListResult["entries"] }) {
     return result.entries.filter(({ agent }) => !isArchived(agent) || keepsArchived(agent));
   }
 
-  /** `keepPages`: a refresh's first page, whose later pages are read again (`rereadDonePages`) instead of dropped. */
-  function replaceAgentSnapshot(sourceKey: string, snapshot: PaseoAgentListResult, keepPages = false) {
+  /**
+   * `keepPages`: a refresh's first page, whose later pages are read again (`rereadDonePages`) instead of dropped.
+   * `liveIds`: agents a live update moved while the list's later pages loaded; the
+   * list's copies of them are older, so they keep the membership they have.
+   */
+  /**
+   * Land an agent a list (or one of its pages) carries. An attention clear
+   * it brings first (a reconnect's snapshot, or a page, read between an
+   * archive's two steps) waits as a live one does: the archive, or the
+   * remove it comes as, follows within moments. A done page's agent is held
+   * as the done list's, the list whose remove the archive sends.
+   */
+  function landListed(sourceKey: string, entry: PaseoAgentListResult["entries"][number]) {
+    if (clearsOnlyAttention(entry.agent)) {
+      applyAgentUpdate(sourceKey, { type: "agent_update", payload: { kind: "upsert", agent: entry.agent, project: entry.project ?? undefined } });
+      return;
+    }
+    updateRecord(entry.agent, entry.project ?? null);
+  }
+
+  function replaceAgentSnapshot(sourceKey: string, snapshot: PaseoAgentListResult, keepPages = false, liveIds?: ReadonlySet<string>) {
     batchUpdates(() => {
       const nextMembers = new Set<string>();
+      const current = sourceMembers.get(sourceKey);
+      // Its record is newer than the list's copy: whether the list holds it
+      // follows that record (the status list may have landed it first), not
+      // the members this list had before.
+      for (const id of liveIds ?? []) {
+        const shown = entries.get(id)?.agent;
+        if (shown ? belongsToActiveList(sourceKey, shown) ?? current?.has(id) : current?.has(id)) nextMembers.add(id);
+      }
+      const listed = new Set<string>();
       for (const entry of matchingEntries(snapshot)) {
+        listed.add(entry.agent.id);
+        if (liveIds?.has(entry.agent.id)) continue;
+        // A held attention clear decides when the read lands.
+        if (waitsForHeldClear(entry.agent)) {
+          nextMembers.add(entry.agent.id);
+          continue;
+        }
         nextMembers.add(entry.agent.id);
-        updateRecord(entry.agent, entry.project ?? null);
+        landListed(sourceKey, entry);
+      }
+      // A held snapshot whose list no longer carries the agent (an archive
+      // whose removes were lost, then a reconnect): once its wait is over it
+      // reads the agent rather than apply what it held.
+      for (const [id, held] of startIdles) {
+        if (listed.has(id)) continue;
+        if (held.sourceKey === sourceKey || current?.has(id)) held.removedFromSource = true;
       }
       sourceMembers.set(sourceKey, nextMembers);
       const pagesKept = keepPages && [...sourceMembers.keys()].some((key) => key.startsWith("done-page-"));
       // The done lane starts over from its first page, as `doneCursor` below
       // does: a page read once hears of no archive made while disconnected.
-      if (sourceKey === DONE_SUBSCRIPTION && !pagesKept) for (const key of [...sourceMembers.keys()]) if (key.startsWith("done-page-")) sourceMembers.delete(key);
+      // A page asked for after the old first page belongs to it: it must not land on the new one.
+      if (sourceKey === DONE_SUBSCRIPTION) doneSnapshots += 1;
+      // A refresh's first page, its later pages to be read again: what the old
+      // first page held and the new one does not (pushed onto the second page
+      // by a task added at the top) stays until those pages land and replace
+      // it, so the card at the page boundary does not leave and come back.
+      if (sourceKey === DONE_SUBSCRIPTION && pagesKept) {
+        const carried = new Set([...(current ?? [])].filter((id) => !nextMembers.has(id)));
+        if (carried.size > 0) sourceMembers.set(DONE_PAGE_CARRY, carried);
+      }
+      if (sourceKey === DONE_SUBSCRIPTION && !pagesKept) {
+        for (const key of [...sourceMembers.keys()]) if (key.startsWith("done-page-")) sourceMembers.delete(key);
+      }
       for (const id of [...entries.keys()]) if (!nextMembers.has(id) && memberSetsContaining(id).length === 0) dropIfUnreferenced(id);
       if (sourceKey === STATUS_KEY) statusReady = true;
       if (sourceKey === ATTENTION_KEY) attentionReady = true;
@@ -1574,23 +2300,31 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
    * in at once: the lane neither shrinks while they load nor keeps an agent
    * archived or deleted since. A failed read keeps the old pages.
    */
-  async function rereadDonePages(run: Run, first: PaseoAgentListResult, pages: number, session: typeof searchPages, regularPages: number): Promise<Landing> {
+  async function rereadDonePages(run: Run, first: PaseoAgentListResult, snapshotAsked: number, pages: number, session: typeof searchPages, regularPages: number): Promise<Landing> {
+    const asked = recordClock;
+    // A newer first page landed before the pages were asked for: they would follow the old one.
+    if (doneSnapshots !== snapshotAsked) return "stale";
     const read: Array<{ key: string; result: PaseoAgentListResult }> = [];
     let cursor = first.pageInfo.nextCursor;
     try {
       while (read.length < (session && searchPages !== session ? regularPages : pages) && cursor) {
-        const result = await api.agents.list({ filter: doneFilter(), sort: DONE_SORT, page: { limit: PAGE_SIZE, cursor } });
-        if (!isCurrent(run)) return "stale";
+        // A newer first page landed: this chain of pages follows the old one, so stop asking.
+        if (doneSnapshots !== snapshotAsked) return "stale";
+        const result = await listAgents({ filter: doneFilter(), sort: DONE_SORT, page: { limit: PAGE_SIZE, cursor } });
+        if (!isCurrent(run) || doneSnapshots !== snapshotAsked) return "stale";
         read.push({ key: `done-page-${cursor}`, result });
         cursor = result.pageInfo.nextCursor;
       }
     } catch (caught) {
-      if (!isCurrent(run)) return "stale";
+      // A page of an old chain failing says nothing about the list now.
+      if (!isCurrent(run) || doneSnapshots !== snapshotAsked) return "stale";
       if (!session || searchPages === session || read.length < regularPages) {
         subscriptionError(caught);
         return "failed";
       }
     }
+    // The done list started over from a newer first page since: these pages follow the old one.
+    if (doneSnapshots !== snapshotAsked) return "stale";
     if (session && searchPages !== session) {
       read.splice(regularPages);
       cursor = read.length ? read.at(-1)!.result.pageInfo.nextCursor : first.pageInfo.nextCursor;
@@ -1605,8 +2339,11 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
       for (const { key, result } of read) {
         const members = new Set<string>();
         for (const entry of matchingEntries(result)) {
+          // Changed or removed while the pages were read (archived, prompted): its live state stands.
+          if (changedSince(entry.agent.id, asked) || removedSince(entry.agent.id, asked)) continue;
           members.add(entry.agent.id);
-          updateRecord(entry.agent, entry.project ?? null);
+          if (waitsForHeldClear(entry.agent)) continue;
+          landListed(DONE_SUBSCRIPTION, entry);
         }
         sourceMembers.set(key, members);
       }
@@ -1629,13 +2366,142 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
   }
 
   function subscriptionError(caught: unknown) {
+    // The gate is handled where the list is opened. Reporting it here toasts on every retry.
+    if (isBackgroundWorkspacesGate(caught)) return;
     error = caught instanceof Error ? caught.message : String(caught);
+    notify();
+  }
+
+  /** A list that failed: no longer loading, so the board shows what it has and a refresh reads it again. */
+  /**
+   * A list's subscription could not be made: nothing will tell the board of
+   * its changes (an archive, a new task) until it is made again. Refresh,
+   * which makes it again (a refresh reads loaded lists, and a failed first
+   * list counts as loaded), and again after a longer wait while it fails.
+   */
+  /** A list is being read, or a refresh is about to take its place. */
+  function servingList(key: string): boolean {
+    return subscriptions.has(key) || replacements.has(key);
+  }
+
+  /**
+   * The list under `key` is the one opened without background workspaces.
+   * Keep asking for the inclusive list. A recovery already in flight will
+   * ask; arming another timer here would retry twice.
+   */
+  function rememberBackgroundFallback(key: string) {
+    backgroundFallbacks.add(key);
+    oweList(key);
+  }
+
+  /**
+   * The list under `key` is owed to recovery. A recovery refresh in flight
+   * reads `listsToRecover` when it ends and schedules the next one, so only
+   * the key is added; otherwise a timer is armed.
+   */
+  function oweList(key: string) {
+    if (recoveryRunning) listsToRecover.add(key);
+    else scheduleListRecovery(key);
+  }
+
+  function scheduleListRecovery(key?: string) {
+    if (key !== undefined) listsToRecover.add(key);
+    if (recoveryTimer !== null) return;
+    const run = generation;
+    const delay = LIST_RECOVERY_DELAYS_MS[Math.min(recoveryAttempts, LIST_RECOVERY_DELAYS_MS.length - 1)]!;
+    recoveryTimer = setTimeout(() => {
+      recoveryTimer = null;
+      if (run !== generation || consumers === 0) return;
+      const epoch = ++recoveryEpoch;
+      recoveryRunning = true;
+      void refresh()
+        .finally(() => {
+          if (epoch === recoveryEpoch) recoveryRunning = false;
+        })
+        .then(() => {
+          if (run !== generation) return;
+          // A refresh can end "done" without a list it skipped (one still
+          // loading, as the workspaces wait for the status list's pages): only
+          // a list live again, or no longer wanted, is recovered. A fallback
+          // is live, and still owes the inclusive list, so it stays owed.
+          for (const listKey of [...listsToRecover]) {
+            if (!listWanted(listKey)) {
+              listsToRecover.delete(listKey);
+              backgroundFallbacks.delete(listKey);
+              continue;
+            }
+            if (subscriptions.has(listKey) && !backgroundFallbacks.has(listKey)) listsToRecover.delete(listKey);
+          }
+          if (listsToRecover.size === 0) {
+            recoveryAttempts = 0;
+            return;
+          }
+          recoveryAttempts += 1;
+          scheduleListRecovery();
+        });
+    }, delay);
+  }
+
+  /** Whether the board still wants this list (its tier has consumers). */
+  function listWanted(key: string): boolean {
+    if (consumers === 0) return false;
+    if (key === STATUS_KEY || key === "workspaces") return true;
+    if (key === ATTENTION_KEY) return attentionConsumers > 0;
+    if (key === DONE_SUBSCRIPTION) return doneConsumers > 0;
+    return false;
+  }
+
+  /**
+   * The SDK re-subscribes a list after a reconnect; if that fails it reports
+   * the error and lets the subscription go. A list it served is left with no
+   * live updates: let it go here too, and recover it. A refresh's list not
+   * yet serving just goes; the one it was to replace stays.
+   */
+  function subscriptionLost(key: string, own: StoreSubscription, caught: unknown) {
+    subscriptionError(caught);
+    if (subscriptions.get(key) === own) {
+      subscriptions.delete(key);
+      own.stopObserver();
+      own.stopped?.();
+      forgetArrivals(key, own);
+      scheduleListRecovery(key);
+    } else if (replacements.get(key) === own) {
+      dropReplacement(key, own);
+    }
+  }
+
+  function firstListFailed(key: string) {
+    if (key === STATUS_KEY && !statusReady) statusReady = true;
+    else if (key === ATTENTION_KEY && !attentionReady) attentionReady = true;
+    else if (key === DONE_SUBSCRIPTION) doneListLanded();
+    else if (key === "workspaces" && !workspacesReady) workspacesReady = true;
+    else return;
+    notify();
+  }
+
+  /** A list whose later pages could not be read: the board says so until a later snapshot of it reads them all. */
+  function pageError(key: string, caught: unknown) {
+    if (key !== historyScanKey && isBackgroundWorkspacesGate(caught)) return;
+    const message = caught instanceof Error ? caught.message : String(caught);
+    pageErrors.set(key, message);
+    error = message;
+    notify();
+  }
+
+  function clearPageError(key: string) {
+    const message = pageErrors.get(key);
+    if (message === undefined) return;
+    pageErrors.delete(key);
+    if (error !== message || [...pageErrors.values()].includes(message)) return;
+    // Another list may still be incomplete: say so until it reads every page too.
+    error = pageErrors.values().next().value ?? null;
     notify();
   }
 
   function isCurrent(run: Run): boolean {
     if (run.generation !== generation || consumers === 0 || run.refresh?.cancelled) return false;
     if (run.tier === "base") return run.tierRun === baseRun;
+    if (run.tier === "workspaces") return run.tierRun === workspaceRun;
     if (run.tier === "attention") return attentionConsumers > 0 && run.tierRun === attentionRun;
     if (run.tier === "board") return boardConsumers > 0 && run.tierRun === boardRun;
     if (run.tier === "done") return doneConsumers > 0 && run.tierRun === doneRun;
@@ -1647,6 +2513,20 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
     if (replacements.get(key) === own) replacements.delete(key);
     own.stopObserver();
     own.release();
+    own.stopped?.();
+    forgetArrivals(key, own);
+  }
+
+  /** A subscription that stopped serving: its snapshots no longer outrank the other one's; wake the list's waits. */
+  function forgetArrivals(key: string, own: StoreSubscription) {
+    if (arrivalOwners.get(key)?.delete(own)) for (const waiter of [...(landingWaiters.get(key) ?? [])]) waiter();
+  }
+
+  /** The newest snapshot of a list that arrived on a subscription still serving it. */
+  function newestServingArrival(key: string): number {
+    let newest = 0;
+    for (const arrived of arrivalOwners.get(key)?.values() ?? []) newest = Math.max(newest, arrived);
+    return newest;
   }
 
   /**
@@ -1657,15 +2537,23 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
     key: string,
     result: T,
     run: Run,
-    initial: (snapshot: T) => void,
+    /**
+     * Applies a snapshot. A paged one returns the landing of its later pages:
+     * the list lands (and a refresh ends) only once every page has. `live`
+     * says whether they are still wanted: this is the subscription's latest
+     * snapshot, and the subscription still serves (or is about to serve) its
+     * list. Not `isCurrent(run)`: a refresh moves the run, and a refresh that
+     * fails leaves this subscription serving, so its later snapshots must
+     * still page.
+     */
+    initial: (snapshot: T, live: () => boolean, landed: (outcome?: "landed" | "failed") => void, gate: LandingGate) => void | Promise<Landing>,
     update: (message: unknown) => void,
     replace = false,
   ): Promise<Landing> {
     const owned = result.subscription;
     if (!owned) {
       if (!isCurrent(run)) return "stale";
-      initial(result);
-      return "landed";
+      return (await initial(result, () => isCurrent(run), () => {}, { landable: () => isCurrent(run), whenLandable: async () => isCurrent(run) })) ?? "landed";
     }
     if (!isCurrent(run)) {
       await owned.release();
@@ -1673,19 +2561,77 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
     }
     const pending: Array<{ kind: "snapshot"; value: T } | { kind: "update"; value: unknown }> = [];
     let initialApplied = false;
+    // The landing of the latest snapshot's later pages; a newer snapshot replaces it and wakes the wait.
+    let latest: Promise<Landing> | void = undefined;
+    let latestArrived = 0;
+    let snapshots = 0;
+    let wake = () => {};
+    let own!: StoreSubscription;
+    const serving = () => run.generation === generation && consumers > 0 && (subscriptions.get(key) === own || replacements.get(key) === own);
+    const apply = (snapshot: T) => {
+      const mine = ++snapshots;
+      // Two subscriptions of one list (a refresh's and the one it replaces)
+      // both land snapshots on its members: one that arrived before another
+      // already landed is older, and must not undo it.
+      const arrived = (snapshotArrivals.get(key) ?? 0) + 1;
+      snapshotArrivals.set(key, arrived);
+      const owners = arrivalOwners.get(key) ?? new Map<StoreSubscription, number>();
+      arrivalOwners.set(key, owners);
+      owners.set(own, arrived);
+      // Worth reading its pages: its subscription's latest, still serving,
+      // and no newer snapshot of the list landed.
+      const live = () => mine === snapshots && serving() && (snapshotLandings.get(key) ?? 0) < arrived;
+      // May land now: also the newest snapshot of the list among the
+      // subscriptions still serving it, so an older one that finishes first
+      // does not land over a newer one still reading its pages. A newer one
+      // whose subscription was let go (a refresh that timed out) no longer counts.
+      const landable = () => live() && newestServingArrival(key) === arrived;
+      const gate: LandingGate = {
+        landable,
+        // Wait until it may land, or can no longer: woken by any landing of
+        // the list and by its subscriptions stopping.
+        async whenLandable() {
+          for (;;) {
+            if (landable()) return true;
+            if (!live()) return false;
+            const waiters = landingWaiters.get(key) ?? new Set<() => void>();
+            landingWaiters.set(key, waiters);
+            await new Promise<void>((resolve) => {
+              const done = () => { waiters.delete(done); resolve(); };
+              waiters.add(done);
+            });
+          }
+        },
+      };
+      const landed = (outcome: "landed" | "failed" = "landed") => {
+        if ((snapshotLandings.get(key) ?? 0) >= arrived) return;
+        snapshotLandings.set(key, arrived);
+        snapshotOutcomes.set(key, outcome);
+        // The other subscription of the list may be waiting on pages this landing just made stale.
+        for (const waiter of [...(landingWaiters.get(key) ?? [])]) waiter();
+      };
+      // A paged snapshot calls `landed` in the very step that lands it, after
+      // checking `live`: an older snapshot whose pages finish in the same turn
+      // must already see it landed.
+      const result = initial(snapshot, live, landed, gate);
+      if (result === undefined) landed();
+      latest = result;
+      latestArrived = arrived;
+      wake();
+    };
     const observer = {
       snapshot(snapshot: unknown) {
-        if (initialApplied) initial(snapshot as T);
+        if (initialApplied) apply(snapshot as T);
         else pending.push({ kind: "snapshot", value: snapshot as T });
       },
       update(message: unknown) {
         if (initialApplied) update(message);
         else pending.push({ kind: "update", value: message });
       },
-      error: subscriptionError,
+      error: (caught: unknown) => subscriptionLost(key, own, caught),
     };
     const stopObserver = owned.subscribe(observer);
-    const own: StoreSubscription = { stopObserver, release: () => { void owned.release(); } };
+    own = { stopObserver, release: () => { void owned.release(); }, stopped: () => wake() };
     if (replace) {
       const earlier = replacements.get(key);
       if (earlier) dropReplacement(key, earlier);
@@ -1699,18 +2645,58 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
         if (replace) dropReplacement(key, own);
         return "stale";
       }
+      apply(ready);
+      initialApplied = true;
+      for (const event of pending) {
+        // The SDK replays its snapshot to each new observer, the very one `ready` gives.
+        if (event.kind === "snapshot") { if (event.value !== ready) apply(event.value); }
+        else update(event.value);
+      }
+      // Wait for the pages of whichever snapshot is the latest: a newer one
+      // wakes the wait, so a page that hangs for an older one holds nothing.
+      let landing: Landing;
+      const waiters = landingWaiters.get(key) ?? new Set<() => void>();
+      landingWaiters.set(key, waiters);
+      const wakeOnLanding = () => wake();
+      waiters.add(wakeOnLanding);
+      try {
+        for (;;) {
+          if (!serving()) { landing = "stale"; break; }
+          // A newer snapshot of the list arrived on the other subscription:
+          // this one's pages can only be stale. Once that one lands, take its
+          // outcome; until then wait for it (it may still fail, and stopping
+          // its subscription before it lands would lose it).
+          const newest = newestServingArrival(key);
+          if (newest > latestArrived) {
+            if ((snapshotLandings.get(key) ?? 0) >= newest) { landing = snapshotOutcomes.get(key) ?? "landed"; break; }
+            await new Promise<null>((resolve) => { wake = () => resolve(null); });
+            continue;
+          }
+          const waiting: Promise<Landing> | undefined = latest ?? undefined;
+          if (waiting === undefined) { landing = "landed"; break; }
+          const woken = new Promise<null>((resolve) => { wake = () => resolve(null); });
+          const settled = await Promise.race([waiting, woken]);
+          if (settled === null || waiting !== latest) continue;
+          // Stale because it was superseded or stopped: look again.
+          if (settled === "stale" && (!serving() || newestServingArrival(key) > latestArrived)) continue;
+          landing = settled === "stale" ? "landed" : settled;
+          break;
+        }
+      } finally {
+        waiters.delete(wakeOnLanding);
+      }
+      // A refresh's list takes over only once every page of it landed;
+      // failing, timed out or superseded, it goes and the old list stays.
       if (replace) {
+        if (landing !== "landed" || !isCurrent(run)) {
+          dropReplacement(key, own);
+          return landing === "landed" ? "stale" : landing;
+        }
         replacements.delete(key);
         stopSubscription(key);
         subscriptions.set(key, own);
       }
-      initial(ready);
-      initialApplied = true;
-      for (const event of pending) {
-        if (event.kind === "snapshot") initial(event.value);
-        else update(event.value);
-      }
-      return "landed";
+      return landing;
     } catch (caught) {
       if (replace) dropReplacement(key, own);
       if (!isCurrent(run)) return "stale";
@@ -1830,6 +2816,7 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
     subagentReading = true;
     try {
       await readReads(run);
+      await readUnreads(run);
       await readOrigins(run);
       const result = await loader(subagentVersion);
       if (run !== generation) return;
@@ -1869,7 +2856,7 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
   function failsBySubagent(id: string, lastUserMessageAt: string | null): boolean {
     const readAt = readMarks.get(id);
     const seen = readAt !== undefined && readAt >= epoch(lastUserMessageAt) ? readAt : Number.NEGATIVE_INFINITY;
-    return shownSubagents(subagentsByParent.get(id), lastUserMessageAt).some((subagent) => subagent.status === "failed" && epoch(subagent.updatedAt) > seen);
+    return shownSubagents(subagentsByParent.get(id)).some((subagent) => subagent.status === "failed" && epoch(subagent.updatedAt) > epoch(lastUserMessageAt) && epoch(subagent.updatedAt) > seen);
   }
 
   /** The latest failure the board knows the time of: the last turn's error, or a provider subagent's. */
@@ -1945,6 +2932,39 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
     }
   }
 
+  /** The server's unread marks; a changed one moves a done card back to review. */
+  async function readUnreads(run: number) {
+    const loader = unreadMarksLoader;
+    if (!loader) return;
+    try {
+      const marks = await loader();
+      if (run !== generation) return;
+      const next = new Map<string, number>();
+      for (const mark of marks) {
+        const at = Date.parse(mark.unreadAt);
+        // A read that left before an open's clear landed still lists the mark.
+        if (Number.isFinite(at) && !clearingUnreads.has(mark.agentId)) next.set(mark.agentId, at);
+      }
+      const changed = new Set<string>();
+      for (const [id, at] of next) if (unreadMarks.get(id) !== at) changed.add(id);
+      for (const id of unreadMarks.keys()) if (!next.has(id)) changed.add(id);
+      if (changed.size === 0) return;
+      unreadMarks.clear();
+      for (const [id, at] of next) unreadMarks.set(id, at);
+      batchUpdates(() => {
+        for (const id of changed) {
+          refreshFinalCard(id);
+          const parent = parentByChild.get(id);
+          if (parent) refreshFinalCard(parent);
+        }
+        syncSubagentParents();
+        notify();
+      });
+    } catch {
+      // An older server without `tasks.unreads`, or a failed read: the marks stay as they were.
+    }
+  }
+
   /**
    * Keeps every parent with a failure since its latest prompt on the board,
    * and in the sidebar's review count, whether or not a list holds it: one
@@ -1977,8 +2997,11 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
 
   /** A failed parent no list holds, or one a list let go: read by id, kept while its failure shows. */
   function fetchSubagentParent(id: string, run: number) {
+    const asked = recordClock;
     void api.agents.ref(id).refresh().then((result) => {
       if (run !== generation) return;
+      // Its record changed (archived and taken off, prompted) while the read was out: that state stands.
+      if (changedSince(id, asked)) return;
       const members = sourceMembers.get(SUBAGENT_KEY);
       if (!result || isArchived(result.agent) || !failsBySubagent(id, result.agent.lastUserMessageAt)) {
         if (members?.delete(id)) dropIfUnreferenced(id);
@@ -2018,6 +3041,33 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
     return { filter, subscribe: {} };
   }
 
+  /**
+   * A one-shot agent read. A subscribe is opened by `openAgentSubscription`,
+   * which keeps the inclusive list owed. Here the host gate is asked once
+   * more without the flag, so a later page still lands.
+   */
+  async function listAgents(options: PaseoAgentListOptions): Promise<PaseoAgentListResult> {
+    const asked = generation;
+    try {
+      const result = await api.agents.list(options);
+      if (options.filter?.includeBackground && asked === generation) backgroundProven = true;
+      return result;
+    } catch (caught) {
+      if (options.subscribe || !options.filter?.includeBackground || !isBackgroundWorkspacesGate(caught)) throw caught;
+      // Once an inclusive list landed, a page without the flag would follow an inclusive cursor with fewer records.
+      if (backgroundProven) throw caught;
+      return await api.agents.list({ ...options, filter: withoutBackground(options.filter) });
+    }
+  }
+
+  /** A list's pages after the first, from its cursor. Stops once `alive` is false. */
+  function readAgentPages(options: PaseoAgentListOptions, cursor: string | null | undefined, alive: () => boolean): Promise<PageRead<PaseoAgentListResult["entries"][number]>> {
+    return readPages(cursor, alive, async (next) => {
+      const result = await listAgents({ filter: options.filter, ...(options.sort ? { sort: options.sort } : null), page: { limit: LIST_PAGE_SIZE, cursor: next } });
+      return { entries: result.entries, pageInfo: result.pageInfo };
+    });
+  }
+
   /** `refreshed`: a refresh's list (`observeOwned`'s `replace`), told of its first snapshot, which keeps the done pages. */
   async function openAgentSubscription(key: string, options: PaseoAgentListOptions, run: Run, refreshed?: (snapshot: PaseoAgentListResult) => void): Promise<Landing> {
     try {
@@ -2026,24 +3076,97 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
         await result.subscription?.release();
         return "stale";
       }
+      // The host answered the inclusive list: it has the feature, whether or not a later page reads.
+      if (options.filter?.includeBackground) backgroundProven = true;
       let first = refreshed !== undefined;
-      return await observeOwned(key, result, run,
-        (snapshot) => {
+      let receivedSnapshot = false;
+      const land = (list: PaseoAgentListResult, liveIds?: ReadonlySet<string>) => {
+        if (options.filter?.includeBackground) backgroundProven = true;
+        replaceAgentSnapshot(key, list, first, liveIds);
+        if (key === DONE_SUBSCRIPTION && receivedSnapshot && historyConsumers > 0) startHistoryScan(undefined, true);
+        receivedSnapshot = true;
+        if (!first) return;
+        first = false;
+        refreshed?.(list);
+      };
+      const landing = await observeOwned(key, result, run,
+        (snapshot, live, landed, gate) => {
           const list = snapshot as PaseoAgentListResult;
-          replaceAgentSnapshot(key, list, first);
-          if (!first) return;
-          first = false;
-          refreshed?.(list);
+          // The done list pages on its own (`loadMoreDone`); every other list is
+          // the whole of what it filters, and its snapshot only the first page
+          // (200 at most). Its members land once every page has, so an agent on
+          // a later page is not dropped for a moment.
+          if (key === DONE_SUBSCRIPTION || !list.pageInfo?.hasMore) {
+            land(list);
+            clearPageError(key);
+            return;
+          }
+          const liveIds = new Set<string>();
+          const asked = recordClock;
+          const watching = agentListUpdates.get(key) ?? new Set<Set<string>>();
+          agentListUpdates.set(key, watching);
+          watching.add(liveIds);
+          return readAgentPages(options, list.pageInfo.nextCursor, live).then(async (read): Promise<Landing> => {
+            if (read.kind === "stale" || !(await gate.whenLandable()) || !gate.landable()) {
+              watching.delete(liveIds);
+              return "stale";
+            }
+            watching.delete(liveIds);
+            // A page that cannot be read keeps the members the list had, lands the
+            // first page, and says the list is incomplete.
+            const entries = read.kind === "failed" ? list.entries : [...list.entries, ...read.entries];
+            if (read.kind === "failed") for (const id of sourceMembers.get(key) ?? []) liveIds.add(id);
+            // Changed anywhere while the pages were read (archived and removed, a read by id, another
+            // list adding it to this one): its current record decides, not the list's older copy.
+            for (const entry of entries) if (changedSince(entry.agent.id, asked)) liveIds.add(entry.agent.id);
+            for (const id of sourceMembers.get(key) ?? []) if (changedSince(id, asked)) liveIds.add(id);
+            land({ ...list, entries, pageInfo: { ...list.pageInfo, nextCursor: null, hasMore: false } }, liveIds);
+            landed(read.kind === "failed" ? "failed" : "landed");
+            if (read.kind === "failed") {
+              pageError(key, read.error);
+              return "failed";
+            }
+            clearPageError(key);
+            return "landed";
+          });
         },
         (message) => applyAgentUpdate(key, message as AgentUpdateEnvelope),
         refreshed !== undefined);
+      // The inclusive list is serving: the fallback, if this replaced one, is paid.
+      if (options.filter?.includeBackground && landing === "landed") backgroundFallbacks.delete(key);
+      // A first list whose subscription failed (its ready rejected) is not
+      // still loading: mark it loaded, so the board leaves its skeleton and a
+      // refresh, which reads only loaded lists again, retries it.
+      if (landing === "failed") firstListFailed(key);
+      return landing;
     } catch (caught) {
       if (!isCurrent(run)) return "stale";
+      if (isBackgroundWorkspacesGate(caught) && options.filter?.includeBackground) {
+        // A list already serving stays, including one opened without the flag.
+        // Replacing it on every retry would redraw the board on a host that never advertises the feature.
+        if (servingList(key)) return "failed";
+        if (backgroundProven) {
+          // The store keeps the last inclusive list until one lands again: a
+          // list without the flag would drop the background children and move
+          // their parents. Not loading any more, and owed to recovery.
+          if (key === STATUS_KEY) statusReady = true;
+          if (key === ATTENTION_KEY) attentionReady = true;
+          if (key === DONE_SUBSCRIPTION) doneListLanded();
+          notify();
+          oweList(key);
+          return "failed";
+        }
+        const landing = await openAgentSubscription(key, { ...options, filter: withoutBackground(options.filter) }, run, refreshed);
+        if (landing !== "stale" && isCurrent(run) && servingList(key)) rememberBackgroundFallback(key);
+        return landing;
+      }
       // A failed list must not hold the board on its skeleton.
       if (key === STATUS_KEY) statusReady = true;
       if (key === ATTENTION_KEY) attentionReady = true;
       if (key === DONE_SUBSCRIPTION) doneListLanded();
       subscriptionError(caught);
+      // A refresh's failure leaves the old list live; a first list's leaves none.
+      if (refreshed === undefined || !subscriptions.has(key)) scheduleListRecovery(key);
       return "failed";
     }
   }
@@ -2057,6 +3180,8 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
   function updateWorkspace(workspace: PaseoWorkspace) {
     const previous = workspaces.get(workspace.id);
     workspaces.set(workspace.id, workspace);
+    knownGoneWorkspaces.delete(workspace.id);
+    workspaceStamps.set(workspace.id, ++recordClock);
     if (workspace.archivingAt) workspaceArchiveTimes.set(workspace.id, workspace.archivingAt);
     else workspaceArchiveTimes.delete(workspace.id);
     let changed = !previous || boardShapeOf(previous) !== boardShapeOf(workspace);
@@ -2079,42 +3204,128 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
    * labels, outside screens and sidebar items at that. It runs with the
    * status list to distinguish background tasks and archived workspaces.
    */
-  async function startWorkspaceSubscription(run: Run, replace = false): Promise<Landing> {
+  /**
+   * The whole workspace list in place of the board's: what is not on it was
+   * archived, and its cards leave. A live update that landed since the
+   * snapshot began wins over the list's copy of its workspace.
+   */
+  function applyWorkspaceList(list: readonly PaseoWorkspace[], listUpdates: ReadonlyMap<string, "upsert" | "remove">, asked: number) {
+    // What the board learned of a workspace after the list was asked for
+    // (its own updates, a full read to place an agent's workspace) stands.
+    const liveUpdates = new Map(listUpdates);
+    for (const [id, stamp] of workspaceStamps) {
+      if (stamp > asked && !liveUpdates.has(id)) liveUpdates.set(id, workspaces.has(id) ? "upsert" : "remove");
+    }
+    batchUpdates(() => {
+      workspacesReady = true;
+      const next = new Set<string>();
+      for (const workspace of list) {
+        const live = liveUpdates.get(workspace.id);
+        if (live === "remove") continue;
+        next.add(workspace.id);
+        if (live !== "upsert") updateWorkspace(workspace);
+      }
+      for (const [id, live] of liveUpdates) if (live === "upsert") next.add(id);
+      workspacesListed = true;
+      // Gone, per this complete list: the workspaces the board held that it
+      // leaves out, and those of agents the board knew before it answered (a
+      // workspace of an agent seen later may be newer than the list).
+      for (const id of workspaces.keys()) if (!next.has(id)) knownGoneWorkspaces.add(id);
+      for (const [id, entry] of entries) {
+        const workspaceId = entry.agent.workspaceId;
+        if (workspaceId && !next.has(workspaceId) && (agentSeenAt.get(id) ?? Number.POSITIVE_INFINITY) <= asked) knownGoneWorkspaces.add(workspaceId);
+      }
+      for (const id of next) knownGoneWorkspaces.delete(id);
+      const removedIds = new Set([...workspaces.keys()].filter((id) => !next.has(id)));
+      for (const id of removedIds) workspaces.delete(id);
+      // Gone from the list, or never in it: archived, and its cards leave.
+      for (const [id, entry] of entries) {
+        if (!entry.agent.workspaceId || next.has(entry.agent.workspaceId)) continue;
+        if (removedIds.has(entry.agent.workspaceId)) {
+          const project = projectFor(entry, undefined, projects);
+          baseCards.set(id, buildBaseCard(entry, undefined, project, colorNames, modelCatalogs.get(entry.agent.provider), project ? projectIcons.get(project.projectId) : undefined));
+        }
+        refreshWithKin(id);
+      }
+      notify();
+    });
+  }
+
+  /** The workspace list's pages after the first, from its cursor. Stops once `alive` is false. */
+  function readWorkspacePages(cursor: string | null | undefined, alive: () => boolean, includeBackground = true): Promise<PageRead<PaseoWorkspace>> {
+    return readPages(cursor, alive, async (next) => {
+      const result = await api.workspaces.list({ filter: includeBackground ? { includeBackground: true } : {}, page: { limit: LIST_PAGE_SIZE, cursor: next } });
+      return { entries: result.entries, pageInfo: result.pageInfo };
+    });
+  }
+
+  async function startWorkspaceSubscription(run: Run, replace = false, includeBackground = true): Promise<Landing> {
     try {
-      const result = await api.workspaces.list({ filter: { includeBackground: true }, subscribe: {} });
+      const result = await api.workspaces.list({ filter: includeBackground ? { includeBackground: true } : {}, subscribe: {} });
       if (!isCurrent(run)) {
         await result.subscription?.release();
         return "stale";
       }
-      return await observeOwned("workspaces", result, run, (snapshot) => {
+      // The host answered the inclusive list: a later page refused by the gate must not
+      // let a list without background workspaces know them gone (`checkWorkspaces`).
+      if (includeBackground) backgroundProven = true;
+      const landing = await observeOwned("workspaces", result, run, (snapshot, live, landed, gate) => {
+        const firstPage = snapshot as PaseoWorkspaceListResult;
+        // What the board knew when the daemon answered: agents seen after may be newer than this list.
+        const asked = recordClock;
+        if (!firstPage.pageInfo?.hasMore) {
+          if (includeBackground) backgroundProven = true;
+          applyWorkspaceList(firstPage.entries, new Map(), asked);
+          clearPageError("workspaces");
+          return;
+        }
+        // The daemon pages its list (200 at most), and a subscription's
+        // snapshot is only the first page. Show that page now, but read a
+        // workspace that is not on it as archived only once every page landed.
+        // The board stays unready on a first list until then, so tasks of an
+        // archived workspace never show for a moment.
         batchUpdates(() => {
-          workspacesReady = true;
-          const workspaceSnapshot = snapshot as PaseoWorkspaceListResult;
-          const next = new Set<string>();
-          for (const workspace of workspaceSnapshot.entries) {
-            next.add(workspace.id);
-            updateWorkspace(workspace);
-          }
-          workspacesListed = true;
-          const removedIds = new Set([...workspaces.keys()].filter((id) => !next.has(id)));
-          for (const id of removedIds) workspaces.delete(id);
-          // Gone from the list, or never in it: archived, and its cards leave.
-          for (const [id, entry] of entries) {
-            if (!entry.agent.workspaceId || next.has(entry.agent.workspaceId)) continue;
-            if (removedIds.has(entry.agent.workspaceId)) {
-              const project = projectFor(entry, undefined, projects);
-              baseCards.set(id, buildBaseCard(entry, undefined, project, colorNames, modelCatalogs.get(entry.agent.provider), project ? projectIcons.get(project.projectId) : undefined));
-            }
-            refreshWithKin(id);
-          }
+          for (const workspace of firstPage.entries) updateWorkspace(workspace);
           notify();
+        });
+        const liveUpdates = new Map<string, "upsert" | "remove">();
+        workspaceListUpdates.add(liveUpdates);
+        return readWorkspacePages(firstPage.pageInfo.nextCursor, live, includeBackground).then(async (read): Promise<Landing> => {
+          if (read.kind === "stale" || !(await gate.whenLandable()) || !gate.landable()) {
+            workspaceListUpdates.delete(liveUpdates);
+            return "stale";
+          }
+          workspaceListUpdates.delete(liveUpdates);
+          if (read.kind === "failed") {
+            // A failed read keeps what the board had: no workspace leaves on a
+            // partial list. It still counts as this list's newest landing, so
+            // an older snapshot cannot land over it and its waits end.
+            landed("failed");
+            if (!workspacesReady) {
+              workspacesReady = true;
+              notify();
+            }
+            pageError("workspaces", read.error);
+            checkUnplacedWorkspaces();
+            return "failed";
+          }
+          if (includeBackground) backgroundProven = true;
+          applyWorkspaceList([...firstPage.entries, ...read.entries], liveUpdates, asked);
+          landed();
+          clearPageError("workspaces");
+          return "landed";
         });
       }, (message) => {
         const envelope = message as WorkspaceUpdateEnvelope;
         if (envelope.type !== "workspace_update" || !envelope.payload) return;
-        if (envelope.payload.kind === "upsert" && envelope.payload.workspace) updateWorkspace(envelope.payload.workspace);
-        else if (envelope.payload.kind === "remove" && envelope.payload.id) {
+        if (envelope.payload.kind === "upsert" && envelope.payload.workspace) {
+          for (const liveUpdates of workspaceListUpdates) liveUpdates.set(envelope.payload.workspace.id, "upsert");
+          updateWorkspace(envelope.payload.workspace);
+        } else if (envelope.payload.kind === "remove" && envelope.payload.id) {
+          for (const liveUpdates of workspaceListUpdates) liveUpdates.set(envelope.payload.id, "remove");
           workspaces.delete(envelope.payload.id);
+          knownGoneWorkspaces.add(envelope.payload.id);
+          workspaceStamps.set(envelope.payload.id, ++recordClock);
           for (const [id, entry] of entries) {
             if (entry.agent.workspaceId !== envelope.payload.id) continue;
             const base = buildBaseCard(entry, undefined, projectFor(entry, undefined, projects), colorNames, modelCatalogs.get(entry.agent.provider), undefined);
@@ -2124,10 +3335,31 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
           notify();
         }
       }, replace);
+      if (includeBackground && landing === "landed") backgroundFallbacks.delete("workspaces");
+      if (landing === "failed") firstListFailed("workspaces");
+      return landing;
     } catch (caught) {
       if (!isCurrent(run)) return "stale";
+      if (includeBackground && isBackgroundWorkspacesGate(caught)) {
+        if (servingList("workspaces")) return "failed";
+        if (backgroundProven) {
+          // A list without the flag would know the background workspaces gone: keep what the board has.
+          if (!workspacesReady) {
+            workspacesReady = true;
+            notify();
+          }
+          checkUnplacedWorkspaces();
+          oweList("workspaces");
+          return "failed";
+        }
+        const landing = await startWorkspaceSubscription(run, replace, false);
+        if (landing !== "stale" && isCurrent(run) && servingList("workspaces")) rememberBackgroundFallback("workspaces");
+        return landing;
+      }
       workspacesReady = true;
       subscriptionError(caught);
+      checkUnplacedWorkspaces();
+      if (!replace || !subscriptions.has("workspaces")) scheduleListRecovery("workspaces");
       return "failed";
     }
   }
@@ -2316,9 +3548,10 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
     statusReady = false;
     workspacesReady = false;
     workspacesListed = false;
+    workspaceCheckRun = null;
     sourceMembers.set(STATUS_KEY, new Set());
     void openAgentSubscription(STATUS_KEY, activeOptions(STATUS_FILTER), run);
-    void startWorkspaceSubscription(run);
+    void startWorkspaceSubscription({ generation, tier: "workspaces", tierRun: ++workspaceRun });
     scheduleSubagents(0);
   }
 
@@ -2346,6 +3579,193 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
     return { statuses: ["idle", "closed"], includeBackground: true, ...(archivedAsked ? { includeArchived: true } : null) };
   }
 
+  function historyWindowSet(): DoneWindow[] {
+    const windows = [...new Set(historyWindows.values())].sort();
+    return windows.length ? windows : retainedHistoryWindows;
+  }
+
+  function historyCandidate(agent: PaseoAgent, windows: readonly DoneWindow[], archived: boolean): boolean {
+    if (!isDone(agent)) return false;
+    if (!isArchived(agent)) return Boolean(agent.lastError);
+    if (!archived) return false;
+    const now = Date.now();
+    const archiveAge = now - Date.parse(agent.archivedAt!);
+    const updateAge = now - Date.parse(agent.updatedAt);
+    const inWindow = windows.some((window) => {
+      const cutoff = doneWindowMs(window);
+      return cutoff === null || archiveAge <= cutoff;
+    });
+    if (!inWindow) return false;
+    // A loaded candidate stays owned while any view still includes it.
+    if (sourceMembers.get(historyScanKey)?.has(agent.id)) return true;
+    return windows.some((window) => {
+      const cutoff = doneWindowMs(window);
+      return cutoff !== null && archiveAge <= cutoff && updateAge > cutoff;
+    });
+  }
+
+  function setHistoryWindow(owner: object, window: DoneWindow | undefined) {
+    const before = historyWindowSet().join(",");
+    if (window === undefined) historyWindows.delete(owner);
+    else historyWindows.set(owner, window);
+    if (historyWindows.size > 0) retainedHistoryWindows = [...new Set(historyWindows.values())].sort();
+    retainKnownHistory();
+    if (before !== historyWindowSet().join(",") && doneConsumers > 0) {
+      const sequence = ++historyScanSequence;
+      queueMicrotask(() => {
+        if (sequence === historyScanSequence && historyConsumers > 0) startHistoryScan(undefined, true);
+      });
+    }
+  }
+
+  /** A retained record is evidence unless a later done-list remove awaits confirmation. */
+  function retainKnownHistory() {
+    if (historyConsumers === 0) return;
+    const members = sourceMembers.get(historyScanKey) ?? new Set<string>();
+    const windows = historyWindowSet();
+    for (const [id, entry] of entries) {
+      if (!pendingHistoryRemovals.has(id) && historyCandidate(entry.agent, windows, archivedAsked)) members.add(id);
+    }
+    if (members.size > 0) sourceMembers.set(historyScanKey, members);
+  }
+
+  /** Read the old tail too: archive time and a settled failure are independent of updatedAt. */
+  async function scanHistory(refresh?: RefreshToken, verifyAttention = false): Promise<Landing> {
+    const sequence = ++historyScanSequence;
+    pendingHistoryScan = sequence;
+    const pending = sourceMembers.get(historyPendingKey) ?? new Set<string>();
+    for (const [id, entry] of entries) {
+      if (!pendingHistoryRemovals.has(id) && isDone(entry.agent) && (!isArchived(entry.agent) || archivedAsked)) pending.add(id);
+    }
+    if (pending.size > 0) sourceMembers.set(historyPendingKey, pending);
+    const scanGeneration = generation;
+    const windows = historyWindowSet();
+    const archived = archivedAsked;
+    const asked = recordClock;
+    const attentionAsked = snapshotArrivals.get(ATTENTION_KEY) ?? 0;
+    const alive = () => sequence === historyScanSequence && scanGeneration === generation && historyConsumers > 0 && !refresh?.cancelled && archived === archivedAsked;
+    // Called right after `alive()` held, so this scan is still the current one.
+    const settle = (result: "landed" | "failed") => (historyScanResult = result);
+    const options = { filter: { ...doneFilter(), ...(!archived ? { requiresAttention: false } : null) }, sort: DONE_SORT, page: { limit: LIST_PAGE_SIZE } };
+    try {
+      const first = await listAgents(options);
+      if (!alive()) return "stale";
+      const rest = await readAgentPages(options, first.pageInfo?.nextCursor, alive);
+      if (!alive() || rest.kind === "stale") return "stale";
+      if (rest.kind === "failed") {
+        pendingHistoryScan = null;
+        if (archived) archivedHistoryReady = true;
+        pageError(historyScanKey, rest.error);
+        return settle("failed");
+      }
+      const previous = sourceMembers.get(historyScanKey) ?? new Set<string>();
+      const held = sourceMembers.get(historyPendingKey) ?? new Set<string>();
+      const next = new Set<string>();
+      const apply: PaseoAgentListResult["entries"] = [];
+      const scanned = [...first.entries, ...rest.entries];
+      const seen = new Set(scanned.map((entry) => entry.agent.id));
+      for (const entry of scanned) {
+        const id = entry.agent.id;
+        if (removedSince(id, asked)) {
+          const current = entries.get(id)?.agent;
+          // A later accepted snapshot is stronger evidence than the earlier remove.
+          if (!pendingHistoryRemovals.has(id) && current && historyCandidate(current, windows, archived)) next.add(id);
+          continue;
+        }
+        if (changedSince(id, asked)) {
+          const current = entries.get(id)?.agent;
+          if (current && historyCandidate(current, windows, archived)) next.add(id);
+          continue;
+        }
+        if (!historyCandidate(entry.agent, windows, archived)) continue;
+        next.add(id);
+        apply.push(entry);
+      }
+      // Updates may move an old scan member ahead of the cursor while pages are read.
+      for (const id of previous) {
+        const current = entries.get(id)?.agent;
+        if ((!removedSince(id, asked) || !pendingHistoryRemovals.has(id)) && changedSince(id, asked) && current && historyCandidate(current, windows, archived)) next.add(id);
+      }
+      const excludedAttention = new Set<string>();
+      const missing = new Set([...previous].filter((id) => {
+        const current = entries.get(id)?.agent;
+        if (current && !archived && current.requiresAttention) {
+          next.add(id);
+          excludedAttention.add(id);
+          return false;
+        }
+        return !next.has(id) && !changedSince(id, asked) && current && historyCandidate(current, windows, archived);
+      }));
+      for (const id of held) {
+        const current = entries.get(id)?.agent;
+        if (seen.has(id) || changedSince(id, asked) || !current || !isDone(current)) continue;
+        if (!archived && (isArchived(current) || current.requiresAttention)) continue;
+        missing.add(id);
+      }
+      for (const id of missing) next.add(id);
+      batchUpdates(() => {
+        pendingHistoryScan = null;
+        sourceMembers.delete(historyPendingKey);
+        if (archived) archivedHistoryReady = true;
+        sourceMembers.set(historyScanKey, next);
+        for (const entry of apply) landListed(DONE_SUBSCRIPTION, entry);
+        for (const id of new Set([...previous, ...held])) if (!next.has(id)) dropIfUnreferenced(id);
+        clearPageError(historyScanKey);
+        notify();
+      });
+      if (missing.size === 0 && excludedAttention.size === 0) return settle("landed");
+      const listOwner = refresh ?? refreshing?.token;
+      const lists = listOwner?.listsReady
+        ? await Promise.race([listOwner.listsReady, listOwner.cancelledSignal.then(() => null)])
+        : undefined;
+      if (!alive()) return "stale";
+      const freshAttention = (snapshotLandings.get(ATTENTION_KEY) ?? 0) > attentionAsked && snapshotOutcomes.get(ATTENTION_KEY) === "landed";
+      const attentionUncertain = !attentionReady || lists === null || lists?.some((landing) => landing !== "landed") === true || (verifyAttention && !freshAttention);
+      for (const id of excludedAttention) if (attentionUncertain || !sourceMembers.get(ATTENTION_KEY)?.has(id)) missing.add(id);
+      const confirmations = await Promise.all([...missing].filter((id) => entries.has(id) && !changedSince(id, asked)).map((id) => confirmHistoryAgent(id, alive)));
+      if (!alive()) return "stale";
+      return settle(confirmations.includes("failed") ? "failed" : "landed");
+    } catch (caught) {
+      if (!alive()) return "stale";
+      pendingHistoryScan = null;
+      if (archived) archivedHistoryReady = true;
+      pageError(historyScanKey, caught);
+      return settle("failed");
+    }
+  }
+
+  function startHistoryScan(refresh?: RefreshToken, verifyAttention = false) {
+    historyScanOwner = refresh;
+    historyScanResult = null;
+    currentHistoryScan = scanHistory(refresh, verifyAttention);
+    for (const wake of [...historyScanWaiters]) wake();
+  }
+
+  /**
+   * A scan whose result a board opening now can share: one that landed, or
+   * one still running that no refresh owns (a refresh's scan ends with it
+   * when it times out). Live updates and reconnects keep a landed scan
+   * current while a hold keeps the lists open.
+   */
+  function historyScanShared(): boolean {
+    if (currentHistoryScan === null) return false;
+    return historyScanResult === "landed" || (historyScanResult === null && historyScanOwner === undefined);
+  }
+
+  async function waitForHistoryScan(token: RefreshToken): Promise<Landing> {
+    while (!token.cancelled && currentHistoryScan) {
+      const current = currentHistoryScan;
+      let wake!: () => void;
+      const changed = new Promise<null>((resolve) => { wake = () => resolve(null); });
+      historyScanWaiters.add(wake);
+      const result = await Promise.race([current, changed]);
+      historyScanWaiters.delete(wake);
+      if (current !== currentHistoryScan || result === null) continue;
+      return result;
+    }
+    return "stale";
+  }
+
   /**
    * Turn the archived lane on or off: the done list is read again with or
    * without archived agents. The cards on the board stay until it lands, so
@@ -2355,6 +3775,7 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
   function setArchivedLane(on: boolean) {
     if (archivedAsked === on) return;
     archivedAsked = on;
+    if (on) archivedHistoryReady = false;
     batchUpdates(() => {
       if (doneConsumers > 0 && consumers > 0) {
         doneRun += 1;
@@ -2365,6 +3786,7 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
         openDoneList();
       }
       if (!on || !doneReloading) showArchivedLane(on);
+      if (historyConsumers > 0) startHistoryScan(undefined, true);
       notify();
     });
   }
@@ -2386,6 +3808,7 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
 
   function startDone() {
     doneReady = false;
+    archivedHistoryReady = false;
     sourceMembers.set(DONE_SUBSCRIPTION, new Set());
     openDoneList();
   }
@@ -2399,15 +3822,28 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
     void openAgentSubscription(DONE_SUBSCRIPTION, doneListOptions(), run);
   }
 
+  /** Stop a list, and a refresh's list that was to replace it: neither may land after this. */
   function stopSubscription(key: string) {
+    const replacement = replacements.get(key);
+    if (replacement) dropReplacement(key, replacement);
     const subscription = subscriptions.get(key);
     if (!subscription) return;
     subscriptions.delete(key);
     subscription.stopObserver();
     subscription.release();
+    subscription.stopped?.();
+    forgetArrivals(key, subscription);
   }
 
   function stopDone() {
+    historyScanSequence += 1;
+    pendingHistoryScan = null;
+    currentHistoryScan = null;
+    historyScanOwner = undefined;
+    for (const wake of [...historyScanWaiters]) wake();
+    sourceMembers.delete(historyScanKey);
+    sourceMembers.delete(historyPendingKey);
+    clearPageError(historyScanKey);
     doneRun += 1;
     stopSubscription(DONE_SUBSCRIPTION);
     for (const key of [...sourceMembers.keys()]) if (key === DONE_SUBSCRIPTION || key.startsWith("done-page-")) sourceMembers.delete(key);
@@ -2470,6 +3906,14 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
 
   function stopAll() {
     cancelRefresh("superseded");
+    if (recoveryTimer !== null) clearTimeout(recoveryTimer);
+    recoveryTimer = null;
+    recoveryAttempts = 0;
+    recoveryRunning = false;
+    recoveryEpoch += 1;
+    listsToRecover.clear();
+    backgroundFallbacks.clear();
+    backgroundProven = false;
     generation += 1;
     for (const key of [...subscriptions.keys()]) stopSubscription(key);
     for (const [key, own] of [...replacements]) dropReplacement(key, own);
@@ -2477,7 +3921,9 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
     for (const unsubscribe of providerUnsubscribes.splice(0)) unsubscribe();
     enabledProviders.clear();
     for (const key of [...sourceMembers.keys()]) sourceMembers.delete(key);
+    pendingHistoryRemovals.clear();
     entries.clear();
+    agentSeenAt.clear();
     baseCards.clear();
     cards.clear();
     childrenByParent.clear();
@@ -2488,6 +3934,10 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
     parentReads.clear();
     workspaces.clear();
     workspaceArchiveTimes.clear();
+    // What the board knew of the workspaces is of the closed board: a
+    // workspace restored meanwhile must be read again, not known gone.
+    knownGoneWorkspaces.clear();
+    workspaceStamps.clear();
     projects.clear();
     colorNames.clear();
     modelCatalogs.clear();
@@ -2514,18 +3964,22 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
     serverOrigins.clear();
     originsVersion = undefined;
     readMarks.clear();
+    unreadMarks.clear();
     statusReady = false;
     attentionReady = false;
     workspacesReady = false;
     workspacesListed = false;
+    workspaceCheckRun = null;
     doneCursor = null;
     doneTailAt = null;
     loadingDone = false;
     doneReady = false;
     doneReloading = false;
+    archivedHistoryReady = false;
     historyError = null;
     archivedLane = archivedAsked;
     error = null;
+    pageErrors.clear();
     notify();
   }
 
@@ -2585,13 +4039,18 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
     const cutoff = doneWindowMs(options.doneWindow);
     const now = Date.now();
     const filteredCards = [...cards.values()].filter((card) => {
-      if (inBackgroundWorkspace(card) || entries.get(card.id)?.agent.labels?.[TITLE_HELPER_LABEL] === TITLE_HELPER_PURPOSE) return false;
+      const labels = entries.get(card.id)?.agent.labels;
+      if (
+        isBackground(card) ||
+        labels?.[TITLE_HELPER_LABEL] === TITLE_HELPER_PURPOSE ||
+        labels?.[TRANSLATION_HELPER_LABEL] === TRANSLATION_HELPER_PURPOSE
+      ) return false;
       if (!isHistoryLane(card.lane)) return true;
       if (!options.includeDone || (card.lane === "archived" && !showArchived)) return false;
       if (cutoff === null) return true;
       // Done uses the card's own end: the daemon moves `updatedAt` whenever it loads the agent.
       // Archived uses the archive time, so a later touch does not count as just archived.
-      const at = Date.parse(card.lane === "done" ? settledAt(card.timing) : archivedOrderAt(card));
+      const at = Date.parse(card.lane === "done" ? settledAt(card.timing) : archivedWindowAt(card));
       return Number.isFinite(at) && now - at <= cutoff;
     });
     const byId = new Map(filteredCards.map((card) => [card.id, card]));
@@ -2600,7 +4059,7 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
       for (const child of card.children) {
         if (byId.has(child.id)) continue;
         const hidden = cards.get(child.id);
-        if (hidden && inBackgroundWorkspace(hidden)) byId.set(hidden.id, hidden);
+        if (hidden && isBackground(hidden)) byId.set(hidden.id, hidden);
       }
     }
     const lanes = {} as Record<LaneId, LaneModel>;
@@ -2609,7 +4068,7 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
       laneCards.sort(laneCompare(lane));
       const tailOld = cutoff !== null && doneTailAt !== null && Number.isFinite(Date.parse(doneTailAt)) && now - Date.parse(doneTailAt) > cutoff;
       const paged = lane === "done" ? options.includeDone : lane === "archived" && showArchived;
-      const initialLoading = paged && (!doneReady || (lane === "archived" && doneReloading));
+      const initialLoading = paged && (!doneReady || (lane === "archived" && (doneReloading || !archivedHistoryReady)));
       lanes[lane] = {
         id: lane,
         cards: laneCards,
@@ -2658,10 +4117,21 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
       resolveParent,
       refreshParent,
       refreshReads,
+      refreshUnreads,
       requestProjectIcon,
     };
     snapshotCaches.push({ key: cacheKey, snapshot });
     return snapshot;
+  }
+
+  function getQuestionCounts(scope?: CountScope): SidebarCounts {
+    const counts = getCounts(scope);
+    if (!questionCountsCache || questionCountsCache.questions !== countQuestions ||
+      questionCountsCache.needsInput !== counts.needsInput || questionCountsCache.running !== counts.running ||
+      questionCountsCache.review !== counts.review || questionCountsCache.ready !== counts.ready || questionCountsCache.hidden !== counts.hidden) {
+      questionCountsCache = { ...counts, questions: countQuestions };
+    }
+    return questionCountsCache;
   }
 
   function getCounts(scope?: CountScope): SidebarCounts {
@@ -2677,14 +4147,21 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
         if (card.lane === "needs_input" || card.lane === "running" || (card.lane === "review" && reviewKnown)) lanes[card.lane].cards.push(card);
       };
       for (const card of cards.values()) {
-        if (inBackgroundWorkspace(card) || entries.get(card.id)?.agent.labels?.[TITLE_HELPER_LABEL] === TITLE_HELPER_PURPOSE) continue;
+        const labels = entries.get(card.id)?.agent.labels;
+        if (
+          isBackground(card) ||
+          labels?.[TITLE_HELPER_LABEL] === TITLE_HELPER_PURPOSE ||
+          labels?.[TRANSLATION_HELPER_LABEL] === TRANSLATION_HELPER_PURPOSE
+        ) continue;
         add(card);
         // A provider subagent's card counts in its lane, as the board draws it (`withSubagentCards`).
         if (card.lane !== "archived" && card.children.some((child) => child.kind === "provider")) {
           for (const sub of subagentCardsOf(card)) add(sub);
         }
       }
-      const shown = scope ? filterLanes(lanes, scope.filters, scope.firstMessage && scope.filters.query.trim() ? firstMessagesOf(lanes, scope.firstMessage) : undefined) : lanes;
+      const shown = scope ? filterLanes(lanes, scope.filters, scope.firstMessage && scope.filters.query.trim() ? firstMessagesOf(lanes, scope.firstMessage) : undefined, scope.home) : lanes;
+      const questions = shown.needs_input.cards.filter((card) => card.permission?.kind === "question" || card.permission?.kind === "other").sort(laneCompare("needs_input"));
+      if (countQuestions.length !== questions.length || questions.some((card, index) => countQuestions[index] !== card)) countQuestions = questions;
       const needsInput = shown.needs_input.cards.length;
       const running = shown.running.cards.length;
       const review = shown.review.cards.length;
@@ -2753,20 +4230,27 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
     if (cutoff !== null && Number.isFinite(tailTime) && Date.now() - tailTime > cutoff) return;
     const cursor = doneCursor;
     const run: Run = { generation, tier: "done", tierRun: doneRun };
+    const asked = recordClock;
+    const snapshotAsked = doneSnapshots;
     loadingDone = true;
     notify();
-    void api.agents.list({
+    void listAgents({
       filter: doneFilter(),
       sort: [{ key: "updated_at", direction: "desc" }],
       page: { limit: PAGE_SIZE, cursor },
     }).then((result) => {
       if (!isCurrent(run) || (current && !current())) return;
+      // The done list was read again from its first page since: this page follows the old one.
+      if (doneSnapshots !== snapshotAsked) return;
       const key = `done-page-${cursor}`;
       batchUpdates(() => {
         const pageMembers = new Set<string>();
         for (const entry of matchingEntries(result)) {
+          // Changed or removed while the page was read: its live state stands.
+          if (changedSince(entry.agent.id, asked) || removedSince(entry.agent.id, asked)) continue;
           pageMembers.add(entry.agent.id);
-          updateRecord(entry.agent, entry.project ?? null);
+          if (waitsForHeldClear(entry.agent)) continue;
+          landListed(DONE_SUBSCRIPTION, entry);
         }
         sourceMembers.set(key, pageMembers);
         doneCursor = result.pageInfo.nextCursor;
@@ -2775,16 +4259,21 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
           if (current) searchPages.keys.add(key);
           else { searchPages.keys.clear(); searchPages.cursor = doneCursor; searchPages.tail = doneTailAt; }
         }
+        // The page and the end of its loading in one board update: each update draws every lane again.
+        loadingDone = false;
         notify();
       });
     }).catch((caught: unknown) => {
-      if (!isCurrent(run)) return;
+      // A page of the old first page's chain failing says nothing about the list now.
+      if (!isCurrent(run) || doneSnapshots !== snapshotAsked) return;
+      // The client's hello flag went away for a moment: the page is asked again on the next scroll, no notice.
+      if (isBackgroundWorkspacesGate(caught)) return;
       if (!current) { subscriptionError(caught); return; }
       if (!current()) return;
       historyError = caught instanceof Error ? caught.message : String(caught);
       notify();
     }).finally(() => {
-      if (!isCurrent(run)) return;
+      if (!isCurrent(run) || !loadingDone) return;
       loadingDone = false;
       notify();
     });
@@ -2796,7 +4285,12 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
    * child before its parent.
    */
   function queueParentRead(id: string) {
-    if ((resolvedParents.has(id) && !hasActiveBackgroundChildren(id)) || parentReads.has(id)) return;
+    // Read once; a parent with active background children is read again for
+    // its record, unless it was found archived (it gets none: reading it
+    // again, which refreshes the children, which queue it again, would loop).
+    // An explicit refreshParent still reads it.
+    const known = resolvedParents.get(id);
+    if ((known && (known.archived === true || !hasActiveBackgroundChildren(id))) || parentReads.has(id)) return;
     parentReads.add(id);
     if (parentReads.size > 1) return;
     const run = generation;
@@ -2822,12 +4316,51 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
     void readReads(generation);
   }
 
+  function refreshUnreads(): void {
+    void readUnreads(generation);
+  }
+
+  /**
+   * The board opened this agent in Paseo: it was seen, so its unread mark
+   * goes now and on the server. The server is asked every time, as the marks
+   * may not have been read yet; its marks are read again after, so a failed
+   * or older server puts the mark back.
+   */
+  function openedAgent(id: string): void {
+    const clearer = unreadClearer;
+    if (!clearer) return;
+    if (unreadMarks.delete(id)) {
+      batchUpdates(() => {
+        refreshFinalCard(id);
+        const parent = parentByChild.get(id);
+        if (parent) refreshFinalCard(parent);
+        syncSubagentParents();
+        notify();
+      });
+    }
+    const run = generation;
+    clearingUnreads.set(id, (clearingUnreads.get(id) ?? 0) + 1);
+    const settle = () => {
+      const left = (clearingUnreads.get(id) ?? 1) - 1;
+      if (left > 0) clearingUnreads.set(id, left);
+      else clearingUnreads.delete(id);
+      if (run === generation) void readUnreads(run);
+    };
+    void Promise.resolve().then(() => clearer([id])).then(settle, settle);
+  }
+
   function refreshParent(id: string): Promise<boolean | null> {
     if (!resolvedParents.has(id)) resolvedParents.set(id, { title: null, archived: null });
     const run = generation;
+    const asked = recordClock;
+    const read = (parentReadSeqs.get(id) ?? 0) + 1;
+    parentReadSeqs.set(id, read);
     return api.agents.ref(id).refresh().then((result) => {
       const archived = result ? isArchived(result.agent) : null;
       if (run !== generation || !result) return archived;
+      // A later read of the parent, or a change to its record since (archived
+      // and taken off by a gone check), outranks this answer.
+      if (parentReadSeqs.get(id) !== read || changedSince(id, asked)) return archived;
       resolvedParents.set(id, { title: result.agent.title?.trim() || null, archived });
       if (!archived && hasActiveBackgroundChildren(id)) updateRecord(result.agent, result.project ?? null);
       for (const childId of linkedChildrenOf(id)) refreshFinalCard(childId);
@@ -2904,6 +4437,7 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
 
   function subscribe(listener: () => void, demand: TasksDemand): () => void {
     const done = demand.board && demand.done;
+    const history = done && demand.historyScan !== undefined;
     const attention = demand.board || demand.attention === true;
     listeners.add(listener);
     consumers += 1;
@@ -2923,9 +4457,26 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
       doneConsumers += 1;
       if (doneConsumers === 1) startDone();
     }
+    if (history) {
+      historyConsumers += 1;
+      if (historyConsumers === 1) {
+        retainKnownHistory();
+        startHistoryScan();
+      } else if (demand.historyScan === "board" && !historyScanShared()) startHistoryScan(undefined, true);
+    }
     return () => {
       listeners.delete(listener);
       consumers = Math.max(0, consumers - 1);
+      if (history) {
+        historyConsumers = Math.max(0, historyConsumers - 1);
+        if (historyConsumers === 0) {
+          historyScanSequence += 1;
+          pendingHistoryScan = null;
+          currentHistoryScan = null;
+          historyScanOwner = undefined;
+          for (const wake of [...historyScanWaiters]) wake();
+        }
+      }
       if (done) {
         doneConsumers = Math.max(0, doneConsumers - 1);
         if (doneConsumers === 0 && consumers > 0) stopDone();
@@ -2956,9 +4507,12 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
     if (refreshing) return refreshing.promise;
     if (error !== null) {
       error = null;
+      pageErrors.clear();
       notify();
     }
-    const token: RefreshToken = { cancelled: false };
+    let signalCancellation!: () => void;
+    const cancelledSignal = new Promise<void>((resolve) => { signalCancellation = resolve; });
+    const token: RefreshToken = { cancelled: false, cancelledSignal, signalCancellation };
     let timer: ReturnType<typeof setTimeout> | null = null;
     let resolve!: (result: TasksRefreshResult) => void;
     const promise = new Promise<TasksRefreshResult>((settle) => { resolve = settle; });
@@ -2974,16 +4528,22 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
     };
     refreshing = active;
     const landings: Array<Promise<Landing>> = [];
-    if (statusReady) {
+    // A list lost before its first landing (a reconnect's re-subscribe failed
+    // while its first pages were out) has nothing loading it any more: read it too.
+    const lost = (key: string) => listsToRecover.has(key) && !subscriptions.has(key);
+    if (statusReady || lost(STATUS_KEY)) {
       const run: Run = { generation, tier: "base", tierRun: ++baseRun, refresh: token };
       landings.push(openAgentSubscription(STATUS_KEY, activeOptions(STATUS_FILTER), run, () => {}));
-      if (workspacesReady) landings.push(startWorkspaceSubscription(run, true));
     }
-    if (attentionConsumers > 0 && attentionReady) {
+    // Only a workspace list that landed is read again; one still loading carries on.
+    if ((statusReady && workspacesReady) || lost("workspaces")) {
+      landings.push(startWorkspaceSubscription({ generation, tier: "workspaces", tierRun: ++workspaceRun, refresh: token }, true));
+    }
+    if (attentionConsumers > 0 && (attentionReady || lost(ATTENTION_KEY))) {
       const run: Run = { generation, tier: "attention", tierRun: ++attentionRun, refresh: token };
       landings.push(openAgentSubscription(ATTENTION_KEY, activeOptions(ATTENTION_FILTER), run, () => {}));
     }
-    if (doneConsumers > 0 && doneReady && !doneReloading) {
+    if (doneConsumers > 0 && (lost(DONE_SUBSCRIPTION) || (doneReady && !doneReloading))) {
       const run: Run = { generation, tier: "done", tierRun: ++doneRun, refresh: token };
       const pages = [...sourceMembers.keys()].filter((key) => key.startsWith("done-page-")).length;
       const session = searchPages;
@@ -2993,11 +4553,19 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
       doneRefreshRun = doneRun;
       notify();
       let first: PaseoAgentListResult | null = null;
-      landings.push(openAgentSubscription(DONE_SUBSCRIPTION, doneListOptions(), run, (list) => { first = list; })
-        .then((landing) => (landing === "landed" && first && pages > 0 ? rereadDonePages(run, first, pages, session, regularPages) : landing))
+      // The first page and the done generation it set, taken together as it lands: the pages after it
+      // are read from its cursor and belong to it, even if a newer first page lands before they start.
+      let firstGeneration = -1;
+      landings.push(openAgentSubscription(DONE_SUBSCRIPTION, doneListOptions(), run, (list) => { first = list; firstGeneration = doneSnapshots; })
+        .then((landing) => (landing === "landed" && first && pages > 0 ? rereadDonePages(run, first, firstGeneration, pages, session, regularPages) : landing))
         .finally(() => {
           if (doneRefreshRun === run.tierRun) { doneRefreshRun = -1; notify(); }
         }));
+    }
+    const listsReady = Promise.all(landings);
+    token.listsReady = listsReady;
+    if (historyConsumers > 0) {
+      startHistoryScan(token);
     }
     scheduleSubagents(0);
     timer = setTimeout(() => {
@@ -3006,9 +4574,17 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
       cancelRefresh("failed");
     }, REFRESH_TIMEOUT_MS);
     // A list that lands keeps its place; one that fails leaves the old list live.
-    void Promise.all(landings).then((results) => active.end(
-      results.includes("failed") ? "failed" : results.length > 0 && results.every((result) => result === "stale") ? "superseded" : "done",
-    ));
+    void listsReady.then(async (results) => {
+      while (!token.cancelled && historyConsumers > 0) {
+        const current = currentHistoryScan;
+        const result = await waitForHistoryScan(token);
+        if (current !== currentHistoryScan) continue;
+        results.push(result);
+        break;
+      }
+      if (token.cancelled) return;
+      active.end(results.includes("failed") ? "failed" : results.length > 0 && results.every((result) => result === "stale") ? "superseded" : "done");
+    });
     return promise;
   }
 
@@ -3022,6 +4598,16 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
     const active = refreshing;
     if (!active) return;
     active.token.cancelled = true;
+    active.token.signalCancellation();
+    // Its scan, unless it already ended: a landed one stays shareable.
+    if (historyScanOwner === active.token && historyScanResult === null) {
+      historyScanSequence += 1;
+      pendingHistoryScan = null;
+      currentHistoryScan = null;
+      historyScanOwner = undefined;
+      if (archivedAsked) archivedHistoryReady = true;
+    }
+    for (const wake of [...historyScanWaiters]) wake();
     for (const [key, own] of [...replacements]) dropReplacement(key, own);
     doneRefreshRun = -1;
     notify();
@@ -3040,9 +4626,19 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
   function hold(reason: TasksHoldReason, ms: number | null) {
     let held = holds.get(reason);
     if (!held) {
-      held = { release: subscribe(() => {}, BOARD_DEMAND), timer: null };
+      const demand: TasksDemand = historyConsumers > 0 ? { ...BOARD_DEMAND, historyScan: "hold" } : BOARD_DEMAND;
+      held = { release: subscribe(() => {}, demand), timer: null, historyScan: demand.historyScan !== undefined };
       holds.set(reason, held);
       heldStores.add(store);
+    }
+    if (historyConsumers > 0) {
+      for (const existing of holds.values()) {
+        if (existing.historyScan) continue;
+        const release = subscribe(() => {}, { ...BOARD_DEMAND, historyScan: "hold" });
+        existing.release();
+        existing.release = release;
+        existing.historyScan = true;
+      }
     }
     if (held.timer !== null) clearTimeout(held.timer);
     held.timer = ms === null ? null : setTimeout(() => dropHold(reason), ms);
@@ -3059,6 +4655,7 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
 
   const store: TaskStore = {
     subscribe,
+    setHistoryWindow,
     hold,
     hasHold: (reason) => holds.has(reason),
     dropHolds() {
@@ -3066,12 +4663,15 @@ function createStore(api: PaseoApi, localServerExtras = true): TaskStore {
     },
     getSnapshot,
     getCounts,
+    getQuestionCounts,
     refresh,
     setArchivedLane,
     loadMoreDone,
     resolveParent,
     refreshParent,
     refreshReads,
+    refreshUnreads,
+    openedAgent,
     requestProjectIcon,
   };
   return store;
@@ -3103,12 +4703,17 @@ function getRemoteStore(api: PaseoApi): TaskStore {
 export function useTasks(paseo: PaseoApi, options: TasksOptions, beforeRelease?: (paseo: PaseoApi) => void): TasksHandle {
   const store = options.remoteHost ? getRemoteStore(paseo) : getStore(paseo);
   const archived = options.includeDone && options.includeArchived === true;
+  const windowOwner = useMemo(() => ({}), [store]);
+  useLayoutEffect(() => {
+    store.setHistoryWindow(windowOwner, options.includeDone ? options.doneWindow : undefined);
+    return () => store.setHistoryWindow(windowOwner, undefined);
+  }, [store, windowOwner, options.doneWindow, options.includeDone]);
   // Before the subscription (a layout effect runs ahead of it), so a first
   // board reads the done list once, with archived agents or without; after,
   // a switch reads it again without letting go of the board.
   useLayoutEffect(() => store.setArchivedLane(archived), [store, archived]);
   const subscribe = useMemo(() => (listener: () => void) => {
-    const release = store.subscribe(listener, { board: true, done: options.includeDone });
+    const release = store.subscribe(listener, { board: true, done: options.includeDone, historyScan: "board" });
     return () => {
       beforeRelease?.(paseo);
       release();
@@ -3138,6 +4743,17 @@ export function holdTasks(paseo: PaseoApi, reason: TasksHoldReason, ms: number |
   getStore(paseo).hold(reason, ms);
 }
 
+/**
+ * The board opened an agent in Paseo: drop its unread mark, so a task marked
+ * unread and then looked at does not come back to review. Without a store
+ * for this host the server is still told.
+ */
+export function openedTask(paseo: PaseoApi, agentId: string): void {
+  const store = stores.get(paseo);
+  if (store) store.openedAgent(agentId);
+  else void unreadClearer?.([agentId]).catch(() => {});
+}
+
 export function hasTasksHold(paseo: PaseoApi, reason: TasksHoldReason): boolean {
   return stores.get(paseo)?.hasHold(reason) ?? false;
 }
@@ -3154,13 +4770,13 @@ export function releaseTasksHolds(): void {
  * the cards an unfiltered board draws, a provider subagent's included.
  * Re-renders only when a number changes.
  */
-export function useTaskCounts(paseo: PaseoApi, review: boolean, scope?: CountScope): SidebarCounts {
+export function useTaskCounts(paseo: PaseoApi, review: boolean, scope?: CountScope, questions = false): SidebarCounts {
   const store = getStore(paseo);
   const subscribe = useMemo(
     () => (listener: () => void) => store.subscribe(listener, { board: false, done: false, attention: review }),
     [store, review],
   );
-  const getCounts = useMemo(() => () => store.getCounts(scope), [store, scope]);
+  const getCounts = useMemo(() => () => questions ? store.getQuestionCounts(scope) : store.getCounts(scope), [store, scope, questions]);
   return useSyncExternalStore(subscribe, getCounts, getCounts);
 }
 
@@ -3183,17 +4799,18 @@ function firstMessagesOf(lanes: Record<LaneId, LaneModel>, read: (card: TaskCard
  * one needs a person, so it keeps its own card unless its parent's card is in
  * the same lane and already shows it.
  */
-export function filterLanes(lanes: Record<LaneId, LaneModel>, filters: BoardFilters, firstMessages?: ReadonlyMap<string, string>): Record<LaneId, LaneModel> {
+export function filterLanes(lanes: Record<LaneId, LaneModel>, filters: BoardFilters, firstMessages?: ReadonlyMap<string, string>, home?: string): Record<LaneId, LaneModel> {
   const query = filters.query.trim().toLowerCase();
   const matches = (card: TaskCard) => {
-    return matchesTaskSearch(card, query, firstMessages?.get(card.id)) &&
+    return matchesTaskSearch(card, query, firstMessages?.get(card.id), home) &&
       (filters.workspaceIds.length === 0 || (card.location.workspaceId !== null && filters.workspaceIds.includes(card.location.workspaceId))) &&
       (filters.providers.length === 0 || filters.providers.includes(card.provider)) &&
       (filters.labels.length === 0 || card.labels.some((label) => filters.labels.includes(label.name)));
   };
   const byId = new Map<string, TaskCard>();
   if (filters.hideSubtasks) for (const id of LANE_ORDER) for (const card of lanes[id].cards) byId.set(card.id, card);
-  const keep = (card: TaskCard) => {
+  // Whether the card has a place of its own, before history folds into it.
+  const shown = (card: TaskCard) => {
     if (!matches(card)) return false;
     // A detached card's former parent is history: it is a task of its own.
     if (!filters.hideSubtasks || card.parent === null || card.parent.detached) return true;
@@ -3203,7 +4820,47 @@ export function filterLanes(lanes: Record<LaneId, LaneModel>, filters: BoardFilt
     if (!parent || !matches(parent) || !parent.children.some((child) => child.id === card.id)) return true;
     return card.status === "running" ? false : parent.lane !== card.lane;
   };
+  // Historical links are used only for display when both cards are archived,
+  // and only onto a parent card that is itself on the board: one folded into
+  // its own parent's row would hide the child with it.
+  const historicalRows = new Map<string, TaskChild[]>();
+  const foldedHistory = new Set<string>();
+  // Archived cards with a detached link, and how many of them name each card as parent.
+  const linked = new Map<string, TaskCard>();
+  const undecided = new Map<string, number>();
+  if (filters.hideSubtasks) for (const card of lanes.archived.cards) {
+    if (!card.parent?.detached) continue;
+    linked.set(card.id, card);
+    undecided.set(card.parent.id, (undecided.get(card.parent.id) ?? 0) + 1);
+  }
+  // From the leaves up, without recursion: a card is decided once all its
+  // history is, and one that matching history folds into keeps its own place.
+  // Cards on a cycle of links, filtered or not, are never decided and fold nowhere.
+  const hosts = new Set<string>();
+  const queue = [...linked.values()].filter((card) => !undecided.has(card.id));
+  for (let index = 0; index < queue.length; index++) {
+    const card = queue[index]!;
+    const parentId = card.parent!.id;
+    const parent = byId.get(parentId);
+    if (matches(card) && !hosts.has(card.id) && card.children.length === 0 && parent?.lane === "archived" && shown(parent)) {
+      foldedHistory.add(card.id);
+      hosts.add(parentId);
+      if (!parent.children.some((child) => child.id === card.id)) {
+        const rows = historicalRows.get(parentId) ?? [];
+        rows.push({ id: card.id, title: card.title, status: card.status, provider: card.provider, modelLabel: card.modelLabel, thinkingLabel: card.thinkingLabel, modeLabel: card.modeLabel, context: card.context, lane: card.lane, timing: card.timing });
+        historicalRows.set(parentId, rows);
+      }
+    }
+    const left = (undecided.get(parentId) ?? 1) - 1;
+    undecided.set(parentId, left);
+    const next = linked.get(parentId);
+    if (left === 0 && next) queue.push(next);
+  }
+  const keep = (card: TaskCard) => !foldedHistory.has(card.id) && shown(card);
   const out = {} as Record<LaneId, LaneModel>;
-  for (const id of LANE_ORDER) out[id] = { ...lanes[id], cards: lanes[id].cards.filter(keep) };
+  for (const id of LANE_ORDER) out[id] = { ...lanes[id], cards: lanes[id].cards.filter(keep).map((card) => {
+    const rows = historicalRows.get(card.id);
+    return rows ? { ...card, children: [...card.children, ...rows].sort((left, right) => compareText(left.title, right.title)) } : card;
+  }) };
   return out;
 }

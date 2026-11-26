@@ -1,12 +1,15 @@
-import React, { useMemo, useRef, useState } from "react";
-import { Pressable, Text, View } from "react-native";
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { Platform, Pressable, Text, View } from "react-native";
 import { TasksTypography, HOST_FONT as F, HOST_LINE } from "../typography";
-import type { PluginScreenProps } from "@getpaseo/plugin/client";
+import { usePaseo, type PluginScreenProps } from "@getpaseo/plugin/client";
 import * as pluginClient from "@getpaseo/plugin/client";
-import { Icon } from "@getpaseo/plugin/client/react-native";
+import { Icon, useToast } from "@getpaseo/plugin/client/ui";
 import { useDeviceTasksPreferences } from "../device-preferences";
 import { useTasksLanguage } from "../i18n";
 import { pluginRoot } from "../../components/focus-ring";
+import { textSelectionFill } from "../../components/theme-tokens";
+import { applyTextSelection } from "../../components/text-selection";
+import { themeKey } from "../../ui/tokens/theme-key";
 import { HAIRLINE } from "./board-style";
 import type { TasksSettings } from "../../../shared/tasks-settings";
 import { SearchCoverageProvider } from "./search-loading";
@@ -19,6 +22,9 @@ import { PhoneBoard } from "./phone-board";
 import { AllHostsBoard } from "./all-hosts-screen";
 import { BOARD_STRINGS } from "./strings";
 import { useBoard, type BoardLayoutHandlers } from "./use-board";
+import { TaskQuestionDialog } from "../cards/question-dialog";
+import { consumeBoardOpen } from "./params";
+import { openedTask } from "../data";
 
 /**
  * The Tasks board (`addScreen` id `tasks`): the lanes side by side, scrolling
@@ -35,6 +41,21 @@ import { useBoard, type BoardLayoutHandlers } from "./use-board";
  * without one (or after it failed) it reads the settings itself.
  */
 export function TasksBoardScreen(props: PluginScreenProps) {
+  const toast = useToast();
+  const language = useTasksLanguage();
+  const navigation = props.navigation;
+  const paseo = usePaseo();
+  const token = props.params.openRequest;
+  useEffect(() => {
+    const agentId = consumeBoardOpen(props.host.id, token);
+    if (!agentId) return;
+    if (!navigation) {
+      toast.error(language === "zh" ? "无法打开任务：当前客户端不支持导航" : "Cannot open task: navigation is unavailable in this client");
+      return;
+    }
+    navigation.openAgent({ agentId });
+    openedTask(paseo, agentId);
+  }, [props.host.id, token, navigation, toast, language, paseo]);
   const store = useTasksEnabledStore();
   // Off, as the startup read or the settings page said: say so, and read nothing more.
   if (store.enabled === false) return <BoardOff {...props} />;
@@ -131,6 +152,9 @@ function BoardContent(props: PluginScreenProps & { cardSettings: TasksSettings }
 /** Local board retains the complete existing operations, filters and details. */
 function LocalBoardContent(props: PluginScreenProps) {
   const rootRef = useRef<View>(null);
+  // The board can open before any chat row resolved the theme's selection fill.
+  const colorKey = themeKey(props.theme);
+  useMemo(() => applyTextSelection(textSelectionFill(props.theme.colors), Platform.OS === "web"), [colorKey]); // eslint-disable-line react-hooks/exhaustive-deps
   const handlers = useRef<BoardLayoutHandlers | null>(null);
   const compact = boardIsCompact(props.layout.compact);
   const board = useBoard(props, rootRef, handlers, compact);
@@ -139,9 +163,10 @@ function LocalBoardContent(props: PluginScreenProps) {
   return (
     <TasksTypography theme={props.theme}>
       <View {...pluginRoot} style={{ flex: 1, backgroundColor: props.theme.colors.surface0 }}>
-        <SearchCoverageProvider cancelled={board.searchCancelled} setCancelled={board.setSearchCancelled} cancelText={board.strings.cancelSearch} resumeText={board.strings.resumeSearch} stoppedText={board.strings.searchStopped} status={board.searchStatus} historyLoading={board.searchHistoryLoading} historyError={board.tasks.historyError} retryHistory={board.tasks.clearHistoryError} historyLoadingText={board.strings.historyLoading} historyFailedText={board.strings.historyFailed} query={board.params.query} strings={board.fullConversationSearch ? board.strings.conversationSearchCoverage : board.strings.searchCoverage} total={board.total} fullConversation={board.fullConversationSearch} onFullConversationChange={board.setFullConversationSearch} fullConversationLabel={board.strings.fullConversationSearch} fullConversationShortLabel={board.strings.fullConversationShort} fullConversationHint={board.strings.fullConversationHint(board.fullConversationSearch)}>
+        <SearchCoverageProvider cancelled={board.searchCancelled} setCancelled={board.setSearchCancelled} cancelText={board.strings.cancelSearch} resumeText={board.strings.resumeSearch} stoppedText={board.strings.searchStopped} status={board.searchStatus} historyLoading={board.searchHistoryLoading} historyError={board.tasks.historyError} retryHistory={board.tasks.clearHistoryError} historyLoadingText={board.strings.historyLoading} historyFailedText={board.strings.historyFailed} query={board.params.query} strings={board.fullConversationSearch ? board.strings.conversationSearchCoverage : board.strings.searchCoverage} fullConversation={board.fullConversationSearch} onFullConversationChange={board.setFullConversationSearch} fullConversationLabel={board.strings.fullConversationSearch} fullConversationShortLabel={board.strings.fullConversationShort} fullConversationHint={board.strings.fullConversationHint(board.fullConversationSearch)}>
           <MenuBoundsContext.Provider value={rootRef}>
             {layout}
+            <TaskQuestionDialog store={board.questionDialog} paseo={board.paseo} cardById={board.cardById} submit={board.submitQuestions} compact={compact} onOpen={board.callbacks.onOpen} theme={props.theme} language={board.language} />
           </MenuBoundsContext.Provider>
         </SearchCoverageProvider>
       </View>

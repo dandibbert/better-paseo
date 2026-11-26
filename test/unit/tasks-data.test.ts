@@ -1,20 +1,23 @@
 import React from "react";
 import TestRenderer, { act } from "react-test-renderer";
 import { describe, expect, it, vi } from "vitest";
-import type { PaseoProject, PaseoProviderModelsResult } from "@getpaseo/client";
-import { START_IDLE_HOLD_MS, START_INIT_HOLD_MS, filterLanes, setLabelDefinitionsLoader, setTasksArchivedLane, setLastTurnLoader, setParentOriginsLoader, setProjectIconsLoader, setReadMarksLoader, setSubagentLoader, useTaskCounts, useTasks, withActiveSubtasks, type CountScope, withLastTurn, withReadMark, withSubagentCards, withSubagents, type TasksHandle } from "../../client/tasks/data";
+import type { PaseoAgentListOptions, PaseoProject, PaseoProviderModelsResult } from "@getpaseo/client";
+import { ATTENTION_CLEAR_HOLD_MS, LIST_RECOVERY_DELAYS_MS, START_IDLE_HOLD_MS, START_INIT_HOLD_MS, filterLanes, holdTasks, releaseTasksHolds, setLabelDefinitionsLoader, setTasksArchivedLane, setLastTurnLoader, setParentOriginsLoader, setProjectIconsLoader, setReadMarksLoader, setSubagentLoader, useTaskCounts, useTasks, withActiveSubtasks, type CountScope, withLastTurn, withReadMark, withSubagentCards, withSubagents, withUnreadMark, setUnreadMarksLoader, setUnreadClearer, openedTask, planTitle, type TasksHandle } from "../../client/tasks/data";
 import type { ProviderSubagent } from "../../shared/tasks-rpc";
-import { EMPTY_FILTERS, LANE_ORDER, type LaneId, type LaneModel, type TaskCard } from "../../client/tasks/model";
+import { EMPTY_FILTERS, LANE_ORDER, type LaneId, type LaneModel, type TaskCard, type TaskChild } from "../../client/tasks/model";
 import { sampleCards } from "../../client/tasks/sample-cards";
 import { fallbackLabelColor } from "../../client/tasks/label-colors";
+import { permissionButtons, respondToPermission } from "../../client/tasks/actions";
 import { cardStart, cardTimer, formatEnded } from "../../client/tasks/cards/card-time";
 import { at, createFakePaseo, makeAgent, makePlacement, makeWorkspace } from "./helpers/fake-paseo";
 import "./helpers/quiet-renderer";
+import { claudeExitPlanRequest, codexPlanRequest, exitPlanPermission } from "./helpers/plan-request";
 
-const storeNotificationProbe = vi.hoisted(() => ({ enabled: false, count: 0 }));
+const storeNotificationProbe = vi.hoisted(() => ({ enabled: false, count: 0, snapshots: [] as unknown[] }));
 vi.mock("react", async (importOriginal) => {
   const react = await importOriginal<typeof import("react")>();
   const wrappedSubscriptions = new WeakMap<object, unknown>();
+  const latestGets = new WeakMap<object, () => unknown>();
   return {
     ...react,
     useSyncExternalStore: (
@@ -22,10 +25,14 @@ vi.mock("react", async (importOriginal) => {
       getSnapshot: Parameters<typeof react.useSyncExternalStore>[1],
       getServerSnapshot?: Parameters<typeof react.useSyncExternalStore>[2],
     ) => {
+      latestGets.set(subscribe, getSnapshot);
       let wrapped = wrappedSubscriptions.get(subscribe) as typeof subscribe | undefined;
       if (!wrapped) {
         wrapped = (onStoreChange) => subscribe(() => {
-          if (storeNotificationProbe.enabled) storeNotificationProbe.count += 1;
+          if (storeNotificationProbe.enabled) {
+            storeNotificationProbe.count += 1;
+            storeNotificationProbe.snapshots.push(latestGets.get(subscribe)?.());
+          }
           onStoreChange();
         });
         wrappedSubscriptions.set(subscribe, wrapped);
@@ -83,6 +90,17 @@ function workspace(labels: string[] = []) {
 function activeAgent(id: string, overrides: Partial<ReturnType<typeof makeAgent>> = {}) {
   const prompted = overrides.updatedAt !== undefined && !("lastUserMessageAt" in overrides) ? { lastUserMessageAt: overrides.updatedAt } : null;
   return makeAgent({ id, workspaceId: "ws", ...prompted, ...overrides });
+}
+
+/** Let a queued read of the whole workspace list (a timer, then its pages) run and land. */
+async function settleWorkspaceCheck() {
+  // A check, a list's landing that queues another, and that one: each a timer, then its pages.
+  for (let round = 0; round < 6; round += 1) {
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      for (let index = 0; index < 32; index += 1) await Promise.resolve();
+    });
+  }
 }
 
 async function mountTasks(fake: Fake, doneWindow: "24h" | "7d" | "all" = "24h", includeDone = true) {
@@ -223,6 +241,769 @@ describe("Tasks data store refresh", () => {
     }
   });
 
+  describe("an unread agent's attention clear", () => {
+    // Paseo 0.15 archives an unread agent in two steps: its attention cleared (same updatedAt), then archivedAt.
+    const unreadAt = recentIso(5_000);
+    const unread = activeAgent("unread", { status: "idle", requiresAttention: true, attentionReason: "finished", updatedAt: unreadAt });
+    async function mountWith() {
+      const fake = createFakePaseo({ agents: [unread], workspaces: [workspace()] });
+      let current!: TasksHandle;
+      function Probe() {
+        current = useTasks(fake.paseo, { doneWindow: "24h", includeDone: true, includeArchived: true });
+        return null;
+      }
+      let renderer!: Renderer;
+      await act(async () => {
+        setTasksArchivedLane(fake.paseo, true);
+        renderer = TestRenderer.create(React.createElement(Probe));
+        await flush(8);
+      });
+      const mounted = { get current() { return current; }, unmount: () => act(() => renderer.unmount()) };
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      const lanesOf: string[] = [];
+      const push = async (agent: ReturnType<typeof activeAgent>) => {
+        await act(async () => {
+          fake.upsertAgent(agent);
+          await flush(4);
+        });
+        lanesOf.push(mounted.current.byId.get("unread")?.lane ?? "none");
+      };
+      return { fake, mounted, push, lanesOf };
+    }
+
+    it("moves an archived unread card straight from review to archived", async () => {
+      const { mounted, push, lanesOf } = await mountWith();
+      try {
+        expect(mounted.current.byId.get("unread")?.lane).toBe("review");
+        await push({ ...unread, requiresAttention: false, attentionReason: null, attentionTimestamp: null } as never);
+        await push({ ...unread, requiresAttention: false, attentionReason: null, attentionTimestamp: null, archivedAt: recentIso(0), updatedAt: recentIso(0) } as never);
+        expect(lanesOf).toEqual(["review", "archived"]);
+        await act(async () => {
+          vi.advanceTimersByTime(ATTENTION_CLEAR_HOLD_MS + 100);
+          await flush(4);
+        });
+        expect(mounted.current.byId.get("unread")?.lane).toBe("archived");
+      } finally {
+        vi.useRealTimers();
+        mounted.unmount();
+      }
+    });
+
+    it("moves a card read on another device to done once the wait is over", async () => {
+      const { mounted, push, lanesOf } = await mountWith();
+      try {
+        await push({ ...unread, requiresAttention: false, attentionReason: null, attentionTimestamp: null } as never);
+        expect(lanesOf).toEqual(["review"]);
+        await act(async () => {
+          vi.advanceTimersByTime(ATTENTION_CLEAR_HOLD_MS);
+          await flush(4);
+        });
+        expect(mounted.current.byId.get("unread")).toMatchObject({ lane: "done", status: "done" });
+      } finally {
+        vi.useRealTimers();
+        mounted.unmount();
+      }
+    });
+
+    it("does not hold a clear that comes with a permission request", async () => {
+      const { mounted, push, lanesOf } = await mountWith();
+      try {
+        await push({ ...unread, requiresAttention: false, attentionReason: null, attentionTimestamp: null, pendingPermissions: [{ id: "p1", provider: "claude", name: "Bash", kind: "tool", title: "Run" }] } as never);
+        expect(lanesOf).toEqual(["needs_input"]);
+      } finally {
+        vi.useRealTimers();
+        mounted.unmount();
+      }
+    });
+
+    it("does not hold a clear that comes with an error", async () => {
+      const { mounted, push } = await mountWith();
+      try {
+        await push({ ...unread, requiresAttention: false, attentionReason: null, attentionTimestamp: null, lastError: "Usage limit reached" } as never);
+        expect(mounted.current.byId.get("unread")).toMatchObject({ lane: "review", status: "failed" });
+      } finally {
+        vi.useRealTimers();
+        mounted.unmount();
+      }
+    });
+
+    it("does not bring an archived task back when the archived lane is off", async () => {
+      const fake = createFakePaseo({ agents: [unread], workspaces: [workspace()] });
+      const mounted = await mountTasks(fake, "24h");
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      try {
+        expect(mounted.current.byId.get("unread")?.lane).toBe("review");
+        const cleared = { ...unread, requiresAttention: false, attentionReason: null, attentionTimestamp: null };
+        await act(async () => {
+          fake.upsertAgent(cleared as never);
+          await flush(4);
+        });
+        // Archived: with the archived lane off, every list only removes it.
+        await act(async () => {
+          fake.upsertAgent({ ...cleared, archivedAt: recentIso(0), updatedAt: recentIso(0) } as never);
+          await flush(8);
+        });
+        await act(async () => {
+          vi.advanceTimersByTime(ATTENTION_CLEAR_HOLD_MS + 100);
+          await flush(8);
+        });
+        expect(mounted.current.byId.has("unread")).toBe(false);
+        expect(mounted.current.lanes.done.cards.map((card) => card.id)).not.toContain("unread");
+      } finally {
+        vi.useRealTimers();
+        mounted.unmount();
+      }
+    });
+
+    it("drops a read by id that answers after a newer state landed", async () => {
+      const fake = createFakePaseo({ agents: [unread], workspaces: [workspace()] });
+      const mounted = await mountTasks(fake, "24h");
+      try {
+        expect(mounted.current.byId.get("unread")?.lane).toBe("review");
+        // An older snapshot: the board reads the agent by id, and that read hangs.
+        const release = fake.holdRefreshes();
+        await act(async () => {
+          fake.pushAgentSnapshot({ ...unread, updatedAt: recentIso(60_000) } as never);
+          await flush(8);
+        });
+        expect(fake.calls.some((call) => call.method === "agents.ref.refresh")).toBe(true);
+        // Prompted again meanwhile: it runs.
+        await act(async () => {
+          fake.upsertAgent(activeAgent("unread", { status: "running", requiresAttention: false, updatedAt: recentIso(0), lastUserMessageAt: recentIso(0) }));
+          await flush(8);
+        });
+        expect(mounted.current.byId.get("unread")?.lane).toBe("running");
+        // The read answers with the state from before: it must not take the card out of running.
+        await act(async () => {
+          release();
+          await flush(16);
+        });
+        expect(mounted.current.byId.get("unread")?.lane).toBe("running");
+      } finally {
+        mounted.unmount();
+      }
+    });
+
+    it("drops a read by id that answers after the task was archived and removed", async () => {
+      const fake = createFakePaseo({ agents: [unread], workspaces: [workspace()] });
+      const mounted = await mountTasks(fake, "24h");
+      try {
+        // An older snapshot: the board reads the agent by id, and that read hangs with the unarchived state.
+        const releaseOld = fake.holdRefreshes();
+        await act(async () => {
+          fake.pushAgentSnapshot({ ...unread, updatedAt: recentIso(60_000) } as never);
+          await flush(8);
+        });
+        // Archived, with the archived lane off: removes only; the board reads it again and lets it go.
+        const releaseNew = fake.holdRefreshes();
+        await act(async () => {
+          fake.upsertAgent({ ...unread, requiresAttention: false, attentionReason: null, archivedAt: recentIso(0), updatedAt: recentIso(0) } as never);
+          await flush(8);
+        });
+        await act(async () => {
+          releaseNew();
+          await flush(16);
+        });
+        expect(mounted.current.byId.has("unread")).toBe(false);
+        // The older read answers last: it must not bring the archived task back.
+        await act(async () => {
+          releaseOld();
+          await flush(16);
+        });
+        expect(mounted.current.byId.has("unread")).toBe(false);
+      } finally {
+        mounted.unmount();
+      }
+    });
+
+    it("keeps a held read when a list that never had the task removes it", async () => {
+      const { fake, mounted, push, lanesOf } = await mountWith();
+      try {
+        await push({ ...unread, requiresAttention: false, attentionReason: null, attentionTimestamp: null } as never);
+        expect(lanesOf).toEqual(["review"]);
+        // The running list never held it: the SDK replays a remove it had buffered.
+        await act(async () => {
+          fake.pushRemoveTo("unread", (options) => options.filter?.statuses?.includes("running") === true);
+          await flush(8);
+        });
+        // Still waiting for an archive: the read lands only after the hold.
+        expect(mounted.current.byId.get("unread")?.lane).toBe("review");
+        await act(async () => {
+          vi.advanceTimersByTime(ATTENTION_CLEAR_HOLD_MS);
+          await flush(8);
+        });
+        expect(mounted.current.byId.get("unread")?.lane).toBe("done");
+      } finally {
+        vi.useRealTimers();
+        mounted.unmount();
+      }
+    });
+
+    it("keeps a task restored to running when a gone check answers with its archive", async () => {
+      const done = activeAgent("gone-check", { status: "idle", requiresAttention: false, updatedAt: recentIso(5_000) });
+      const fake = createFakePaseo({ agents: [done], workspaces: [workspace()] });
+      const mounted = await mountTasks(fake, "24h");
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      try {
+        expect(mounted.current.byId.get("gone-check")?.lane).toBe("done");
+        const release = fake.holdRefreshes();
+        // Archived with the archived lane off: removes, then a gone check reads it (held).
+        await act(async () => {
+          fake.upsertAgent({ ...done, archivedAt: recentIso(1_000), updatedAt: recentIso(1_000) } as never);
+          await flush(8);
+          vi.advanceTimersByTime(3_500);
+          await flush(8);
+        });
+        // Unarchived and prompted meanwhile.
+        await act(async () => {
+          fake.upsertAgent(activeAgent("gone-check", { status: "running", archivedAt: null, updatedAt: recentIso(0), lastUserMessageAt: recentIso(0) }));
+          await flush(8);
+        });
+        expect(mounted.current.byId.get("gone-check")?.lane).toBe("running");
+        await act(async () => {
+          release();
+          await flush(16);
+        });
+        expect(mounted.current.byId.get("gone-check")?.lane).toBe("running");
+      } finally {
+        vi.useRealTimers();
+        mounted.unmount();
+      }
+    });
+
+    it("sits out the wait when the list that held the task removes it after the read", async () => {
+      const { fake, mounted, push, lanesOf } = await mountWith();
+      try {
+        const cleared = { ...unread, requiresAttention: false, attentionReason: null, attentionTimestamp: null };
+        fake.setAgentSilently(cleared as never);
+        // The done list hears of the read first, then the attention list, which held the task, lets it go.
+        await act(async () => {
+          fake.pushUpsertTo(cleared as never, (options) => options.filter?.statuses?.includes("idle") === true);
+          await flush(4);
+        });
+        lanesOf.push(mounted.current.byId.get("unread")?.lane ?? "none");
+        await act(async () => {
+          fake.pushRemoveTo("unread", (options) => options.filter?.requiresAttention === true);
+          await flush(8);
+        });
+        lanesOf.push(mounted.current.byId.get("unread")?.lane ?? "none");
+        // The archive's second step, within the wait.
+        await push({ ...cleared, archivedAt: recentIso(0), updatedAt: recentIso(0) } as never);
+        expect(lanesOf).toEqual(["review", "review", "archived"]);
+      } finally {
+        vi.useRealTimers();
+        mounted.unmount();
+      }
+    });
+
+    it("takes a deleted task off once its gone check answers, though the same snapshot came again meanwhile", async () => {
+      const closed = activeAgent("deleted", { status: "closed", requiresAttention: true, attentionReason: "finished", updatedAt: recentIso(5_000) });
+      const fake = createFakePaseo({ agents: [closed], workspaces: [workspace()] });
+      const mounted = await mountTasks(fake, "24h");
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      try {
+        expect(mounted.current.byId.get("deleted")?.lane).toBe("review");
+        // Deleted on another client: this board hears nothing, and its gone check reads the agent (held).
+        fake.deleteAgentSilently("deleted");
+        const release = fake.holdRefreshes();
+        await act(async () => {
+          fake.pushAgentSnapshot(closed as never);
+          await flush(4);
+          vi.advanceTimersByTime(1_100);
+          await flush(8);
+        });
+        // The same snapshot again, from another list.
+        await act(async () => {
+          fake.pushAgentSnapshot(closed as never);
+          await flush(8);
+        });
+        await act(async () => {
+          release();
+          await flush(16);
+          vi.advanceTimersByTime(5_000);
+          await flush(16);
+        });
+        expect(mounted.current.byId.has("deleted")).toBe(false);
+      } finally {
+        vi.useRealTimers();
+        mounted.unmount();
+      }
+    });
+
+    it("reads the task afresh once a held read's wait ends, not with a read asked before it", async () => {
+      const { fake, mounted } = await mountWith();
+      try {
+        // An older snapshot: the board reads the agent by id, and that read (unread) hangs.
+        const releaseOld = fake.holdRefreshes();
+        await act(async () => {
+          fake.pushAgentSnapshot({ ...unread, updatedAt: recentIso(60_000) } as never);
+          await flush(8);
+        });
+        fake.passNewRefreshes();
+        // Read on another device: the done list hears it first, then the attention list lets the task go.
+        const cleared = { ...unread, requiresAttention: false, attentionReason: null, attentionTimestamp: null };
+        fake.setAgentSilently(cleared as never);
+        await act(async () => {
+          fake.pushUpsertTo(cleared as never, (options) => options.filter?.statuses?.includes("idle") === true);
+          await flush(4);
+          fake.pushRemoveTo("unread", (options) => options.filter?.requiresAttention === true);
+          await flush(4);
+        });
+        await act(async () => {
+          vi.advanceTimersByTime(ATTENTION_CLEAR_HOLD_MS + 50);
+          await flush(8);
+        });
+        // The old read answers unread: it must not keep the task in review.
+        await act(async () => {
+          releaseOld();
+          await flush(24);
+        });
+        expect(mounted.current.byId.get("unread")?.lane).toBe("done");
+      } finally {
+        vi.useRealTimers();
+        mounted.unmount();
+      }
+    });
+
+    it("does not bring back a task archived during a held read that only the attention list held", async () => {
+      const fake = createFakePaseo({
+        agents: Array.from({ length: 60 }, (_, index) => activeAgent(`u-${index}`, { status: "idle", requiresAttention: true, attentionReason: "finished", updatedAt: recentIso(10_000 + index * 1_000) })),
+        workspaces: [workspace()],
+      });
+      const mounted = await mountTasks(fake, "24h");
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      try {
+        await act(async () => { for (let index = 0; index < 16; index += 1) await Promise.resolve(); });
+        // Past the done list's first page: only the attention list holds it.
+        expect(mounted.current.byId.get("u-55")?.lane).toBe("review");
+        const target = fake.paseo.agents.ref("u-55").current()!;
+        const cleared = { ...target, requiresAttention: false, attentionReason: null, attentionTimestamp: null };
+        // Read: the attention list removes it, then the done list sends the read state (held).
+        fake.setAgentSilently(cleared as never);
+        // The daemon sends both in one go: no read by id answers in between.
+        await act(async () => {
+          fake.pushRemoveTo("u-55", (options) => options.filter?.requiresAttention === true);
+          fake.pushUpsertTo(cleared as never, (options) => options.filter?.statuses?.includes("idle") === true);
+          await flush(4);
+        });
+        // Archived within the wait, the archived lane off: every list only removes it.
+        fake.setAgentSilently({ ...cleared, archivedAt: recentIso(0), updatedAt: recentIso(0) } as never);
+        await act(async () => {
+          fake.pushRemoveTo("u-55", () => true);
+          await flush(8);
+        });
+        await act(async () => {
+          vi.advanceTimersByTime(ATTENTION_CLEAR_HOLD_MS + 70);
+          await flush(16);
+        });
+        expect(mounted.current.lanes.done.cards.map((card) => card.id)).not.toContain("u-55");
+        await act(async () => {
+          vi.advanceTimersByTime(4_000);
+          await flush(16);
+        });
+        expect(mounted.current.byId.has("u-55")).toBe(false);
+      } finally {
+        vi.useRealTimers();
+        mounted.unmount();
+      }
+    });
+
+    it("lets a snapshot carrying the same read wait with the held one", async () => {
+      const { fake, mounted, lanesOf } = await mountWith();
+      try {
+        const cleared = { ...unread, requiresAttention: false, attentionReason: null, attentionTimestamp: null };
+        await act(async () => {
+          fake.upsertAgent(cleared as never);
+          await flush(4);
+        });
+        lanesOf.push(mounted.current.byId.get("unread")?.lane ?? "none");
+        // The done list reconnects within the wait; its snapshot carries the same read state.
+        await act(async () => {
+          fake.reconnectAgentSubscriptionWhere((options) => options.filter?.statuses?.includes("idle") === true);
+          await flush(8);
+        });
+        lanesOf.push(mounted.current.byId.get("unread")?.lane ?? "none");
+        await act(async () => {
+          vi.advanceTimersByTime(ATTENTION_CLEAR_HOLD_MS);
+          await flush(8);
+        });
+        lanesOf.push(mounted.current.byId.get("unread")?.lane ?? "none");
+        expect(lanesOf).toEqual(["review", "review", "done"]);
+      } finally {
+        vi.useRealTimers();
+        mounted.unmount();
+      }
+    });
+
+    it("does not bring back a task archived during a held read whose removes were lost", async () => {
+      const fake = createFakePaseo({ agents: [unread], workspaces: [workspace()] });
+      const mounted = await mountTasks(fake, "24h");
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      try {
+        const cleared = { ...unread, requiresAttention: false, attentionReason: null, attentionTimestamp: null };
+        await act(async () => {
+          fake.upsertAgent(cleared as never);
+          await flush(4);
+        });
+        // Archived, but its removes never reached the board; the done list then reconnects without it.
+        fake.setAgentSilently({ ...cleared, archivedAt: recentIso(0), updatedAt: recentIso(0) } as never);
+        await act(async () => {
+          fake.reconnectAgentSubscriptionWhere((options) => options.filter?.statuses?.includes("idle") === true);
+          await flush(8);
+        });
+        await act(async () => {
+          vi.advanceTimersByTime(ATTENTION_CLEAR_HOLD_MS + 50);
+          await flush(16);
+        });
+        expect(mounted.current.byId.has("unread")).toBe(false);
+      } finally {
+        vi.useRealTimers();
+        mounted.unmount();
+      }
+    });
+
+    it("keeps a held task's card through a snapshot of its list that no longer carries it", async () => {
+      const fake = createFakePaseo({
+        agents: Array.from({ length: 60 }, (_, index) => activeAgent(`h-${index}`, { status: "idle", requiresAttention: true, attentionReason: "finished", updatedAt: recentIso(10_000 + index * 1_000) })),
+        workspaces: [workspace()],
+      });
+      const mounted = await mountTasks(fake, "24h");
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      try {
+        await act(async () => { await flush(16); });
+        const target = fake.paseo.agents.ref("h-55").current()!;
+        const cleared = { ...target, requiresAttention: false, attentionReason: null, attentionTimestamp: null };
+        fake.setAgentSilently(cleared as never);
+        // The done list's read state is held; the attention list then reconnects without the task.
+        await act(async () => {
+          fake.pushUpsertTo(cleared as never, (options) => options.filter?.statuses?.includes("idle") === true);
+          await flush(4);
+        });
+        await act(async () => {
+          fake.reconnectAgentSubscriptionWhere((options) => options.filter?.requiresAttention === true);
+          await flush(8);
+        });
+        // Still shown as it was until the wait is over.
+        expect(mounted.current.byId.get("h-55")?.lane).toBe("review");
+        await act(async () => {
+          vi.advanceTimersByTime(ATTENTION_CLEAR_HOLD_MS + 50);
+          await flush(16);
+        });
+        expect(mounted.current.byId.get("h-55")?.lane).toBe("done");
+      } finally {
+        vi.useRealTimers();
+        mounted.unmount();
+      }
+    });
+
+    it("shows a permission request a snapshot brings during a held read, with the same update time", async () => {
+      const { fake, mounted } = await mountWith();
+      try {
+        const cleared = { ...unread, requiresAttention: false, attentionReason: null, attentionTimestamp: null };
+        await act(async () => {
+          fake.upsertAgent(cleared as never);
+          await flush(4);
+        });
+        fake.setAgentSilently({ ...cleared, pendingPermissions: [{ id: "perm-1", provider: "claude", name: "Bash", kind: "tool", title: "Run" }] } as never);
+        await act(async () => {
+          fake.reconnectAgentSubscriptionWhere((options) => options.filter?.statuses?.includes("idle") === true);
+          await flush(8);
+        });
+        expect(mounted.current.byId.get("unread")?.lane).toBe("needs_input");
+      } finally {
+        vi.useRealTimers();
+        mounted.unmount();
+      }
+    });
+
+    it("says so and reads again when a held read's read by id fails", async () => {
+      const fake = createFakePaseo({ agents: [unread], workspaces: [workspace()] });
+      const mounted = await mountTasks(fake, "24h");
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      try {
+        const cleared = { ...unread, requiresAttention: false, attentionReason: null, attentionTimestamp: null };
+        await act(async () => {
+          fake.upsertAgent(cleared as never);
+          await flush(4);
+        });
+        // Archived; the reads by id fail for now.
+        fake.failRefreshes(new Error("connection lost"));
+        await act(async () => {
+          fake.upsertAgent({ ...cleared, archivedAt: recentIso(0), updatedAt: recentIso(0) } as never);
+          await flush(8);
+          vi.advanceTimersByTime(ATTENTION_CLEAR_HOLD_MS + 50);
+          await flush(16);
+        });
+        expect(mounted.current.error).toBe("connection lost");
+        // Reads answer again: the retry takes the archived task off and the error goes.
+        fake.failRefreshes(null);
+        await act(async () => {
+          vi.advanceTimersByTime(2_100);
+          await flush(16);
+        });
+        expect(mounted.current.byId.has("unread")).toBe(false);
+        expect(mounted.current.error).toBeNull();
+      } finally {
+        vi.useRealTimers();
+        mounted.unmount();
+      }
+    });
+
+    it("lets a read by id retried during a held read wait with it", async () => {
+      const { fake, mounted } = await mountWith();
+      try {
+        // An older snapshot sends a read by id, which fails and is tried again 2 s later.
+        fake.failRefreshes(new Error("connection lost"));
+        await act(async () => {
+          fake.pushAgentSnapshot({ ...unread, updatedAt: recentIso(60_000) } as never);
+          await flush(8);
+        });
+        fake.failRefreshes(null);
+        await act(async () => {
+          vi.advanceTimersByTime(1_950);
+          await flush(8);
+        });
+        // Read on another device just before the retry: held.
+        const cleared = { ...unread, requiresAttention: false, attentionReason: null, attentionTimestamp: null };
+        await act(async () => {
+          fake.upsertAgent(cleared as never);
+          await flush(4);
+        });
+        // The retry reads the same read state within the wait: the hold still decides.
+        await act(async () => {
+          vi.advanceTimersByTime(100);
+          await flush(16);
+        });
+        expect(mounted.current.byId.get("unread")?.lane).toBe("review");
+        await act(async () => {
+          vi.advanceTimersByTime(ATTENTION_CLEAR_HOLD_MS);
+          await flush(16);
+        });
+        expect(mounted.current.byId.get("unread")?.lane).toBe("done");
+      } finally {
+        vi.useRealTimers();
+        mounted.unmount();
+      }
+    });
+
+    it("says nothing when a read by id fails after its task was archived and taken off", async () => {
+      const fake = createFakePaseo({ agents: [unread], workspaces: [workspace()] });
+      const mounted = await mountTasks(fake, "24h");
+      try {
+        // An older snapshot: a read by id goes out and hangs.
+        const releaseOld = fake.holdRefreshes();
+        await act(async () => {
+          fake.pushAgentSnapshot({ ...unread, updatedAt: recentIso(60_000) } as never);
+          await flush(8);
+        });
+        fake.passNewRefreshes();
+        // Archived, the archived lane off: the board confirms it and takes the card off.
+        await act(async () => {
+          fake.upsertAgent({ ...unread, archivedAt: recentIso(0), updatedAt: recentIso(0) } as never);
+          await flush(16);
+        });
+        expect(mounted.current.byId.has("unread")).toBe(false);
+        // The old read times out, and so does any read asked meanwhile: none decides anything shown.
+        fake.failRefreshes(new Error("read timed out"));
+        await act(async () => {
+          releaseOld(new Error("read timed out"));
+          await flush(16);
+        });
+        expect(mounted.current.error).toBeNull();
+      } finally {
+        mounted.unmount();
+      }
+    });
+
+    it("keeps a running task, says so and reads again when an older snapshot takes it off every list and the reads fail", async () => {
+      const runner = activeAgent("runner", { status: "running", updatedAt: recentIso(1_000), lastUserMessageAt: recentIso(1_000) });
+      const fake = createFakePaseo({ agents: [runner], workspaces: [workspace()] });
+      const mounted = await mountTasks(fake, "24h");
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      try {
+        expect(mounted.current.byId.get("runner")?.lane).toBe("running");
+        // An older idle copy: the running list removes it, the done list gets the stale upsert; reads by id fail.
+        fake.failRefreshes(new Error("connection lost"));
+        await act(async () => {
+          fake.pushAgentSnapshot({ ...runner, status: "idle", updatedAt: recentIso(60_000) } as never);
+          await flush(16);
+        });
+        expect(mounted.current.byId.get("runner")?.lane).toBe("running");
+        expect(mounted.current.error).toBe("connection lost");
+        // Reads answer again: the retry finds it still running.
+        fake.failRefreshes(null);
+        await act(async () => {
+          vi.advanceTimersByTime(2_100);
+          await flush(16);
+        });
+        expect(mounted.current.byId.get("runner")?.lane).toBe("running");
+        expect(mounted.current.error).toBeNull();
+      } finally {
+        vi.useRealTimers();
+        mounted.unmount();
+      }
+    });
+
+    it("holds an attention clear a reconnect's done snapshot brings, so an archive right after skips done", async () => {
+      const fake = createFakePaseo({ agents: [unread], workspaces: [workspace()] });
+      const mounted = await mountTasks(fake, "24h");
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      try {
+        expect(mounted.current.byId.get("unread")?.lane).toBe("review");
+        // Missed while disconnected: the archive's first step, an attention clear (updatedAt unchanged).
+        const cleared = { ...unread, requiresAttention: false, attentionReason: null, attentionTimestamp: null };
+        fake.setAgentSilently(cleared as never);
+        await act(async () => {
+          fake.reconnectAgentSubscriptionWhere((options) => options.filter?.statuses?.includes("idle") === true);
+          await flush(16);
+        });
+        expect(mounted.current.byId.get("unread")?.lane).toBe("review");
+        // The archive lands (archived lane off: removes only).
+        fake.setAgentSilently({ ...cleared, archivedAt: recentIso(0), updatedAt: recentIso(0) } as never);
+        await act(async () => {
+          fake.removeFromAgentSubscriptions("unread");
+          await flush(8);
+        });
+        expect(mounted.current.byId.get("unread")?.lane).not.toBe("done");
+        await act(async () => {
+          vi.advanceTimersByTime(ATTENTION_CLEAR_HOLD_MS + 50);
+          await flush(16);
+        });
+        expect(mounted.current.byId.has("unread")).toBe(false);
+      } finally {
+        vi.useRealTimers();
+        mounted.unmount();
+      }
+    });
+
+    it("lands an attention clear a reconnect's done snapshot brings once its wait is over", async () => {
+      const fake = createFakePaseo({ agents: [unread], workspaces: [workspace()] });
+      const mounted = await mountTasks(fake, "24h");
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      try {
+        // Read on another device while disconnected.
+        const cleared = { ...unread, requiresAttention: false, attentionReason: null, attentionTimestamp: null };
+        fake.setAgentSilently(cleared as never);
+        await act(async () => {
+          fake.reconnectAgentSubscriptionWhere((options) => options.filter?.statuses?.includes("idle") === true);
+          await flush(16);
+        });
+        await act(async () => {
+          vi.advanceTimersByTime(ATTENTION_CLEAR_HOLD_MS + 50);
+          await flush(16);
+        });
+        expect(mounted.current.byId.get("unread")?.lane).toBe("done");
+      } finally {
+        vi.useRealTimers();
+        mounted.unmount();
+      }
+    });
+
+    it("says nothing when a gone check's read fails after its task ran again", async () => {
+      const closed = activeAgent("rerun", { status: "closed", requiresAttention: true, attentionReason: "finished", updatedAt: recentIso(5_000) });
+      const fake = createFakePaseo({ agents: [closed], workspaces: [workspace()] });
+      const mounted = await mountTasks(fake, "24h");
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      try {
+        // A closed snapshot schedules a gone check; its read hangs.
+        const release = fake.holdRefreshes();
+        await act(async () => {
+          fake.pushAgentSnapshot(closed as never);
+          await flush(4);
+          vi.advanceTimersByTime(1_100);
+          await flush(8);
+        });
+        // Prompted again meanwhile: it runs.
+        await act(async () => {
+          fake.upsertAgent(activeAgent("rerun", { status: "running", requiresAttention: false, updatedAt: recentIso(0), lastUserMessageAt: recentIso(0) }));
+          await flush(8);
+        });
+        await act(async () => {
+          release(new Error("obsolete gone read failed"));
+          await flush(16);
+        });
+        expect(mounted.current.byId.get("rerun")?.lane).toBe("running");
+        expect(mounted.current.error).toBeNull();
+      } finally {
+        vi.useRealTimers();
+        mounted.unmount();
+      }
+    });
+
+    it("takes an archived task off though an older read by id answered first", async () => {
+      const done = activeAgent("rd", { status: "idle", requiresAttention: false, updatedAt: recentIso(5_000) });
+      const fake = createFakePaseo({ agents: [done], workspaces: [workspace()] });
+      const mounted = await mountTasks(fake, "24h");
+      try {
+        expect(mounted.current.byId.get("rd")?.lane).toBe("done");
+        // An older snapshot: a read by id goes out with the unarchived state, held.
+        const releaseOld = fake.holdRefreshes();
+        await act(async () => {
+          fake.pushAgentSnapshot({ ...done, updatedAt: recentIso(60_000) } as never);
+          await flush(8);
+        });
+        // Archived, the archived lane off: removes, and the board reads it to confirm (held too).
+        const releaseNew = fake.holdRefreshes();
+        await act(async () => {
+          fake.upsertAgent({ ...done, archivedAt: recentIso(0), updatedAt: recentIso(0) } as never);
+          await flush(8);
+        });
+        // The old read answers first, then the confirmation.
+        await act(async () => {
+          releaseOld();
+          await flush(16);
+        });
+        await act(async () => {
+          releaseNew();
+          await flush(16);
+        });
+        expect(mounted.current.byId.has("rd")).toBe(false);
+      } finally {
+        mounted.unmount();
+      }
+    });
+
+    it("clears a read's error once a newer state of the task lands after its retries ran out", async () => {
+      const fake = createFakePaseo({ agents: [unread], workspaces: [workspace()] });
+      const mounted = await mountTasks(fake, "24h");
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      try {
+        fake.failRefreshes(new Error("old read failed"));
+        await act(async () => {
+          fake.pushAgentSnapshot({ ...unread, updatedAt: recentIso(60_000) } as never);
+          await flush(8);
+        });
+        for (const wait of [2_100, 5_100, 15_100, 1_000]) {
+          await act(async () => {
+            vi.advanceTimersByTime(wait);
+            await flush(8);
+          });
+        }
+        expect(mounted.current.error).toBe("old read failed");
+        await act(async () => {
+          fake.upsertAgent(activeAgent("unread", { status: "running", title: "Renamed", requiresAttention: false, updatedAt: recentIso(0), lastUserMessageAt: recentIso(0) }));
+          await flush(8);
+        });
+        expect(mounted.current.byId.get("unread")?.lane).toBe("running");
+        expect(mounted.current.error).toBeNull();
+      } finally {
+        vi.useRealTimers();
+        mounted.unmount();
+      }
+    });
+
+    it("does not hold a clear that comes with a new turn", async () => {
+      const { mounted, push, lanesOf } = await mountWith();
+      try {
+        await push(activeAgent("unread", { status: "running", requiresAttention: false, updatedAt: recentIso(0), lastUserMessageAt: recentIso(0) }));
+        expect(lanesOf).toEqual(["running"]);
+      } finally {
+        vi.useRealTimers();
+        mounted.unmount();
+      }
+    });
+  });
+
   describe("a new agent's idle before its first turn", () => {
     // Paseo 0.15 sends a prompted agent's start as initializing, then idle (newer, never prompted), then running.
     const starting = (status: "initializing" | "idle", updatedAt: string) => activeAgent("fresh", { status, createdAt: recentIso(0), updatedAt, lastUserMessageAt: null, activeTurn: null });
@@ -258,6 +1039,49 @@ describe("Tasks data store refresh", () => {
         });
         expect(mounted.current.byId.get("fresh")).toMatchObject({ lane: "running", status: "running" });
         expect(mounted.current.lanes.done.cards.map((card) => card.id)).not.toContain("fresh");
+      } finally {
+        vi.useRealTimers();
+        mounted.unmount();
+      }
+    });
+
+    it("does not bring back an agent made without a prompt that was archived during its wait", async () => {
+      const { fake, mounted, push, lanesOf } = await mountWith();
+      try {
+        const created = Date.now();
+        await push(starting("initializing", new Date(created).toISOString()));
+        await push(starting("idle", new Date(created + 1).toISOString()));
+        // Archived within the wait, with the archived lane off: its lists only remove it.
+        await act(async () => {
+          fake.upsertAgent({ ...starting("idle", new Date(created + 1).toISOString()), archivedAt: new Date(created + 50).toISOString(), updatedAt: new Date(created + 50).toISOString() } as never);
+          await flush(4);
+        });
+        await act(async () => {
+          vi.advanceTimersByTime(START_IDLE_HOLD_MS + 100);
+          await flush(8);
+        });
+        expect(lanesOf).toEqual(["none", "none"]);
+        expect(mounted.current.byId.has("fresh")).toBe(false);
+      } finally {
+        vi.useRealTimers();
+        mounted.unmount();
+      }
+    });
+
+    it("keeps a starting agent off done when the done list's snapshot carries its held idle", async () => {
+      const { fake, mounted, push, lanesOf } = await mountWith();
+      try {
+        const created = Date.now();
+        await push(starting("initializing", new Date(created).toISOString()));
+        await push(starting("idle", new Date(created + 1).toISOString()));
+        // The done list reconnects within the wait; its snapshot has the same idle.
+        await act(async () => {
+          fake.reconnectAgentSubscriptionWhere((options) => options.filter?.statuses?.includes("idle") === true);
+          await flush(8);
+        });
+        lanesOf.push(mounted.current.byId.get("fresh")?.lane ?? "none");
+        await push(activeAgent("fresh", { status: "running", createdAt: new Date(created).toISOString(), updatedAt: new Date(created + 8).toISOString(), lastUserMessageAt: new Date(created + 8).toISOString(), activeTurn: { turnId: "t1", startedAt: new Date(created + 8).toISOString() } as never }));
+        expect(lanesOf).toEqual(["none", "none", "none", "running"]);
       } finally {
         vi.useRealTimers();
         mounted.unmount();
@@ -330,7 +1154,7 @@ describe("Tasks data store refresh", () => {
       fake.setAgentSilently(activeAgent("done-60", { status: "idle", requiresAttention: false, updatedAt: recentIso(61_000), archivedAt: recentIso(0) }));
       fake.setAgentSilently(activeAgent("done-110", { status: "idle", requiresAttention: false, updatedAt: recentIso(111_000), title: "Renamed late" }));
       const release = fake.holdReady();
-      const pages = () => listCalls(fake).filter((call) => (call.input as { subscribe?: unknown }).subscribe === undefined).length;
+      const pages = () => listCalls(fake).filter((call) => (call.input as { subscribe?: unknown; page?: { limit?: number } }).subscribe === undefined && (call.input as { page?: { limit?: number } }).page?.limit !== 200).length;
       const pagesBefore = pages();
       let result: string | undefined;
       await act(async () => {
@@ -423,8 +1247,8 @@ describe("Tasks data store refresh", () => {
       await flush();
     });
     expect(second).toBe(first);
-    // One status, attention and done list each.
-    expect(listCalls(fake).length - listsBefore).toBe(3);
+    // One status, attention and done list each, plus the history scan.
+    expect(listCalls(fake).length - listsBefore).toBe(4);
     mounted.unmount();
     release();
     await act(async () => { await flush(); });
@@ -507,6 +1331,49 @@ describe("Tasks data store refresh", () => {
     }
   });
 
+  for (const path of ["loading more", "a refresh reading the pages again"] as const) {
+    it(`holds an attention clear a later done page brings (${path}), so an archive right after skips done`, async () => {
+      const done = Array.from({ length: 130 }, (_, index) => activeAgent("done-" + index, { status: "idle", requiresAttention: false, updatedAt: recentIso((index + 1) * 1_000) }));
+      const target = activeAgent("target", { status: "idle", requiresAttention: true, attentionReason: "finished", updatedAt: recentIso(70_500) });
+      const fake = createFakePaseo({ agents: [...done, target] });
+      const mounted = await mountTasks(fake, "all");
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      try {
+        expect(mounted.current.byId.get("target")?.lane).toBe("review");
+        const cleared = { ...target, requiresAttention: false, attentionReason: null, attentionTimestamp: null };
+        if (path === "a refresh reading the pages again") {
+          await act(async () => {
+            mounted.current.loadMoreDone();
+            await flush(30);
+          });
+        }
+        // Missed: the archive's first step, an attention clear (updatedAt unchanged).
+        fake.setAgentSilently(cleared as never);
+        await act(async () => {
+          if (path === "loading more") mounted.current.loadMoreDone();
+          else void mounted.current.refresh();
+          await flush(40);
+        });
+        expect(fake.calls.some((call) => call.method === "agents.list" && (call.input as { page?: { cursor?: string } }).page?.cursor)).toBe(true);
+        expect(mounted.current.byId.get("target")?.lane).toBe("review");
+        // The archive lands (archived lane off: removes only).
+        await act(async () => {
+          fake.upsertAgent({ ...cleared, archivedAt: recentIso(0), updatedAt: recentIso(0) } as never);
+          await flush(16);
+        });
+        expect(mounted.current.byId.get("target")?.lane).not.toBe("done");
+        await act(async () => {
+          vi.advanceTimersByTime(ATTENTION_CLEAR_HOLD_MS + 50);
+          await flush(30);
+        });
+        expect(mounted.current.byId.has("target")).toBe(false);
+      } finally {
+        vi.useRealTimers();
+        mounted.unmount();
+      }
+    });
+  }
+
   it("drops the done pages a timed-out refresh reads late, and pages on again", async () => {
     const done = Array.from({ length: 130 }, (_, index) => activeAgent("done-" + index, { status: "idle", requiresAttention: false, updatedAt: recentIso((index + 1) * 1_000) }));
     const fake = createFakePaseo({ agents: done });
@@ -558,7 +1425,7 @@ describe("Tasks data store refresh", () => {
   it("ends at once when the board closes during a refresh the daemon has not answered", async () => {
     const fake = createFakePaseo({ agents: [activeAgent("run", { status: "running" })], workspaces: [workspace()] });
     const mounted = await mountTasks(fake, "all");
-    fake.holdReady();
+    const release = fake.holdReady();
     let first!: Promise<string>;
     await act(async () => {
       first = mounted.current.refresh();
@@ -567,6 +1434,11 @@ describe("Tasks data store refresh", () => {
     mounted.unmount();
     const soon = new Promise<string>((resolve) => setTimeout(() => resolve("still waiting"), 50));
     await expect(Promise.race([first, soon])).resolves.toBe("superseded");
+    // The lists still unanswered (the SDK's list waits for ready) are let go as they answer.
+    await act(async () => {
+      release();
+      await flush();
+    });
     expect(fake.openSubscriptions()).toBe(0);
   });
 
@@ -642,6 +1514,65 @@ describe("Tasks data store refresh", () => {
     }
   });
 
+  it("lands a done page and the end of its loading in one board update", async () => {
+    const done = Array.from({ length: 120 }, (_, index) => activeAgent("done-" + index, { status: "idle", requiresAttention: false, updatedAt: recentIso((index + 1) * 1_000) }));
+    const fake = createFakePaseo({ agents: done });
+    const mounted = await mountTasks(fake, "all");
+    try {
+      expect(mounted.current.lanes.done.cards).toHaveLength(50);
+      storeNotificationProbe.snapshots = [];
+      storeNotificationProbe.enabled = true;
+      await act(async () => {
+        mounted.current.loadMoreDone();
+        await flush();
+      });
+      storeNotificationProbe.enabled = false;
+      // What the board was told at each store notify (React batches the renders themselves).
+      const told = (storeNotificationProbe.snapshots as Array<Partial<TasksHandle> | undefined>)
+        .filter((value): value is TasksHandle => Boolean(value?.lanes))
+        .map((value) => ({ cards: value.lanes.done.cards.length, loading: value.lanes.done.loading }))
+        .filter((entry, index, all) => index === 0 || entry.cards !== all[index - 1]!.cards || entry.loading !== all[index - 1]!.loading);
+      // Loading starts, then the page comes with loading off: no update shows the new cards still loading.
+      expect(told).toEqual([
+        { cards: 50, loading: true },
+        { cards: 100, loading: false },
+      ]);
+    } finally {
+      storeNotificationProbe.enabled = false;
+      storeNotificationProbe.snapshots = [];
+      mounted.unmount();
+    }
+  });
+
+  it("ends a failed done page's loading, and can load it again", async () => {
+    const done = Array.from({ length: 120 }, (_, index) => activeAgent("done-" + index, { status: "idle", requiresAttention: false, updatedAt: recentIso((index + 1) * 1_000) }));
+    const fake = createFakePaseo({ agents: done });
+    const mounted = await mountTasks(fake, "all");
+    const agentsApi = fake.paseo.agents as { list: (options: { subscribe?: unknown }) => Promise<unknown> };
+    const list = agentsApi.list.bind(agentsApi);
+    try {
+      agentsApi.list = async (options) => {
+        if (!options.subscribe) throw new Error("offline");
+        return list(options);
+      };
+      await act(async () => {
+        mounted.current.loadMoreDone();
+        await flush();
+      });
+      expect(mounted.current.lanes.done.loading).toBe(false);
+      expect(mounted.current.lanes.done.cards).toHaveLength(50);
+      agentsApi.list = list;
+      await act(async () => {
+        mounted.current.loadMoreDone();
+        await flush();
+      });
+      expect(mounted.current.lanes.done.loading).toBe(false);
+      expect(mounted.current.lanes.done.cards).toHaveLength(100);
+    } finally {
+      mounted.unmount();
+    }
+  });
+
   it("keeps loadMoreDone the same function across updates, so the lanes need not draw again", async () => {
     const fake = createFakePaseo({ agents: [activeAgent("run", { status: "running", updatedAt: recentIso(5_000) })] });
     const mounted = await mountTasks(fake, "all");
@@ -692,6 +1623,131 @@ function recentIso(ageMs: number) {
 }
 
 describe("Tasks data store", () => {
+  // The request in the 2026-11-10 report, exactly as the daemon's CodexAsyncQuestions
+  // hands it over: the model wrote only the title and option strings.
+  it.each([["允许", "拒绝"], ["Not yet", "Go ahead"]])("answers a Codex async question with options %j from the card", async (...labels) => {
+    const title = "是否允许按上述范围实施结构化快捷回答，包括普通二选一题也可能显示按钮？";
+    const fake = createFakePaseo({
+      agents: [activeAgent("asking", { provider: "codex", status: "running", pendingPermissions: [{
+        id: "permission-item-1", provider: "codex", name: "request_user_input_async", kind: "question", title: "Question",
+        input: { questions: [{ id: "0", header: "Question 1", question: title, options: labels.map((label) => ({ label })), isOther: true }] },
+      }] })],
+      workspaces: [workspace()],
+    });
+    const mounted = await mountTasks(fake, "24h", false);
+    try {
+      const permission = mounted.current.byId.get("asking")!.permission!;
+      // Codex builds the request id from the question's timeline row: the dialog reads the text before it.
+      expect(permission).toMatchObject({ requestId: "permission-item-1", kind: "question", summary: title, callId: "item-1",
+        questions: [{ id: "0", header: "Question 1", question: title, multiSelect: false, options: labels.map((label) => ({ label })) }] });
+      const buttons = permissionButtons(permission, "zh");
+      expect(buttons.map((button) => [button.label, button.kind])).toEqual(labels.map((label) => [label, "respond"]));
+      await respondToPermission(fake.paseo, "asking", buttons[1]!, permission.requestId);
+      expect(fake.permissionResponses).toEqual([{ agentId: "asking", requestId: "permission-item-1",
+        response: { behavior: "allow", updatedInput: { answers: { "Question 1": labels[1] } } } }]);
+    } finally { mounted.unmount(); }
+  });
+
+  // Claude's provider names the AskUserQuestion's tool use in the metadata; the request id is a fresh uuid.
+  it("keeps a Claude question's tool use id as its call id", async () => {
+    const fake = createFakePaseo({
+      agents: [activeAgent("asking", { provider: "claude", status: "running", pendingPermissions: [{
+        id: "permission-6b1f", provider: "claude", name: "AskUserQuestion", kind: "question", title: "Question",
+        input: { questions: [{ header: "Scope", question: "Change both?", options: [{ label: "Yes" }, { label: "No" }], multiSelect: false }] },
+        metadata: { toolUseId: "toolu_01ABC" },
+      }] })],
+      workspaces: [workspace()],
+    });
+    const mounted = await mountTasks(fake, "24h", false);
+    try {
+      expect(mounted.current.byId.get("asking")!.permission).toMatchObject({ requestId: "permission-6b1f", name: "AskUserQuestion", callId: "toolu_01ABC" });
+    } finally { mounted.unmount(); }
+  });
+
+  // Claude's ExitPlanMode, as its provider sends it: no title, Reject and
+  // Implement, and Implement with the resume mode when there is one. The cards
+  // show it as a plan (tasks-cards, tasks-card-action-layout, tasks-board-render).
+  it.each([false, true])("answers a real Claude ExitPlanMode request with its own actions (resume %s)", async (resume) => {
+    const fake = createFakePaseo({
+      agents: [activeAgent("planning", { provider: "claude", status: "running", pendingPermissions: [claudeExitPlanRequest({ resume })] as never })],
+      workspaces: [workspace()],
+    });
+    const mounted = await mountTasks(fake, "24h", false);
+    try {
+      const card = mounted.current.byId.get("planning")!;
+      expect(card.lane).toBe("needs_input");
+      expect(card.permission).toEqual(exitPlanPermission({ resume }));
+      const buttons = permissionButtons(card.permission!, "zh", true);
+      expect(buttons.map((button) => [button.label, button.kind, button.variant])).toEqual([
+        ["拒绝", "respond", "danger"], ["实施", "respond", "primary"], ...(resume ? [["Implement with Bypass", "respond", "secondary"]] : []),
+      ]);
+      for (const button of buttons) await respondToPermission(fake.paseo, "planning", button, card.permission!.requestId);
+      expect(fake.permissionResponses).toEqual([
+        { agentId: "planning", requestId: "permission-exit-plan", response: { behavior: "deny", selectedActionId: "reject", message: "Denied by user" } },
+        { agentId: "planning", requestId: "permission-exit-plan", response: { behavior: "allow", selectedActionId: "implement" } },
+        ...(resume ? [{ agentId: "planning", requestId: "permission-exit-plan", response: { behavior: "allow", selectedActionId: "implement_resume" } }] : []),
+      ]);
+    } finally { mounted.unmount(); }
+  });
+
+  it("answers a Codex plan approval with Dismiss and Implement", async () => {
+    const fake = createFakePaseo({
+      agents: [activeAgent("planning", { provider: "codex", status: "running", pendingPermissions: [codexPlanRequest()] as never })],
+      workspaces: [workspace()],
+    });
+    const mounted = await mountTasks(fake, "24h", false);
+    try {
+      const permission = mounted.current.byId.get("planning")!.permission!;
+      // The plan's first line names it, not the request's fixed description; "View plan" opens the whole text.
+      expect(permission).toMatchObject({ kind: "plan", title: "Plan", summary: "Section every request", body: "1. Section every request" });
+      const buttons = permissionButtons(permission, "en", true);
+      expect(buttons.map((button) => button.label)).toEqual(["Dismiss", "Implement"]);
+      await respondToPermission(fake.paseo, "planning", buttons[0]!, permission.requestId);
+      expect(fake.permissionResponses).toEqual([{ agentId: "planning", requestId: "permission-codex-plan", response: { behavior: "deny", selectedActionId: "dismiss", message: "Denied by user" } }]);
+    } finally { mounted.unmount(); }
+  });
+
+  // The card names a plan by its first line; the whole plan opens from "View plan".
+  it.each([
+    ["# 把左右键同按新规则同步到 luoph-mini\n\n## Context\n本机已改好", "把左右键同按新规则同步到 luoph-mini"],
+    ["\n\n## **Ship** the `layout` ##\nsteps", "Ship the layout"],
+    ["- Section every request\n- Test it", "Section every request"],
+    ["2) Test it", "Test it"],
+    ["Plain   first\tline\nsecond", "Plain first line"],
+    ["  \n\n", null],
+    ["#", "#"],
+  ])("titles the plan %j as %j", (text, title) => {
+    expect(planTitle(text)).toBe(title);
+  });
+
+  it("reads a plan from its metadata when the input carries none", async () => {
+    const fake = createFakePaseo({
+      agents: [activeAgent("planning", { provider: "claude", status: "running", pendingPermissions: [{ ...claudeExitPlanRequest(), input: { plan: "  \n" }, metadata: { planText: "# From metadata" } }] as never })],
+      workspaces: [workspace()],
+    });
+    const mounted = await mountTasks(fake, "24h", false);
+    try {
+      expect(mounted.current.byId.get("planning")!.permission).toMatchObject({ summary: "From metadata", body: "# From metadata" });
+    } finally { mounted.unmount(); }
+  });
+
+  // Codex request_user_input (Plan mode) requires a description on each option, which a card cannot show.
+  it("leaves a Codex question whose options carry descriptions to the agent tab", async () => {
+    const fake = createFakePaseo({
+      agents: [activeAgent("asking", { provider: "codex", status: "running", pendingPermissions: [{
+        id: "permission-item-2", provider: "codex", name: "request_user_input", kind: "question", title: "Question",
+        input: { questions: [{ id: "plan_scope", header: "Scope", question: "Ship both fixes?", options: [
+          { label: "Both", description: "One release for the two fixes" }, { label: "First only", description: "Hold the second" },
+        ] }] },
+      }] })],
+      workspaces: [workspace()],
+    });
+    const mounted = await mountTasks(fake, "24h", false);
+    try {
+      expect(permissionButtons(mounted.current.byId.get("asking")!.permission!).map((button) => button.kind)).toEqual(["open"]);
+    } finally { mounted.unmount(); }
+  });
+
   it("retains the full pending Claude question and options for details", async () => {
     const fake = createFakePaseo({
       agents: [activeAgent("asking", { provider: "claude", status: "running", pendingPermissions: [{
@@ -795,7 +1851,7 @@ describe("Tasks data store", () => {
         git: { dirty: true, ahead: 2, behind: 1 },
         pullRequest: { number: 42, title: "Tasks board" },
       });
-      expect(fake.calls.filter((call) => call.method === "agents.list")).toHaveLength(3);
+      expect(fake.calls.filter((call) => call.method === "agents.list")).toHaveLength(4);
       expect(filterLanes(mounted.current.lanes, {
         query: "feature/tasks",
         workspaceIds: [],
@@ -874,6 +1930,131 @@ describe("Tasks data store", () => {
     expect(withReadMark(card, marked, marked + 1)).toMatchObject({ lane: "review", status: "failed", readable: true });
     expect(withReadMark(card, undefined, Number.NEGATIVE_INFINITY)).toMatchObject({ lane: "review", readable: true });
     expect(withReadMark({ ...card, lane: "running", status: "running" }, marked, 0).readable).toBeFalsy();
+  });
+
+  it("moves a done card back to review when marked unread since its prompt and since any read", () => {
+    const card = { ...sampleCards(Date.parse("2026-10-22T10:00:00.000Z")).find((sample) => sample.id === "sample-done")! };
+    const prompted = Date.parse(card.timing.lastUserMessageAt ?? "");
+    const unreadAt = prompted + 60_000;
+    expect(withUnreadMark(card, unreadAt, undefined)).toMatchObject({ lane: "review", status: "unread", readable: true });
+    // A read at the same moment or later keeps the card done.
+    expect(withUnreadMark(card, unreadAt, unreadAt)).toMatchObject({ lane: "done", status: "done" });
+    expect(withUnreadMark(card, unreadAt, unreadAt + 1)).toMatchObject({ lane: "done", status: "done" });
+    expect(withUnreadMark(card, unreadAt, unreadAt - 1)).toMatchObject({ lane: "review", status: "unread", readable: true });
+    // A mark from before this prompt, a review card, and an archived card stay put.
+    expect(withUnreadMark(card, prompted - 1, undefined)).toMatchObject({ lane: "done", status: "done" });
+    expect(withUnreadMark(card, undefined, undefined)).toBe(card);
+    expect(withUnreadMark({ ...card, lane: "review", status: "unread" }, unreadAt, undefined).lane).toBe("review");
+    expect(withUnreadMark({ ...card, archived: "agent" }, unreadAt, undefined).lane).toBe("done");
+  });
+
+  it("moves a done card to review once its unread mark loads", async () => {
+    const prompt = Date.now() - 10 * 60_000;
+    const iso = (ms: number) => new Date(ms).toISOString();
+    const fake = createFakePaseo({
+      agents: [activeAgent("finished", { status: "closed", updatedAt: iso(prompt), lastUserMessageAt: iso(prompt) })],
+      workspaces: [workspace()],
+    });
+    const loader = vi.fn(async () => [{ agentId: "finished", unreadAt: iso(prompt + 30_000) }]);
+    setUnreadMarksLoader(loader);
+    const mounted = await mountTasks(fake, "all");
+    try {
+      expect(mounted.current.byId.get("finished")).toMatchObject({ lane: "done", status: "done" });
+      await act(async () => {
+        mounted.current.refreshUnreads();
+        for (let index = 0; index < 6; index += 1) await Promise.resolve();
+      });
+      expect(loader).toHaveBeenCalled();
+      expect(mounted.current.byId.get("finished")).toMatchObject({ lane: "review", status: "unread", readable: true });
+    } finally {
+      mounted.unmount();
+      setUnreadMarksLoader(null);
+    }
+  });
+
+  it("drops the unread mark when the board opens the task, and keeps it if the server refuses", async () => {
+    // Marked unread on 11-10, opened later: the card must not come back to review.
+    const prompt = Date.now() - 10 * 60_000;
+    const iso = (ms: number) => new Date(ms).toISOString();
+    const fake = createFakePaseo({
+      agents: [
+        activeAgent("finished", { status: "closed", updatedAt: iso(prompt), lastUserMessageAt: iso(prompt) }),
+        activeAgent("other", { status: "closed", updatedAt: iso(prompt), lastUserMessageAt: iso(prompt) }),
+      ],
+      workspaces: [workspace()],
+    });
+    let server = [{ agentId: "finished", unreadAt: iso(prompt + 30_000) }, { agentId: "other", unreadAt: iso(prompt + 30_000) }];
+    const loader = vi.fn(async () => server);
+    let refuse = false;
+    let release!: () => void;
+    const clearer = vi.fn((agentIds: string[]) => new Promise<void>((resolve, reject) => {
+      release = () => {
+        if (refuse) reject(new Error("refused"));
+        else {
+          server = server.filter((mark) => !agentIds.includes(mark.agentId));
+          resolve();
+        }
+      };
+    }));
+    setUnreadMarksLoader(loader);
+    setUnreadClearer(clearer);
+    const settle = async () => {
+      for (let index = 0; index < 8; index += 1) await Promise.resolve();
+    };
+    const mounted = await mountTasks(fake, "all");
+    try {
+      await act(async () => {
+        mounted.current.refreshUnreads();
+        await settle();
+      });
+      expect(mounted.current.byId.get("finished")).toMatchObject({ lane: "review", status: "unread" });
+      const other = mounted.current.byId.get("other");
+      expect(other).toMatchObject({ lane: "review", status: "unread" });
+
+      await act(async () => {
+        openedTask(fake.paseo, "finished");
+        await settle();
+      });
+      // Out of review at once, before the server answers; the other card is untouched.
+      expect(clearer).toHaveBeenCalledWith(["finished"]);
+      expect(mounted.current.byId.get("finished")).toMatchObject({ lane: "done", status: "done" });
+      expect(mounted.current.byId.get("other")).toBe(other);
+
+      // A read that left before the clear landed still lists the mark: it does not move the card back.
+      await act(async () => {
+        mounted.current.refreshUnreads();
+        await settle();
+      });
+      expect(mounted.current.byId.get("finished")).toMatchObject({ lane: "done" });
+
+      await act(async () => {
+        release();
+        await settle();
+      });
+      expect(mounted.current.byId.get("finished")).toMatchObject({ lane: "done" });
+      await act(async () => {
+        mounted.current.refreshUnreads();
+        await settle();
+      });
+      expect(mounted.current.byId.get("finished")).toMatchObject({ lane: "done" });
+
+      // A server that refuses keeps its mark: the read after the failure puts the card back.
+      refuse = true;
+      await act(async () => {
+        openedTask(fake.paseo, "other");
+        await settle();
+      });
+      expect(mounted.current.byId.get("other")).toMatchObject({ lane: "done" });
+      await act(async () => {
+        release();
+        await settle();
+      });
+      expect(mounted.current.byId.get("other")).toMatchObject({ lane: "review", status: "unread" });
+    } finally {
+      mounted.unmount();
+      setUnreadMarksLoader(null);
+      setUnreadClearer(null);
+    }
   });
 
   it.each(["feature/tasks", "feature-tasks"])("hides a workspace name that repeats branch %s", async (workspaceName) => {
@@ -1047,6 +2228,76 @@ describe("Tasks data store", () => {
       cards: askingLanes[id].cards.map((card) => card.id === parentId ? { ...card, children: [] } : card),
     }])) as Record<LaneId, LaneModel>;
     expect(filterLanes(unlisted, filters).running.cards.map((card) => card.id)).toEqual(["child-running"]);
+  });
+
+  it("folds archived detached children only when their archived parent is visible", () => {
+    const sample = sampleCards().find((card) => card.id === "sample-done")!;
+    const parent: TaskCard = { ...sample, id: "parent", title: "Parent", lane: "archived", children: [], provider: "parent-provider" };
+    const child: TaskCard = { ...sample, id: "child", title: "Child", lane: "archived", provider: "child-provider", parent: { id: "parent", title: "Parent", missing: false, archived: false, detached: true } };
+    const lanes = Object.fromEntries(LANE_ORDER.map((id) => [id, { id, cards: id === "archived" ? [parent, child] : [], hasMore: false, loading: false }])) as Record<LaneId, LaneModel>;
+    const filters = { query: "", workspaceIds: [], providers: [], labels: [], hideSubtasks: true };
+    const folded = filterLanes(lanes, filters);
+    expect(folded.archived.cards.map((card) => card.id)).toEqual(["parent"]);
+    expect(folded.archived.cards[0]?.children.map((row) => row.id)).toEqual(["child"]);
+    expect(parent.children).toEqual([]);
+    expect(filterLanes(lanes, { ...filters, hideSubtasks: false }).archived.cards.map((card) => card.id)).toEqual(["parent", "child"]);
+    expect(filterLanes(lanes, { ...filters, providers: ["child-provider"] }).archived.cards.map((card) => card.id)).toEqual(["child"]);
+    const withoutParent = { ...lanes, archived: { ...lanes.archived, cards: [child] } };
+    expect(filterLanes(withoutParent, filters).archived.cards.map((card) => card.id)).toEqual(["child"]);
+    const restored = { ...lanes, archived: { ...lanes.archived, cards: [child] }, done: { ...lanes.done, cards: [{ ...parent, lane: "done" as const }] } };
+    expect(filterLanes(restored, filters).archived.cards.map((card) => card.id)).toEqual(["child"]);
+  });
+
+  it("keeps an archived detached child on its own card when its archived parent is itself folded away", () => {
+    const sample = sampleCards().find((card) => card.id === "sample-done")!;
+    const row = (card: TaskCard): TaskChild => ({ id: card.id, title: card.title, status: card.status, provider: card.provider, modelLabel: card.modelLabel, thinkingLabel: card.thinkingLabel, modeLabel: card.modeLabel, context: card.context, lane: card.lane, timing: card.timing });
+    const parent: TaskCard = { ...sample, id: "parent", title: "Parent", lane: "archived", children: [], provider: "parent-provider", parent: { id: "root", title: "Root", missing: false, archived: true } };
+    const root: TaskCard = { ...sample, id: "root", title: "Root", lane: "archived", children: [row(parent)], provider: "root-provider" };
+    const child: TaskCard = { ...sample, id: "child", title: "Child", lane: "archived", provider: "child-provider", parent: { id: "parent", title: "Parent", missing: false, archived: true, detached: true } };
+    const lanes = Object.fromEntries(LANE_ORDER.map((id) => [id, { id, cards: id === "archived" ? [root, parent, child] : [], hasMore: false, loading: false }])) as Record<LaneId, LaneModel>;
+    const filters = { query: "", workspaceIds: [], providers: [], labels: [], hideSubtasks: true };
+    const hidden = filterLanes(lanes, filters);
+    // The parent shows only as the root's row, so the child cannot fold into it.
+    expect(hidden.archived.cards.map((card) => card.id)).toEqual(["root", "child"]);
+    expect(hidden.archived.cards[0]?.children.map((item) => item.id)).toEqual(["parent"]);
+    expect(filterLanes(lanes, { ...filters, hideSubtasks: false }).archived.cards.map((card) => card.id)).toEqual(["root", "parent", "child"]);
+    // A finished subtask stays hidden with its root filtered out, so the child still has its own card.
+    expect(filterLanes(lanes, { ...filters, providers: ["parent-provider", "child-provider"] }).archived.cards.map((card) => card.id)).toEqual(["child"]);
+    // Once the parent has a card of its own, the child folds into it again.
+    const detachedParent = { ...lanes, archived: { ...lanes.archived, cards: [root, { ...parent, parent: { ...parent.parent!, detached: true as const } }, child] } };
+    const folded = filterLanes(detachedParent, filters);
+    expect(folded.archived.cards.map((card) => card.id)).toEqual(["root", "parent"]);
+    expect(folded.archived.cards[1]?.children.map((item) => item.id)).toEqual(["child"]);
+    // A filtered-out child has nothing to show on the parent's card: the parent folds into the root.
+    const withoutChild = filterLanes(detachedParent, { ...filters, providers: ["root-provider", "parent-provider"] });
+    expect(withoutChild.archived.cards.map((card) => card.id)).toEqual(["root"]);
+    expect(withoutChild.archived.cards[0]?.children.map((item) => item.id)).toEqual(["parent"]);
+    // Along a chain of archive links, a card keeps its own place only while history folds into it.
+    const link = (id: string) => ({ id, title: id, missing: false, archived: true, detached: true as const });
+    const chain: TaskCard[] = [
+      { ...sample, id: "a-root", title: "a-root", lane: "archived", children: [], parent: null },
+      { ...sample, id: "b-middle", title: "b-middle", lane: "archived", children: [], parent: link("a-root") },
+      { ...sample, id: "c-branch", title: "c-branch", lane: "archived", children: [], parent: link("b-middle") },
+      { ...sample, id: "d-leaf", title: "d-leaf", lane: "archived", children: [], parent: link("c-branch") },
+    ];
+    const chained = filterLanes({ ...lanes, archived: { ...lanes.archived, cards: chain } }, filters);
+    expect(chained.archived.cards.map((card) => [card.id, card.children.map((item) => item.id)])).toEqual([["a-root", ["b-middle"]], ["c-branch", ["d-leaf"]]]);
+    // Links that loop back fold nowhere, in any order: every card keeps its place.
+    const loop: TaskCard[] = [
+      { ...chain[0]!, parent: link("c-branch") }, { ...chain[1]!, parent: link("a-root") }, { ...chain[2]!, parent: link("b-middle") },
+    ];
+    for (const cards of [loop, [...loop].reverse(), [{ ...chain[0]!, parent: link("a-root") }]]) {
+      const looped = filterLanes({ ...lanes, archived: { ...lanes.archived, cards } }, filters);
+      expect(looped.archived.cards.map((card) => card.id).sort()).toEqual(cards.map((card) => card.id).sort());
+    }
+    // A filter hides a card of the cycle but does not break it.
+    const loopFiltered = filterLanes({ ...lanes, archived: { ...lanes.archived, cards: loop.map((card) => ({ ...card, provider: card.id === "c-branch" ? "other" : "shown" })) } }, { ...filters, providers: ["shown"] });
+    expect(loopFiltered.archived.cards.map((card) => card.id).sort()).toEqual(["a-root", "b-middle"]);
+    // A deep chain is worked out without recursion: each card folds into the one above it in pairs.
+    const deep: TaskCard[] = Array.from({ length: 20_000 }, (_, index) => ({ ...chain[0]!, id: `deep-${index}`, title: `deep-${index}`, parent: index === 0 ? null : link(`deep-${index - 1}`) }));
+    const deepLanes = filterLanes({ ...lanes, archived: { ...lanes.archived, cards: deep } }, filters);
+    expect(deepLanes.archived.cards).toHaveLength(10_000);
+    expect(deepLanes.archived.cards.at(-1)?.children.map((item) => item.id)).toEqual(["deep-19999"]);
   });
 
   it("keeps the board quiet for a workspace update that changes nothing it shows, and keeps its workspace options", async () => {
@@ -1225,7 +2476,7 @@ describe("Tasks data store", () => {
       });
       expect(mounted.current.lanes.done.cards).toHaveLength(51);
       expect(mounted.current.lanes.done.hasMore).toBe(false);
-      expect(fake.calls.filter((call) => call.method === "agents.list" && (call.input as { subscribe?: unknown }).subscribe === undefined)).toHaveLength(1);
+      expect(fake.calls.filter((call) => call.method === "agents.list" && (call.input as { subscribe?: unknown; page?: { limit?: number } }).subscribe === undefined && (call.input as { page?: { limit?: number } }).page?.limit !== 200)).toHaveLength(1);
 
       await act(async () => {
         fake.upsertAgent(activeAgent("working", { status: "idle", updatedAt: recentIso(1_000) }));
@@ -1453,6 +2704,7 @@ describe("Tasks data store", () => {
         activeAgent("stale", { status: "idle", requiresAttention: true, updatedAt: recentIso(2_000), workspaceId: "ws-archived" }),
       ],
       workspaces: [workspace()],
+      archivedWorkspaceIds: ["ws-archived"],
     });
     const mounted = await mountTasks(fake);
     try {
@@ -1468,6 +2720,1425 @@ describe("Tasks data store", () => {
     } finally {
       mounted.unmount();
     }
+  });
+
+  describe("paged agent lists", () => {
+    const flush = async (rounds: number) => { for (let index = 0; index < rounds; index += 1) await Promise.resolve(); };
+    // The status and attention lists are each the whole of what they filter,
+    // but a subscription's snapshot is only the daemon's first page (200).
+    const UNREAD = 230;
+    function unreadFake() {
+      return createFakePaseo({
+        agents: Array.from({ length: UNREAD }, (_, index) =>
+          activeAgent(`unread-${index}`, { status: "idle", requiresAttention: true, attentionReason: "finished", updatedAt: recentIso(1_000 + index) })),
+        workspaces: [workspace()],
+      });
+    }
+
+    async function settle() {
+      await act(async () => {
+        for (let index = 0; index < 16; index += 1) await Promise.resolve();
+      });
+    }
+
+    it("shows every unread task past the first page in review", async () => {
+      const fake = unreadFake();
+      const mounted = await mountTasks(fake);
+      try {
+        await settle();
+        expect(mounted.current.lanes.review.cards).toHaveLength(UNREAD);
+        expect(mounted.current.counts.review).toBe(UNREAD);
+        expect(mounted.current.byId.get(`unread-${UNREAD - 1}`)?.lane).toBe("review");
+        await act(async () => {
+          fake.reconnectSubscriptions();
+          await Promise.resolve();
+        });
+        await settle();
+        expect(mounted.current.lanes.review.cards).toHaveLength(UNREAD);
+      } finally {
+        mounted.unmount();
+      }
+    });
+
+    it("shows every running task past the first page in running", async () => {
+      const fake = createFakePaseo({
+        agents: Array.from({ length: 210 }, (_, index) => activeAgent(`run-${index}`, { status: "running", updatedAt: recentIso(1_000 + index) })),
+        workspaces: [workspace()],
+      });
+      const mounted = await mountTasks(fake);
+      try {
+        await settle();
+        expect(mounted.current.lanes.running.cards).toHaveLength(210);
+        expect(mounted.current.counts.running).toBe(210);
+      } finally {
+        mounted.unmount();
+      }
+    });
+
+    it("ends a refresh only once every page of its lists has landed", async () => {
+      const fake = unreadFake();
+      const mounted = await mountTasks(fake);
+      try {
+        await settle();
+        const release = fake.holdPages();
+        let result: string | undefined;
+        await act(async () => {
+          void mounted.current.refresh().then((value) => { result = value; });
+          await flush(16);
+        });
+        expect(result).toBeUndefined();
+        await act(async () => {
+          release();
+          await flush(16);
+        });
+        expect(result).toBe("done");
+        expect(mounted.current.lanes.review.cards).toHaveLength(UNREAD);
+      } finally {
+        mounted.unmount();
+      }
+    });
+
+    it("reports a later page that cannot be read, and fails the refresh", async () => {
+      const fake = unreadFake();
+      const mounted = await mountTasks(fake);
+      try {
+        await settle();
+        expect(mounted.current.error).toBeNull();
+        fake.failNextAgentList((options) => options.page?.cursor !== undefined && options.filter?.requiresAttention === true, "socket closed");
+        let result: string | undefined;
+        await act(async () => {
+          void mounted.current.refresh().then((value) => { result = value; });
+          await flush(16);
+        });
+        expect(result).toBe("failed");
+        expect(mounted.current.error).toBe("socket closed");
+        // What the board had stays.
+        expect(mounted.current.lanes.review.cards).toHaveLength(UNREAD);
+      } finally {
+        mounted.unmount();
+      }
+    });
+
+    it("keeps paging the list it kept after a refresh of it failed", async () => {
+      const fake = createFakePaseo({
+        agents: Array.from({ length: 230 }, (_, index) => activeAgent(`run-${index}`, { status: "running", updatedAt: recentIso(1_000 + index) })),
+        workspaces: [workspace()],
+      });
+      const mounted = await mountTasks(fake);
+      try {
+        await settle();
+        expect(mounted.current.lanes.running.cards).toHaveLength(230);
+        // The refresh's status list fails, so the old one stays.
+        fake.failNextAgentList((options) => options.subscribe !== undefined && options.filter?.statuses?.includes("running") === true, "socket closed");
+        let result: string | undefined;
+        await act(async () => {
+          void mounted.current.refresh().then((value) => { result = value; });
+          await flush(16);
+        });
+        expect(result).toBe("failed");
+        // Missed while disconnected; the kept list's next snapshot must page to find it.
+        fake.setAgentSilently(activeAgent("run-late", { status: "running", updatedAt: recentIso(50_000) }));
+        await act(async () => {
+          fake.reconnectSubscriptions();
+          await flush(16);
+        });
+        await settle();
+        expect(mounted.current.lanes.running.cards).toHaveLength(231);
+        expect(mounted.current.byId.get("run-late")?.lane).toBe("running");
+      } finally {
+        mounted.unmount();
+      }
+    });
+
+    it("ends a refresh once its newest snapshot landed, though an older one's page still hangs", async () => {
+      const fake = unreadFake();
+      const mounted = await mountTasks(fake);
+      try {
+        await settle();
+        const releaseOld = fake.holdPages();
+        let result: string | undefined;
+        await act(async () => {
+          void mounted.current.refresh().then((value) => { result = value; });
+          await flush(16);
+        });
+        expect(result).toBeUndefined();
+        // A newer snapshot of the refresh's list pages at once and lands.
+        fake.passNewPages();
+        await act(async () => {
+          fake.reconnectSubscriptions();
+          await flush(24);
+        });
+        expect(result).toBe("done");
+        expect(mounted.current.lanes.review.cards).toHaveLength(UNREAD);
+        await act(async () => {
+          releaseOld();
+          await flush(16);
+        });
+      } finally {
+        mounted.unmount();
+      }
+    });
+
+    it("clears a page error once a later snapshot reads every page", async () => {
+      const fake = unreadFake();
+      const mounted = await mountTasks(fake);
+      try {
+        await settle();
+        fake.failNextAgentList((options) => options.page?.cursor !== undefined && options.filter?.requiresAttention === true, "socket closed");
+        await act(async () => {
+          fake.reconnectSubscriptions();
+          await flush(16);
+        });
+        expect(mounted.current.error).toBe("socket closed");
+        await act(async () => {
+          fake.reconnectSubscriptions();
+          await flush(16);
+        });
+        expect(mounted.current.error).toBeNull();
+      } finally {
+        mounted.unmount();
+      }
+    });
+
+    it("does not let an older snapshot of a list undo a newer one that landed", async () => {
+      // Older than the done window: only the attention list keeps these on the board.
+      const old = (index: number) => recentIso(3 * 24 * 60 * 60 * 1000 + index * 1000);
+      const fake = createFakePaseo({
+        agents: Array.from({ length: UNREAD }, (_, index) =>
+          activeAgent(`unread-${index}`, { status: "idle", requiresAttention: true, attentionReason: "finished", updatedAt: old(index), lastUserMessageAt: old(index), createdAt: old(index) })),
+        workspaces: [workspace()],
+      });
+      const mounted = await mountTasks(fake);
+      try {
+        await settle();
+        expect(mounted.current.lanes.review.cards).toHaveLength(UNREAD);
+        // The refresh's attention list takes its first page, then its later pages hang.
+        const releaseOld = fake.holdPages();
+        await act(async () => {
+          void mounted.current.refresh();
+          await flush(16);
+        });
+        // Read elsewhere (on the refresh's first page, past the done list's first page, so only the attention list holds it), an update the board missed; the kept list's next snapshot carries it.
+        const read = fake.paseo.agents.ref("unread-100").current()!;
+        fake.setAgentSilently({ ...read, requiresAttention: false, attentionReason: null, attentionTimestamp: null } as never);
+        fake.passNewPages();
+        await act(async () => {
+          fake.reconnectAgentSubscriptionWhere((options) => options.filter?.requiresAttention === true);
+          await flush(24);
+        });
+        expect(mounted.current.byId.get("unread-100")?.lane).not.toBe("review");
+        // The refresh's older snapshot finishes: it must not bring the read task back to review.
+        await act(async () => {
+          releaseOld();
+          await flush(24);
+        });
+        expect(mounted.current.byId.get("unread-100")?.lane).not.toBe("review");
+        expect(mounted.current.lanes.review.cards).toHaveLength(UNREAD - 1);
+      } finally {
+        mounted.unmount();
+      }
+    });
+
+    it("does not let an older snapshot land after a newer one whose last page finished in the same turn", async () => {
+      const old = (index: number) => recentIso(3 * 24 * 60 * 60 * 1000 + index * 1000);
+      const fake = createFakePaseo({
+        agents: Array.from({ length: UNREAD }, (_, index) =>
+          activeAgent(`unread-${index}`, { status: "idle", requiresAttention: true, attentionReason: "finished", updatedAt: old(index), lastUserMessageAt: old(index), createdAt: old(index) })),
+        workspaces: [workspace()],
+      });
+      const mounted = await mountTasks(fake);
+      try {
+        await settle();
+        // Snapshot A: the refresh's attention list, its later pages held.
+        const releaseA = fake.holdPages();
+        await act(async () => {
+          void mounted.current.refresh();
+          await flush(16);
+        });
+        // Read elsewhere; snapshot B, the kept list's newer one, has its later pages held too.
+        const read = fake.paseo.agents.ref("unread-100").current()!;
+        fake.setAgentSilently({ ...read, requiresAttention: false, attentionReason: null, attentionTimestamp: null } as never);
+        const releaseB = fake.holdPages();
+        await act(async () => {
+          fake.reconnectAgentSubscriptionWhere((options) => options.filter?.requiresAttention === true);
+          await flush(16);
+        });
+        // Both finish in one turn, the newer first.
+        await act(async () => {
+          releaseB();
+          releaseA();
+          await flush(32);
+        });
+        expect(mounted.current.byId.get("unread-100")?.lane).not.toBe("review");
+        expect(mounted.current.lanes.review.cards).toHaveLength(UNREAD - 1);
+      } finally {
+        mounted.unmount();
+      }
+    });
+
+    it("fails a refresh whose list was superseded by a snapshot that could not read every page", async () => {
+      const fake = unreadFake();
+      const mounted = await mountTasks(fake);
+      try {
+        await settle();
+        const releaseA = fake.holdPages();
+        let result: string | undefined;
+        await act(async () => {
+          void mounted.current.refresh().then((value) => { result = value; });
+          await flush(16);
+        });
+        // The kept list's newer snapshot fails a later page and lands what it has.
+        fake.passNewPages();
+        fake.failNextAgentList((options) => options.page?.cursor !== undefined && options.filter?.requiresAttention === true, "socket closed");
+        await act(async () => {
+          fake.reconnectAgentSubscriptionWhere((options) => options.filter?.requiresAttention === true);
+          await flush(24);
+        });
+        await act(async () => {
+          releaseA();
+          await flush(24);
+        });
+        expect(result).toBe("failed");
+        expect(mounted.current.error).toBe("socket closed");
+      } finally {
+        mounted.unmount();
+      }
+    });
+
+    it("does not bring back an archived task when a refresh's done page answers late", async () => {
+      const fake = createFakePaseo({
+        agents: Array.from({ length: 60 }, (_, index) => activeAgent(`done-${index}`, { status: "idle", requiresAttention: false, updatedAt: recentIso(10_000 + index * 1_000) })),
+        workspaces: [workspace()],
+      });
+      const mounted = await mountTasks(fake, "24h");
+      try {
+        await settle();
+        await act(async () => {
+          mounted.current.loadMoreDone();
+          await flush(16);
+        });
+        expect(mounted.current.byId.get("done-55")?.lane).toBe("done");
+        vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+        // The refresh reads the second done page now, with done-55 unarchived, and answers later.
+        const releaseAnswers = fake.holdPageAnswers();
+        await act(async () => {
+          void mounted.current.refresh();
+          await flush(16);
+        });
+        // Archived meanwhile, the archived lane off: removes, then a gone check takes the card off.
+        const target = fake.paseo.agents.ref("done-55").current()!;
+        await act(async () => {
+          fake.upsertAgent({ ...target, archivedAt: recentIso(0), updatedAt: recentIso(0) } as never);
+          await flush(8);
+          vi.advanceTimersByTime(3_500);
+          await flush(16);
+        });
+        expect(mounted.current.byId.has("done-55")).toBe(false);
+        await act(async () => {
+          releaseAnswers();
+          await flush(24);
+        });
+        expect(mounted.current.byId.has("done-55")).toBe(false);
+      } finally {
+        vi.useRealTimers();
+        mounted.unmount();
+      }
+    });
+
+    it("keeps unread tasks the status list landed first once that list lets them go", async () => {
+      const fake = createFakePaseo({
+        agents: Array.from({ length: UNREAD }, (_, index) =>
+          activeAgent(`both-${index}`, { status: "running", requiresAttention: true, attentionReason: "finished", updatedAt: recentIso(1_000 + index) })),
+        workspaces: [workspace()],
+      });
+      const mounted = await mountTasks(fake, "24h", false);
+      try {
+        await settle();
+        expect(mounted.current.byId.size).toBe(UNREAD);
+        // Their turns ended, an update the board missed: still unread, no longer running.
+        for (let index = 0; index < UNREAD; index += 1) {
+          const agent = fake.paseo.agents.ref(`both-${index}`).current()!;
+          fake.setAgentSilently({ ...agent, status: "idle" } as never);
+        }
+        await act(async () => {
+          fake.reconnectAgentSubscriptionWhere((options) => options.filter?.statuses?.includes("running") === true);
+          await flush(24);
+        });
+        await settle();
+        // The attention list still holds them all.
+        expect(mounted.current.byId.size).toBe(UNREAD);
+      } finally {
+        mounted.unmount();
+      }
+    });
+
+    it("keeps a member another list added while this list's pages were read", async () => {
+      const fake = unreadFake();
+      const mounted = await mountTasks(fake, "24h", false);
+      try {
+        await settle();
+        // The attention list's next snapshot is taken, its later pages held.
+        const release = fake.holdPages();
+        await act(async () => {
+          fake.reconnectAgentSubscriptionWhere((options) => options.filter?.requiresAttention === true);
+          await flush(16);
+        });
+        // Meanwhile a new task runs and needs attention; the running list brings it.
+        const runner = activeAgent("late-runner", { status: "running", requiresAttention: true, attentionReason: "finished", updatedAt: recentIso(0), lastUserMessageAt: recentIso(0) });
+        fake.setAgentSilently(runner);
+        await act(async () => {
+          fake.pushUpsertTo(runner, (options) => options.filter?.statuses?.includes("running") === true);
+          await flush(8);
+        });
+        await act(async () => {
+          release();
+          await flush(24);
+        });
+        // Its turn ends, still unread; the running list lets it go. The attention list must still hold
+        // it, so the card stays (with the record it has until the attention list sends a newer one).
+        fake.setAgentSilently({ ...runner, status: "idle" } as never);
+        await act(async () => {
+          fake.reconnectAgentSubscriptionWhere((options) => options.filter?.statuses?.includes("running") === true);
+          await flush(24);
+        });
+        expect(mounted.current.byId.has("late-runner")).toBe(true);
+      } finally {
+        mounted.unmount();
+      }
+    });
+
+    it("ends a refresh once the kept list landed a newer snapshot, though the refresh's own page hangs", async () => {
+      const fake = unreadFake();
+      const mounted = await mountTasks(fake);
+      try {
+        await settle();
+        const releaseA = fake.holdPages();
+        let result: string | undefined;
+        await act(async () => {
+          void mounted.current.refresh().then((value) => { result = value; });
+          await flush(16);
+        });
+        fake.passNewPages();
+        // Only the kept list reconnects, and lands every page.
+        await act(async () => {
+          fake.reconnectAgentSubscriptionWhere((options) => options.filter?.requiresAttention === true);
+          await flush(24);
+        });
+        expect(result).toBe("done");
+        expect(mounted.current.lanes.review.cards).toHaveLength(UNREAD);
+        await act(async () => {
+          releaseA();
+          await flush(16);
+        });
+      } finally {
+        mounted.unmount();
+      }
+    });
+
+    it("retries a first list whose subscription failed when the board refreshes", async () => {
+      const fake = createFakePaseo({ agents: [activeAgent("runner", { status: "running", updatedAt: recentIso(1_000) })], workspaces: [workspace()] });
+      fake.failNextReady((options) => options.filter?.statuses?.includes("running") === true, "status list failed");
+      const mounted = await mountTasks(fake);
+      try {
+        await settle();
+        expect(mounted.current.ready).toBe(true);
+        expect(mounted.current.error).toBe("status list failed");
+        expect(mounted.current.byId.has("runner")).toBe(false);
+        let result: string | undefined;
+        await act(async () => {
+          void mounted.current.refresh().then((value) => { result = value; });
+          await flush(24);
+        });
+        expect(result).toBe("done");
+        expect(mounted.current.error).toBeNull();
+        expect(mounted.current.byId.get("runner")?.lane).toBe("running");
+      } finally {
+        mounted.unmount();
+      }
+    });
+
+    it("leaves out a task archived before it was loaded when its done page answers late", async () => {
+      const fake = createFakePaseo({
+        agents: Array.from({ length: 60 }, (_, index) => activeAgent(`a-${index}`, { status: "idle", requiresAttention: false, updatedAt: recentIso(10_000 + index * 1_000) })),
+        workspaces: [workspace()],
+      });
+      const mounted = await mountTasks(fake, "24h");
+      try {
+        await settle();
+        expect(mounted.current.byId.has("a-55")).toBe(false);
+        // The second done page is read now, a-55 unarchived, and answered later.
+        const release = fake.holdPageAnswers();
+        await act(async () => {
+          mounted.current.loadMoreDone();
+          await flush(8);
+        });
+        const target = fake.paseo.agents.ref("a-55").current()!;
+        await act(async () => {
+          fake.upsertAgent({ ...target, archivedAt: recentIso(0), updatedAt: recentIso(0) } as never);
+          await flush(8);
+        });
+        await act(async () => {
+          release();
+          await flush(24);
+        });
+        expect(mounted.current.byId.has("a-55")).toBe(false);
+        expect(mounted.current.lanes.done.cards).toHaveLength(59);
+      } finally {
+        mounted.unmount();
+      }
+    });
+
+    it("lands the workspace list's newer failure over an older snapshot that succeeds later", async () => {
+      const fake = createFakePaseo({
+        agents: [activeAgent("late", { status: "idle", requiresAttention: true, updatedAt: recentIso(1_000) })],
+        workspaces: [...Array.from({ length: 4 }, (_, index) => makeWorkspace({ id: `filler-${index}`, projectId: "project-id", name: `filler-${index}` })), workspace()],
+        workspacePageSize: 2,
+      });
+      const mounted = await mountTasks(fake);
+      try {
+        await settle();
+        const releaseA = fake.holdPages();
+        let result: string | undefined;
+        await act(async () => {
+          void mounted.current.refresh().then((value) => { result = value; });
+          await flush(16);
+        });
+        // The kept workspace list's newer snapshot fails a later page.
+        fake.passNewPages();
+        fake.failWorkspacePages(new Error("workspace page failed"));
+        await act(async () => {
+          fake.reconnectOldestWorkspaceSubscription();
+          await flush(24);
+        });
+        fake.failWorkspacePages(null);
+        await act(async () => {
+          releaseA();
+          await flush(24);
+        });
+        expect(result).toBe("failed");
+        expect(mounted.current.error).toBe("workspace page failed");
+      } finally {
+        mounted.unmount();
+      }
+    });
+
+    it("keeps a done task on a late page when only the running list removed it", async () => {
+      const fake = createFakePaseo({
+        agents: Array.from({ length: 60 }, (_, index) => activeAgent(`d-${index}`, { status: "idle", requiresAttention: false, updatedAt: recentIso(10_000 + index * 1_000) })),
+        workspaces: [workspace()],
+      });
+      const mounted = await mountTasks(fake, "24h");
+      try {
+        await settle();
+        const release = fake.holdPageAnswers();
+        await act(async () => {
+          mounted.current.loadMoreDone();
+          await flush(8);
+        });
+        // The running list never had it; its remove says nothing about done.
+        await act(async () => {
+          fake.pushRemoveTo("d-55", (options) => options.filter?.statuses?.includes("running") === true);
+          await flush(8);
+        });
+        await act(async () => {
+          release();
+          await flush(24);
+        });
+        expect(mounted.current.byId.get("d-55")?.lane).toBe("done");
+        expect(mounted.current.lanes.done.cards).toHaveLength(60);
+      } finally {
+        mounted.unmount();
+      }
+    });
+
+    it("reads an archived parent of a running background task a bounded number of times", async () => {
+      const fake = createFakePaseo({
+        agents: [
+          makeAgent({ id: "p", status: "idle", title: "Archived parent", archivedAt: recentIso(60_000), workspaceId: "ws" }),
+          activeAgent("bg-child", { status: "running", workspaceId: "ws-bg", labels: { "paseo.parent-agent-id": "p" }, updatedAt: recentIso(1_000) }),
+        ],
+        workspaces: [workspace(), makeWorkspace({ id: "ws-bg", projectId: "project-id", name: "bg", background: true } as never)],
+      });
+      // Each read answers on a later task, so a loop shows as many reads instead of hanging the test.
+      const ref = fake.paseo.agents.ref.bind(fake.paseo.agents);
+      (fake.paseo.agents as { ref: typeof ref }).ref = ((agent: Parameters<typeof ref>[0]) => {
+        const handle = ref(agent);
+        return { ...handle, refresh: async () => { await new Promise((resolve) => setTimeout(resolve, 1)); return handle.refresh(); } };
+      }) as typeof ref;
+      const mounted = await mountTasks(fake, "24h");
+      try {
+        await act(async () => { await new Promise((resolve) => setTimeout(resolve, 150)); });
+        const reads = fake.calls.filter((call) => call.method === "agents.ref.refresh" && (call.input as { agentId: string }).agentId === "p");
+        expect(reads.length).toBeLessThanOrEqual(2);
+      } finally {
+        mounted.unmount();
+      }
+    });
+
+    it("drops a done page asked for before the done list started over", async () => {
+      const fake = createFakePaseo({
+        agents: Array.from({ length: 60 }, (_, index) => activeAgent(`g-${index}`, { status: "idle", requiresAttention: false, updatedAt: recentIso(10_000 + index * 1_000) })),
+        workspaces: [workspace()],
+      });
+      const mounted = await mountTasks(fake, "24h");
+      try {
+        await settle();
+        const release = fake.holdPageAnswers();
+        await act(async () => {
+          mounted.current.loadMoreDone();
+          await flush(8);
+        });
+        // Archived with nothing sent, then the done list starts over (a re-subscribe after its buffer overflowed).
+        const target = fake.paseo.agents.ref("g-55").current()!;
+        fake.setAgentSilently({ ...target, archivedAt: recentIso(0), updatedAt: recentIso(0) } as never);
+        await act(async () => {
+          fake.reconnectAgentSubscriptionWhere((options) => options.filter?.statuses?.includes("idle") === true);
+          await flush(8);
+        });
+        await act(async () => {
+          release();
+          await flush(24);
+        });
+        expect(mounted.current.byId.has("g-55")).toBe(false);
+      } finally {
+        mounted.unmount();
+      }
+    });
+
+    it("lets a refresh's older list finish first without taking over from the kept list's newer one", async () => {
+      const old = (index: number) => recentIso(3 * 24 * 60 * 60 * 1000 + index * 1000);
+      const fake = createFakePaseo({
+        agents: Array.from({ length: UNREAD }, (_, index) =>
+          activeAgent(`unread-${index}`, { status: "idle", requiresAttention: true, attentionReason: "finished", updatedAt: old(index), lastUserMessageAt: old(index), createdAt: old(index) })),
+        workspaces: [workspace()],
+      });
+      const mounted = await mountTasks(fake);
+      try {
+        await settle();
+        // The refresh's list A reads its later page now (before the read below) and answers later.
+        const releaseA = fake.holdPageAnswers();
+        let result: string | undefined;
+        await act(async () => {
+          void mounted.current.refresh().then((value) => { result = value; });
+          await flush(16);
+        });
+        // Read elsewhere; the kept list's newer snapshot B also answers its later page later.
+        const read = fake.paseo.agents.ref("unread-100").current()!;
+        fake.setAgentSilently({ ...read, requiresAttention: false, attentionReason: null, attentionTimestamp: null } as never);
+        const releaseB = fake.holdPageAnswers();
+        await act(async () => {
+          fake.reconnectAgentSubscriptionWhere((options) => options.filter?.requiresAttention === true);
+          await flush(16);
+        });
+        // A finishes first; B after.
+        await act(async () => {
+          releaseA();
+          await flush(24);
+        });
+        await act(async () => {
+          releaseB();
+          await flush(24);
+        });
+        expect(result).toBe("done");
+        expect(mounted.current.byId.get("unread-100")?.lane).not.toBe("review");
+        expect(mounted.current.lanes.review.cards).toHaveLength(UNREAD - 1);
+      } finally {
+        mounted.unmount();
+      }
+    });
+
+    it("drops a refresh's reread done page once the done list started over", async () => {
+      const fake = createFakePaseo({
+        agents: Array.from({ length: 60 }, (_, index) => activeAgent(`r-${index}`, { status: "idle", requiresAttention: false, updatedAt: recentIso(10_000 + index * 1_000) })),
+        workspaces: [workspace()],
+      });
+      const mounted = await mountTasks(fake, "24h");
+      try {
+        await settle();
+        await act(async () => {
+          mounted.current.loadMoreDone();
+          await flush(16);
+        });
+        // A task the board never held, in the second page's range.
+        const fresh = activeAgent("r-new", { status: "idle", requiresAttention: false, updatedAt: recentIso(10_000 + 54_500) });
+        fake.setAgentSilently(fresh);
+        // The refresh rereads the second page now (with r-new) and answers later.
+        const release = fake.holdPageAnswers();
+        await act(async () => {
+          void mounted.current.refresh();
+          await flush(16);
+        });
+        // r-new is archived with nothing sent, and the done list starts over from its first page.
+        fake.setAgentSilently({ ...fresh, archivedAt: recentIso(0), updatedAt: recentIso(0) } as never);
+        await act(async () => {
+          fake.reconnectAgentSubscriptionWhere((options) => options.filter?.statuses?.includes("idle") === true);
+          await flush(8);
+        });
+        await act(async () => {
+          release();
+          await flush(24);
+        });
+        // The old second page does not land on the new first one.
+        expect(mounted.current.byId.has("r-new")).toBe(false);
+        expect(mounted.current.lanes.done.cards).toHaveLength(50);
+      } finally {
+        mounted.unmount();
+      }
+    });
+
+    it("does not bring back an archived parent when an older read of it answers late", async () => {
+      const fake = createFakePaseo({
+        agents: [
+          makeAgent({ id: "p", status: "idle", title: "Parent", workspaceId: "ws", updatedAt: recentIso(60_000) }),
+          activeAgent("bg-child", { status: "running", workspaceId: "ws-bg", labels: { "paseo.parent-agent-id": "p" }, updatedAt: recentIso(1_000) }),
+        ],
+        workspaces: [workspace(), makeWorkspace({ id: "ws-bg", projectId: "project-id", name: "bg", background: true } as never)],
+      });
+      const mounted = await mountTasks(fake, "24h");
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      try {
+        await act(async () => { await flush(16); });
+        const release = fake.holdRefreshes();
+        await act(async () => {
+          void mounted.current.refreshParent("p");
+          await flush(8);
+        });
+        fake.passNewRefreshes();
+        // Archived meanwhile; its running background child keeps it until a gone check takes it off.
+        const parent = fake.paseo.agents.ref("p").current()!;
+        await act(async () => {
+          fake.upsertAgent({ ...parent, archivedAt: recentIso(0), updatedAt: recentIso(0) } as never);
+          await flush(8);
+          vi.advanceTimersByTime(1_100);
+          await flush(16);
+        });
+        expect(mounted.current.byId.has("p")).toBe(false);
+        await act(async () => {
+          release();
+          await flush(16);
+        });
+        expect(mounted.current.byId.has("p")).toBe(false);
+      } finally {
+        vi.useRealTimers();
+        mounted.unmount();
+      }
+    });
+
+    it("shows a gapless done lane when a newer first page lands while a refresh rereads", async () => {
+      // A newer first page (a task added at the top shifts the list) lands while the refresh's reread
+      // page is out, at each task boundary the socket allows: the lane shows a prefix of the done list,
+      // never a hole where the old first page ended (keyset cursors, as the daemon's).
+      for (let delay = 0; delay <= 4; delay += 1) {
+        const fake = createFakePaseo({
+          agents: Array.from({ length: 120 }, (_, index) => activeAgent(`k-${String(index).padStart(3, "0")}`, { status: "idle", requiresAttention: false, updatedAt: recentIso(10_000 + index * 1_000) })),
+          workspaces: [workspace()],
+        });
+        const mounted = await mountTasks(fake, "24h");
+        try {
+          await settle();
+          await act(async () => {
+            mounted.current.loadMoreDone();
+            await flush(16);
+          });
+          const release = fake.holdPageAnswers();
+          await act(async () => {
+            void mounted.current.refresh();
+            for (let index = 0; index < delay; index += 1) await new Promise((resolve) => setTimeout(resolve, 0));
+            fake.setAgentSilently(activeAgent("k-top", { status: "idle", requiresAttention: false, updatedAt: recentIso(1_000) }));
+            fake.reconnectAgentSubscriptionWhere((options) => options.filter?.statuses?.includes("idle") === true);
+            await flush(16);
+          });
+          await act(async () => {
+            release();
+            await flush(40);
+          });
+          const ordered = ["k-top", ...Array.from({ length: 120 }, (_, index) => `k-${String(index).padStart(3, "0")}`)];
+          const shown = mounted.current.lanes.done.cards.map((card) => card.id);
+          expect({ delay, shown: [...shown].sort() }).toEqual({ delay, shown: ordered.slice(0, shown.length).sort() });
+          expect(shown).toContain("k-top");
+        } finally {
+          mounted.unmount();
+        }
+      }
+    });
+
+    it("lands the kept list's snapshot once a refresh's newer one was let go", async () => {
+      const old = (index: number) => recentIso(3 * 24 * 60 * 60 * 1000 + index * 1000);
+      const fake = createFakePaseo({
+        agents: Array.from({ length: 210 }, (_, index) =>
+          activeAgent(`unread-${index}`, { status: "idle", requiresAttention: true, attentionReason: "finished", updatedAt: old(index), lastUserMessageAt: old(index), createdAt: old(index) })),
+        workspaces: [workspace()],
+      });
+      const mounted = await mountTasks(fake, "24h", false);
+      try {
+        await settle();
+        // Missed: a new unread task, last in the list's order.
+        fake.setAgentSilently(activeAgent("unread-new", { status: "idle", requiresAttention: true, attentionReason: "finished", updatedAt: old(500), lastUserMessageAt: old(500), createdAt: old(500) }));
+        // The kept list reconnects (A); its later page answers later.
+        const releaseA = fake.holdPageAnswers();
+        await act(async () => {
+          fake.reconnectAgentSubscriptionWhere((options) => options.filter?.requiresAttention === true);
+          await flush(16);
+        });
+        // A refresh's list (B) arrives newer, hangs, and the refresh times out.
+        vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+        const releaseB = fake.holdPageAnswers();
+        let result: string | undefined;
+        await act(async () => {
+          void mounted.current.refresh().then((value) => { result = value; });
+          await flush(16);
+          vi.advanceTimersByTime(30_000);
+          await flush(16);
+        });
+        expect(result).toBe("failed");
+        // A finishes: with B let go, it is the newest and lands.
+        await act(async () => {
+          releaseA();
+          await flush(32);
+        });
+        expect(mounted.current.byId.get("unread-new")?.lane).toBe("review");
+        releaseB();
+      } finally {
+        vi.useRealTimers();
+        mounted.unmount();
+      }
+    });
+
+    it("says so and checks again when a gone check's read fails", async () => {
+      const fake = createFakePaseo({
+        agents: Array.from({ length: 60 }, (_, index) => activeAgent(`gc-${index}`, { status: "idle", requiresAttention: false, updatedAt: recentIso(10_000 + index * 1_000) })),
+        workspaces: [workspace()],
+      });
+      const mounted = await mountTasks(fake, "24h");
+      try {
+        await settle();
+        await act(async () => {
+          mounted.current.loadMoreDone();
+          await flush(16);
+        });
+        vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+        // Archived, the archived lane off: removes; only the second done page still holds it, so a gone check reads it.
+        fake.failRefreshes(new Error("connection lost"));
+        const target = fake.paseo.agents.ref("gc-55").current()!;
+        await act(async () => {
+          fake.upsertAgent({ ...target, archivedAt: recentIso(0), updatedAt: recentIso(0) } as never);
+          await flush(8);
+          vi.advanceTimersByTime(1_100);
+          await flush(16);
+        });
+        expect(mounted.current.byId.has("gc-55")).toBe(true);
+        expect(mounted.current.error).toBe("connection lost");
+        fake.failRefreshes(null);
+        await act(async () => {
+          vi.advanceTimersByTime(2_000 + 1_100);
+          await flush(16);
+        });
+        expect(mounted.current.byId.has("gc-55")).toBe(false);
+        expect(mounted.current.error).toBeNull();
+      } finally {
+        vi.useRealTimers();
+        mounted.unmount();
+      }
+    });
+
+    it("keeps the card at the done page boundary while a refresh rereads the next page", async () => {
+      const fake = createFakePaseo({
+        agents: Array.from({ length: 120 }, (_, index) => activeAgent(`b-${String(index).padStart(3, "0")}`, { status: "idle", requiresAttention: false, updatedAt: recentIso(10_000 + index * 1_000) })),
+        workspaces: [workspace()],
+      });
+      const mounted = await mountTasks(fake, "24h");
+      try {
+        await settle();
+        await act(async () => {
+          mounted.current.loadMoreDone();
+          await flush(16);
+        });
+        expect(mounted.current.byId.has("b-049")).toBe(true);
+        // A task added at the top pushes b-049 onto the second page; the refresh's reread of it answers later.
+        fake.setAgentSilently(activeAgent("b-top", { status: "idle", requiresAttention: false, updatedAt: recentIso(1_000) }));
+        const release = fake.holdPageAnswers();
+        await act(async () => {
+          void mounted.current.refresh();
+          await flush(24);
+        });
+        expect(mounted.current.byId.has("b-top")).toBe(true);
+        expect(mounted.current.byId.has("b-049")).toBe(true);
+        await act(async () => {
+          release();
+          await flush(24);
+        });
+        expect(mounted.current.byId.has("b-049")).toBe(true);
+        // Two pages as before: b-top and b-000..b-098 (b-099 moved to the third page, not loaded).
+        expect(mounted.current.lanes.done.cards).toHaveLength(100);
+      } finally {
+        mounted.unmount();
+      }
+    });
+
+    it("clears a gone check's error once a snapshot took its card off", async () => {
+      const fake = createFakePaseo({
+        agents: Array.from({ length: 60 }, (_, index) => activeAgent(`gs-${index}`, { status: "idle", requiresAttention: false, updatedAt: recentIso(10_000 + index * 1_000) })),
+        workspaces: [workspace()],
+      });
+      const mounted = await mountTasks(fake, "24h");
+      try {
+        await settle();
+        await act(async () => {
+          mounted.current.loadMoreDone();
+          await flush(16);
+        });
+        vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+        fake.failRefreshes(new Error("gone-check read failed"));
+        const target = fake.paseo.agents.ref("gs-55").current()!;
+        await act(async () => {
+          fake.upsertAgent({ ...target, archivedAt: recentIso(0), updatedAt: recentIso(0) } as never);
+          await flush(8);
+          vi.advanceTimersByTime(1_100);
+          await flush(16);
+        });
+        expect(mounted.current.error).toBe("gone-check read failed");
+        // The done list starts over without it: the card leaves with the second page.
+        await act(async () => {
+          fake.reconnectAgentSubscriptionWhere((options) => options.filter?.statuses?.includes("idle") === true);
+          await flush(16);
+        });
+        expect(mounted.current.byId.has("gs-55")).toBe(false);
+        await act(async () => {
+          vi.advanceTimersByTime(2_000 + 1_100);
+          await flush(16);
+        });
+        expect(mounted.current.error).toBeNull();
+      } finally {
+        vi.useRealTimers();
+        mounted.unmount();
+      }
+    });
+
+    it("stops a refresh's reread chain once a newer done first page landed", async () => {
+      const fake = createFakePaseo({
+        agents: Array.from({ length: 150 }, (_, index) => activeAgent(`c-${String(index).padStart(3, "0")}`, { status: "idle", requiresAttention: false, updatedAt: recentIso(10_000 + index * 1_000) })),
+        workspaces: [workspace()],
+      });
+      const mounted = await mountTasks(fake, "24h");
+      try {
+        await settle();
+        for (let page = 0; page < 2; page += 1) {
+          await act(async () => {
+            mounted.current.loadMoreDone();
+            await flush(16);
+          });
+        }
+        expect(mounted.current.lanes.done.cards).toHaveLength(150);
+        // The refresh rereads its second page, answered later.
+        const release = fake.holdPageAnswers();
+        let result: string | undefined;
+        await act(async () => {
+          void mounted.current.refresh().then((value) => { result = value; });
+          await flush(16);
+        });
+        // A newer first page lands; any further page of the old chain would fail.
+        await act(async () => {
+          fake.reconnectAgentSubscriptionWhere((options) => options.filter?.statuses?.includes("idle") === true);
+          await flush(8);
+        });
+        fake.failNextAgentList((options) => options.page?.cursor !== undefined, "obsolete page failed");
+        const before = fake.pageCalls().length;
+        await act(async () => {
+          release();
+          await flush(24);
+        });
+        expect(fake.pageCalls()).toHaveLength(before);
+        expect(mounted.current.error).toBeNull();
+        expect(result).not.toBe("failed");
+      } finally {
+        mounted.unmount();
+      }
+    });
+
+    it("clears a gone check's error when a snapshot takes its card off after the retries ran out", async () => {
+      const fake = createFakePaseo({
+        agents: Array.from({ length: 60 }, (_, index) => activeAgent(`ge-${index}`, { status: "idle", requiresAttention: false, updatedAt: recentIso(10_000 + index * 1_000) })),
+        workspaces: [workspace()],
+      });
+      const mounted = await mountTasks(fake, "24h");
+      try {
+        await settle();
+        await act(async () => {
+          mounted.current.loadMoreDone();
+          await flush(16);
+        });
+        vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+        fake.failRefreshes(new Error("read failed"));
+        const target = fake.paseo.agents.ref("ge-55").current()!;
+        await act(async () => {
+          fake.upsertAgent({ ...target, archivedAt: recentIso(0), updatedAt: recentIso(0) } as never);
+          await flush(8);
+        });
+        // Every check fails, retries included.
+        for (const wait of [1_100, 3_100, 6_100, 16_100, 1_000]) {
+          await act(async () => {
+            vi.advanceTimersByTime(wait);
+            await flush(16);
+          });
+        }
+        expect(mounted.current.error).toBe("read failed");
+        await act(async () => {
+          fake.reconnectAgentSubscriptionWhere((options) => options.filter?.statuses?.includes("idle") === true);
+          await flush(16);
+        });
+        expect(mounted.current.byId.has("ge-55")).toBe(false);
+        expect(mounted.current.error).toBeNull();
+      } finally {
+        vi.useRealTimers();
+        mounted.unmount();
+      }
+    });
+
+    it("says nothing when an old done page fails after the done list started over", async () => {
+      const fake = createFakePaseo({
+        agents: Array.from({ length: 80 }, (_, index) => activeAgent(`of-${index}`, { status: "idle", requiresAttention: false, updatedAt: recentIso(10_000 + index * 1_000) })),
+        workspaces: [workspace()],
+      });
+      const mounted = await mountTasks(fake, "24h");
+      try {
+        await settle();
+        const release = fake.holdPages();
+        await act(async () => {
+          mounted.current.loadMoreDone();
+          await flush(8);
+        });
+        await act(async () => {
+          fake.reconnectAgentSubscriptionWhere((options) => options.filter?.statuses?.includes("idle") === true);
+          await flush(8);
+        });
+        fake.failNextAgentList((options) => options.page?.cursor !== undefined, "obsolete request failed");
+        await act(async () => {
+          release();
+          await flush(16);
+        });
+        expect(mounted.current.error).toBeNull();
+      } finally {
+        mounted.unmount();
+      }
+    });
+
+    it("keeps saying a list is incomplete while another one recovers", async () => {
+      const fake = createFakePaseo({
+        agents: [
+          ...Array.from({ length: 210 }, (_, index) => activeAgent(`run-${index}`, { status: "running", updatedAt: recentIso(1_000 + index) })),
+          ...Array.from({ length: UNREAD }, (_, index) =>
+            activeAgent(`unread-${index}`, { status: "idle", requiresAttention: true, attentionReason: "finished", updatedAt: recentIso(5_000 + index) })),
+        ],
+        workspaces: [workspace()],
+      });
+      const mounted = await mountTasks(fake);
+      try {
+        await settle();
+        fake.failNextAgentList((options) => options.page?.cursor !== undefined && options.filter?.statuses?.includes("running") === true, "running list incomplete");
+        fake.failNextAgentList((options) => options.page?.cursor !== undefined && options.filter?.requiresAttention === true, "review list incomplete");
+        await act(async () => {
+          fake.reconnectSubscriptions();
+          await flush(24);
+        });
+        expect(["running list incomplete", "review list incomplete"]).toContain(mounted.current.error);
+        await act(async () => {
+          fake.reconnectAgentSubscriptionWhere((options) => options.filter?.requiresAttention === true);
+          await flush(24);
+        });
+        expect(mounted.current.error).toBe("running list incomplete");
+        await act(async () => {
+          fake.reconnectAgentSubscriptionWhere((options) => options.filter?.statuses?.includes("running") === true);
+          await flush(24);
+        });
+        expect(mounted.current.error).toBeNull();
+      } finally {
+        mounted.unmount();
+      }
+    });
+
+    it("reads each later page once for the snapshot the SDK replays on subscribe", async () => {
+      const fake = unreadFake();
+      const mounted = await mountTasks(fake);
+      try {
+        await settle();
+        expect(fake.pageCalls().filter((call) => call.startsWith("agents.list:"))).toHaveLength(1);
+      } finally {
+        mounted.unmount();
+      }
+    });
+
+    it("stops reading the pages of a list once the board closes", async () => {
+      const fake = createFakePaseo({
+        agents: Array.from({ length: 650 }, (_, index) =>
+          activeAgent(`unread-${index}`, { status: "idle", requiresAttention: true, attentionReason: "finished", updatedAt: recentIso(1_000 + index) })),
+        workspaces: [workspace()],
+      });
+      const release = fake.holdPages();
+      const mounted = await mountTasks(fake);
+      await settle();
+      const before = fake.pageCalls().filter((call) => call.startsWith("agents.list:")).length;
+      expect(before).toBeGreaterThan(0);
+      mounted.unmount();
+      await act(async () => {
+        release();
+        await flush(16);
+      });
+      // Each list in flight finishes the page it asked for and asks for no other.
+      expect(fake.pageCalls().filter((call) => call.startsWith("agents.list:"))).toHaveLength(before);
+    });
+
+    it("keeps the unread tasks it has when a later page cannot be read", async () => {
+      const fake = unreadFake();
+      const mounted = await mountTasks(fake);
+      try {
+        await settle();
+        fake.failNextAgentList((options) => options.page?.cursor !== undefined && options.filter?.requiresAttention === true, "socket closed");
+        await act(async () => {
+          fake.reconnectSubscriptions();
+          await Promise.resolve();
+        });
+        await settle();
+        expect(mounted.current.lanes.review.cards).toHaveLength(UNREAD);
+        expect(mounted.current.error).toBe("socket closed");
+      } finally {
+        mounted.unmount();
+      }
+    });
+
+    it("lets a live read win over the later pages of a snapshot", async () => {
+      const fake = unreadFake();
+      const mounted = await mountTasks(fake);
+      try {
+        await settle();
+        const last = `unread-${UNREAD - 1}`;
+        await act(async () => {
+          fake.reconnectSubscriptions();
+          // Read on another device while the later pages load: the pages still hold it unread.
+          fake.upsertAgent(activeAgent(last, { status: "idle", requiresAttention: false, updatedAt: recentIso(0) }));
+          await Promise.resolve();
+        });
+        await settle();
+        expect(mounted.current.byId.get(last)?.lane).toBe("done");
+        expect(mounted.current.lanes.review.cards).toHaveLength(UNREAD - 1);
+      } finally {
+        mounted.unmount();
+      }
+    });
+  });
+
+  describe("a paged workspace list", () => {
+    const flush = async (rounds: number) => { for (let index = 0; index < rounds; index += 1) await Promise.resolve(); };
+    // The daemon pages its workspace list (200 at most) and a subscription's
+    // snapshot is only the first page: with 232 workspaces the main checkout's
+    // tasks fell into the archived lane (2026-11-15).
+    function pagedFake() {
+      const fillers = Array.from({ length: 4 }, (_, index) => makeWorkspace({ id: `filler-${index}`, projectId: "project-id", name: `filler-${index}` }));
+      return createFakePaseo({
+        agents: [
+          activeAgent("late", { status: "idle", requiresAttention: true, updatedAt: recentIso(1_000) }),
+          activeAgent("stale", { status: "idle", requiresAttention: true, updatedAt: recentIso(2_000), workspaceId: "ws-archived" }),
+        ],
+        // "ws" comes after two full pages of others.
+        workspaces: [...fillers, workspace()],
+        workspacePageSize: 2,
+      });
+    }
+
+    async function settle() {
+      await act(async () => {
+        for (let index = 0; index < 12; index += 1) await Promise.resolve();
+      });
+    }
+
+    it("keeps a task whose workspace is past the first page out of the archived lane", async () => {
+      const fake = pagedFake();
+      const mounted = await mountTasks(fake);
+      try {
+        await settle();
+        expect(mounted.current.byId.get("late")?.lane).toBe("review");
+        expect(mounted.current.byId.get("late")?.location.workspaceName ?? mounted.current.byId.get("late")?.location.workspaceTitle).toBeTruthy();
+        // A workspace on no page is still archived.
+        expect(mounted.current.byId.has("stale")).toBe(false);
+        await act(async () => {
+          fake.reconnectSubscriptions();
+          await Promise.resolve();
+        });
+        await settle();
+        expect(mounted.current.byId.get("late")?.lane).toBe("review");
+        await act(async () => {
+          fake.removeWorkspace("ws");
+          await Promise.resolve();
+        });
+        expect(mounted.current.byId.has("late")).toBe(false);
+      } finally {
+        mounted.unmount();
+      }
+    });
+
+    it("finishes loading the workspaces when a refresh lands during their later pages", async () => {
+      const fake = pagedFake();
+      const release = fake.holdPages();
+      const mounted = await mountTasks(fake);
+      try {
+        await settle();
+        expect(mounted.current.ready).toBe(false);
+        await act(async () => {
+          void mounted.current.refresh();
+          await flush(16);
+        });
+        await act(async () => {
+          release();
+          await flush(16);
+        });
+        await settle();
+        expect(mounted.current.ready).toBe(true);
+        expect(mounted.current.byId.get("late")?.lane).toBe("review");
+      } finally {
+        mounted.unmount();
+      }
+    });
+
+    it("windows a task archived with its workspace by the task's own update time", async () => {
+      const days = (count: number) => recentIso(count * 24 * 60 * 60 * 1000);
+      const fake = createFakePaseo({
+        agents: [activeAgent("stale-task", { status: "idle", updatedAt: days(5), lastUserMessageAt: days(5), createdAt: days(6), workspaceId: "ws-archiving" })],
+        workspaces: [workspace(), makeWorkspace({ id: "ws-archiving", projectId: "project-id", name: "archiving", archivingAt: recentIso(0) } as never)],
+      });
+      let current!: TasksHandle;
+      function Probe() {
+        current = useTasks(fake.paseo, { doneWindow: "24h", includeDone: true, includeArchived: true });
+        return null;
+      }
+      let renderer!: Renderer;
+      await act(async () => {
+        setTasksArchivedLane(fake.paseo, true);
+        renderer = TestRenderer.create(React.createElement(Probe));
+        await flush(16);
+      });
+      try {
+        // Its workspace is archiving just now, but the done list pages by the task's own time,
+        // which is days old: the lane shows it neither now nor once paged, nor only on this board.
+        expect(current.byId.has("stale-task")).toBe(false);
+      } finally {
+        await act(async () => renderer.unmount());
+      }
+    });
+
+    it("finishes loading the workspaces when a refresh lands before their first page answered", async () => {
+      const fake = pagedFake();
+      const release = fake.holdWorkspaceLists();
+      const mounted = await mountTasks(fake);
+      try {
+        await settle();
+        expect(mounted.current.ready).toBe(false);
+        await act(async () => {
+          void mounted.current.refresh();
+          await flush(16);
+        });
+        await act(async () => {
+          release();
+          await flush(24);
+        });
+        await settle();
+        expect(mounted.current.ready).toBe(true);
+        expect(mounted.current.byId.get("late")?.lane).toBe("review");
+      } finally {
+        mounted.unmount();
+      }
+    });
+
+    it("finishes loading the workspaces when a refresh lands before their subscription is ready", async () => {
+      const fake = pagedFake();
+      const releaseList = fake.holdWorkspaceLists();
+      const mounted = await mountTasks(fake);
+      try {
+        await settle();
+        const releaseReady = fake.holdReady();
+        await act(async () => {
+          releaseList();
+          await flush(16);
+        });
+        await act(async () => {
+          void mounted.current.refresh();
+          await flush(16);
+        });
+        await act(async () => {
+          releaseReady();
+          await flush(24);
+        });
+        await settle();
+        expect(mounted.current.ready).toBe(true);
+        expect(mounted.current.byId.get("late")?.lane).toBe("review");
+      } finally {
+        mounted.unmount();
+      }
+    });
+
+    it("does not archive a task of a workspace made while disconnected before the reconnect's pages land", async () => {
+      const fake = pagedFake();
+      const mounted = await mountTasks(fake);
+      try {
+        await settle();
+        expect(mounted.current.ready).toBe(true);
+        // Made while disconnected: a new workspace (on a later page) and a task running in it.
+        fake.setWorkspaceSilently(makeWorkspace({ id: "z-new", projectId: "project-id", name: "z-new" }));
+        const release = fake.holdPages();
+        await act(async () => {
+          fake.reconnectOldestWorkspaceSubscription();
+          await flush(8);
+        });
+        await act(async () => {
+          fake.upsertAgent(activeAgent("new-runner", { status: "running", workspaceId: "z-new", updatedAt: recentIso(0), lastUserMessageAt: recentIso(0) }));
+          await flush(8);
+        });
+        // Its workspace is unplaced while the list's later pages load: it waits off the board, never archived.
+        expect(mounted.current.byId.has("new-runner")).toBe(false);
+        await settleWorkspaceCheck();
+        expect(mounted.current.byId.has("new-runner")).toBe(false);
+        await act(async () => {
+          release();
+          await flush(24);
+        });
+        await settleWorkspaceCheck();
+        expect(mounted.current.byId.get("new-runner")?.lane).toBe("running");
+        // A workspace archived before (left out of a complete list) stays archived throughout.
+        expect(mounted.current.byId.has("stale")).toBe(false);
+      } finally {
+        mounted.unmount();
+      }
+    });
+
+    it("does not archive a new workspace's running task when the running list reconnects before the workspaces", async () => {
+      const fake = createFakePaseo({ agents: [activeAgent("old", { status: "idle", requiresAttention: true, updatedAt: recentIso(5_000) })], workspaces: [workspace()] });
+      const mounted = await mountTasks(fake);
+      try {
+        await settle();
+        expect(mounted.current.ready).toBe(true);
+        // Made while disconnected.
+        fake.setWorkspaceSilently(makeWorkspace({ id: "z-new", projectId: "project-id", name: "z-new" }));
+        fake.setAgentSilently(activeAgent("new-runner", { status: "running", workspaceId: "z-new", updatedAt: recentIso(0), lastUserMessageAt: recentIso(0) }));
+        // The running list comes back first.
+        await act(async () => {
+          fake.reconnectAgentSubscriptionWhere((options) => options.filter?.statuses?.includes("running") === true);
+          await flush(16);
+        });
+        // The workspace check is a timer. It may already have placed the task
+        // in running; either way it must not have archived it.
+        const early = mounted.current.byId.get("new-runner");
+        expect(early === undefined || early.lane === "running").toBe(true);
+        await settleWorkspaceCheck();
+        expect(mounted.current.byId.get("new-runner")?.lane).toBe("running");
+        await act(async () => {
+          fake.reconnectOldestWorkspaceSubscription();
+          await flush(16);
+        });
+        expect(mounted.current.byId.get("new-runner")?.lane).toBe("running");
+      } finally {
+        mounted.unmount();
+      }
+    });
+
+    it("archives a removed workspace's task though the first workspace list could not read every page", async () => {
+      const fake = createFakePaseo({
+        agents: [activeAgent("victim", { status: "running", workspaceId: "filler-0", updatedAt: recentIso(1_000) })],
+        workspaces: [...Array.from({ length: 4 }, (_, index) => makeWorkspace({ id: `filler-${index}`, projectId: "project-id", name: `filler-${index}` })), workspace()],
+        workspacePageSize: 2,
+      });
+      const release = fake.holdPages();
+      const mounted = await mountTasks(fake);
+      try {
+        await settle();
+        // The daemon archives filler-0 while the first list's later pages load; they then fail.
+        await act(async () => {
+          fake.removeWorkspace("filler-0");
+          await flush(8);
+        });
+        fake.failWorkspacePages(new Error("later page failed"));
+        await act(async () => {
+          release();
+          await flush(24);
+        });
+        expect(mounted.current.ready).toBe(true);
+        expect(mounted.current.error).toBe("later page failed");
+        expect(mounted.current.byId.get("victim")?.lane).not.toBe("running");
+      } finally {
+        mounted.unmount();
+      }
+    });
+
+    it("reads no more pages for a refresh that timed out", async () => {
+      const fake = createFakePaseo({
+        agents: [activeAgent("late", { status: "idle", requiresAttention: true, updatedAt: recentIso(1_000) })],
+        workspaces: [...Array.from({ length: 6 }, (_, index) => makeWorkspace({ id: `filler-${index}`, projectId: "project-id", name: `filler-${index}` })), workspace()],
+        workspacePageSize: 2,
+      });
+      const mounted = await mountTasks(fake);
+      try {
+        await settle();
+        expect(mounted.current.ready).toBe(true);
+        const release = fake.holdPages();
+        vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+        let result: string | undefined;
+        await act(async () => {
+          void mounted.current.refresh().then((value) => { result = value; });
+          await flush(16);
+        });
+        const before = fake.pageCalls().filter((call) => call.startsWith("workspaces.list:")).length;
+        await act(async () => {
+          vi.advanceTimersByTime(30_000);
+          await flush(16);
+        });
+        expect(result).toBe("failed");
+        await act(async () => {
+          release();
+          await flush(24);
+        });
+        // The timed-out refresh's list was let go: it asks for no further page, and the board keeps its workspaces.
+        expect(fake.pageCalls().filter((call) => call.startsWith("workspaces.list:"))).toHaveLength(before);
+        expect(mounted.current.byId.get("late")?.lane).toBe("review");
+      } finally {
+        vi.useRealTimers();
+        mounted.unmount();
+      }
+    });
+
+    it("keeps the board's workspaces when a later page cannot be read", async () => {
+      const fake = pagedFake();
+      const mounted = await mountTasks(fake);
+      try {
+        await settle();
+        expect(mounted.current.byId.get("late")?.lane).toBe("review");
+        fake.failWorkspacePages(new Error("socket closed"));
+        await act(async () => {
+          fake.reconnectSubscriptions();
+          await Promise.resolve();
+        });
+        await settle();
+        expect(mounted.current.byId.get("late")?.lane).toBe("review");
+      } finally {
+        mounted.unmount();
+      }
+    });
+
+    it("lets a live removal win over the later pages of a snapshot", async () => {
+      const fake = pagedFake();
+      const mounted = await mountTasks(fake);
+      try {
+        await settle();
+        await act(async () => {
+          fake.reconnectSubscriptions();
+          // Archived while the snapshot's later pages are read; the fake's list already leaves it out,
+          // so put it back for the pages to carry a stale copy.
+          fake.removeWorkspace("ws");
+          fake.setWorkspaceSilently(workspace());
+          await Promise.resolve();
+        });
+        await settle();
+        expect(mounted.current.byId.has("late")).toBe(false);
+      } finally {
+        mounted.unmount();
+      }
+    });
   });
 
   it("brings an unarchived parent back as a done card the child links to", async () => {
@@ -1904,7 +4575,7 @@ describe("Tasks data store", () => {
     });
     expect(ready).toBe(true);
     expect(counts.running).toBe(1);
-    expect(fake.calls.filter((call) => call.method === "agents.list")).toHaveLength(3);
+    expect(fake.calls.filter((call) => call.method === "agents.list")).toHaveLength(4);
     expect(fake.openSubscriptions()).toBe(5);
     act(() => renderer.unmount());
     expect(fake.openSubscriptions()).toBe(0);
@@ -1926,6 +4597,37 @@ describe("Tasks data store", () => {
       });
       return { get current() { return current; }, get renders() { return renders; }, unmount: () => act(() => renderer.unmount()) };
     }
+
+    it("lands nothing from a refresh's list once the board that asked for it closes", async () => {
+      const fake = createFakePaseo({
+        agents: Array.from({ length: 230 }, (_, index) =>
+          activeAgent(`unread-${index}`, { status: "idle", requiresAttention: true, attentionReason: "finished", updatedAt: recentIso(1_000 + index) })),
+        workspaces: [workspace()],
+      });
+      // The sidebar counts running tasks only, and outlives the board.
+      const counts = await mountCounts(fake, false);
+      const board = await mountTasks(fake);
+      try {
+        await act(async () => { for (let index = 0; index < 16; index += 1) await Promise.resolve(); });
+        expect(board.current.lanes.review.cards).toHaveLength(230);
+        const release = fake.holdPages();
+        await act(async () => {
+          void board.current.refresh();
+          for (let index = 0; index < 16; index += 1) await Promise.resolve();
+        });
+        board.unmount();
+        expect(counts.current.review).toBe(0);
+        const before = fake.pageCalls().length;
+        await act(async () => {
+          release();
+          for (let index = 0; index < 24; index += 1) await Promise.resolve();
+        });
+        expect(counts.current.review).toBe(0);
+        expect(fake.pageCalls()).toHaveLength(before);
+      } finally {
+        counts.unmount();
+      }
+    });
 
     const permission = { id: "p", provider: "claude", name: "Bash", kind: "tool" as const };
 
@@ -1952,6 +4654,23 @@ describe("Tasks data store", () => {
         counts.unmount();
       }
       expect(fake.openSubscriptions()).toBe(0);
+    });
+
+    it("exposes only visible question requests and follows changes without a count change", async () => {
+      const asking = { id: "q", provider: "claude", name: "AskUserQuestion", kind: "question" as const, title: "Question", input: { questions: [{ header: "One", question: "Choose", options: [{ label: "Yes" }] }] } };
+      const fake = createFakePaseo({ agents: [activeAgent("question", { status: "running", pendingPermissions: [asking] }), activeAgent("tool", { status: "running", pendingPermissions: [permission] })] });
+      let current!: ReturnType<typeof useTaskCounts>;
+      const scope = { filters: EMPTY_FILTERS };
+      function Counts() { current = useTaskCounts(fake.paseo, false, scope, true); return null; }
+      let renderer!: Renderer;
+      await act(async () => { renderer = TestRenderer.create(React.createElement(Counts)); for (let i = 0; i < 8; i++) await Promise.resolve(); });
+      try {
+        expect(current.needsInput).toBe(2);
+        expect(current.questions?.map((card) => card.id)).toEqual(["question"]);
+        await act(async () => { fake.upsertAgent(activeAgent("question", { status: "running", pendingPermissions: [permission], updatedAt: at(12) })); await Promise.resolve(); });
+        expect(current.needsInput).toBe(2);
+        expect(current.questions).toEqual([]);
+      } finally { act(() => renderer.unmount()); }
     });
 
     it("count what the board's filters leave on each lane, and count again when they change", async () => {
@@ -2056,7 +4775,7 @@ describe("Tasks data store", () => {
           expect(reopened.current.ready).toBe(true);
           expect(reopened.current.lanes.review.cards.map((card) => card.id)).toEqual(["unread"]);
           expect(reopened.current.byId.get("second")?.location.branch).toBe("feature/tasks");
-          expect(fake.calls.slice(methods.length).map((call) => call.method).sort()).toEqual(["agents.list", "agents.list", "projects.list"]);
+          expect(fake.calls.slice(methods.length).map((call) => call.method).sort()).toEqual(["agents.list", "agents.list", "agents.list", "projects.list"]);
         } finally {
           reopened.unmount();
         }
@@ -2089,7 +4808,7 @@ describe("Tasks data store", () => {
         expect(fake.openSubscriptions()).toBe(3);
         const board = await mountTasks(fake);
         expect(board.current.ready).toBe(true);
-        expect(fake.calls.filter((call) => call.method === "agents.list")).toHaveLength(3);
+        expect(fake.calls.filter((call) => call.method === "agents.list")).toHaveLength(4);
         expect(fake.calls.filter((call) => call.method === "workspaces.list")).toHaveLength(1);
         board.unmount();
         expect(fake.openSubscriptions()).toBe(3);
@@ -2469,9 +5188,9 @@ describe("Tasks data store", () => {
       });
     });
 
-    it("lets a failure go once the parent is prompted after it, and keeps a working parent's lane", () => {
+    it("retains an old failure without failing a parent prompted after it", () => {
       const prompted = { ...doneCard(), timing: { ...doneCard().timing, lastUserMessageAt: "2026-10-22T09:30:00.000Z" } };
-      expect(withSubagents(prompted, [subagent("a")])).toBe(prompted);
+      expect(withSubagents(prompted, [subagent("a")])).toMatchObject({ lane: "done", status: "done", error: null, children: [{ id: "a", status: "failed" }] });
       const running = { ...doneCard(), lane: "running" as const, status: "running" as const };
       const shown = withSubagents(running, [subagent("a")]);
       expect(shown).toMatchObject({ lane: "running", status: "running", error: null });
@@ -2479,6 +5198,13 @@ describe("Tasks data store", () => {
       // A failure of its own keeps its own reason.
       const failed = { ...doneCard(), lane: "review" as const, status: "failed" as const, error: "API error" };
       expect(withSubagents(failed, [subagent("a")]).error).toBe("API error");
+    });
+
+    it("retains completed and canceled provider subagents after a later prompt", () => {
+      const parent = { ...doneCard(), timing: { ...doneCard().timing, lastUserMessageAt: "2026-10-22T09:30:00.000Z" } };
+      const card = withSubagents(parent, [subagent("done", { status: "completed" }), subagent("canceled", { status: "canceled" })]);
+      expect(card.children.map((child) => [child.id, child.status, child.lane])).toEqual([["done", "done", "done"], ["canceled", "done", "done"]]);
+      expect(card).toMatchObject({ lane: "done", status: "done", error: null });
     });
 
     it("moves a done parent to review on the board and drops it when the failures go", async () => {
@@ -2677,6 +5403,1547 @@ describe("Tasks data store, archived lane", () => {
 
   const ids = (lane: LaneModel) => lane.cards.map((card) => card.id);
 
+  it("finds a recently archived task and an old failure after an old page tail", async () => {
+    const old = 3 * 86_400_000;
+    const fake = createFakePaseo({
+      agents: [
+        ...Array.from({ length: 50 }, (_, index) => activeAgent(`old-${index}`, { status: "idle", updatedAt: recentIso(old + index * 1_000) })),
+        activeAgent("recent-archive", { status: "closed", updatedAt: recentIso(old + 60_000), archivedAt: recentIso(1_000) }),
+        activeAgent("old-failure", { status: "closed", updatedAt: recentIso(old + 61_000), lastError: "failed" }),
+      ],
+      workspaces: [workspace()],
+    });
+    const mounted = await mountArchived(fake, true);
+    try {
+      await act(async () => {
+        for (let index = 0; index < 32; index += 1) await Promise.resolve();
+      });
+      expect(mounted.current.byId.get("recent-archive")?.lane).toBe("archived");
+      expect(mounted.current.byId.get("old-failure")?.lane).toBe("review");
+    } finally {
+      mounted.unmount();
+    }
+  });
+
+  it("keeps a live failure when a refresh moves it past the first page", async () => {
+    const fake = createFakePaseo({ agents: [], workspaces: [workspace()] });
+    const mounted = await mountArchived(fake, false);
+    const target = activeAgent("live-failure", { status: "idle", lastError: "failed", updatedAt: recentIso(600_000) });
+    try {
+      await act(async () => {
+        fake.upsertAgent(target);
+        for (let index = 0; index < 200; index += 1) {
+          fake.upsertAgent(activeAgent(`new-${index}`, { status: "idle", updatedAt: recentIso(500_000 - index * 1_000) }));
+        }
+        for (let index = 0; index < 32; index += 1) await Promise.resolve();
+      });
+      expect(mounted.current.byId.get(target.id)?.lane).toBe("review");
+      const release = fake.holdPageAnswers();
+      let result: string | undefined;
+      try {
+        await act(async () => {
+          void mounted.current.refresh().then((value) => { result = value; });
+          for (let index = 0; index < 32; index += 1) await Promise.resolve();
+        });
+        await act(async () => {
+          release();
+          for (let index = 0; index < 64; index += 1) await Promise.resolve();
+        });
+        expect(result).toBe("done");
+        expect(mounted.current.byId.get(target.id)?.lane).toBe("review");
+      } finally {
+        release();
+      }
+    } finally {
+      mounted.unmount();
+    }
+  });
+
+  it("keeps a newer failure after a done-list remove during a historical scan", async () => {
+    const day = 86_400_000;
+    const target = activeAgent("target", { status: "idle", updatedAt: recentIso(3 * day), lastError: "first failure" });
+    const fake = createFakePaseo({ agents: [target,
+      ...Array.from({ length: 201 }, (_, index) => activeAgent(`old-${index}`, { status: "idle", updatedAt: recentIso(4 * day + index * 1_000) })),
+    ], workspaces: [workspace()] });
+    const mounted = await mountArchived(fake, false);
+    const ready = fake.holdReady();
+    const pages = fake.holdPageAnswers();
+    try {
+      expect(mounted.current.byId.get(target.id)?.lane).toBe("review");
+      let result: string | undefined;
+      await act(async () => {
+        void mounted.current.refresh().then((value) => { result = value; });
+        for (let index = 0; index < 32; index += 1) await Promise.resolve();
+      });
+      await act(async () => {
+        fake.upsertAgent({ ...target, status: "running", lastError: undefined, updatedAt: recentIso(3_000) });
+        fake.upsertAgent({ ...target, status: "idle", lastError: "second failure", updatedAt: recentIso(2_000) });
+        for (let index = 0; index < 50; index += 1) {
+          fake.upsertAgent(activeAgent(`new-${index}`, { status: "idle", updatedAt: recentIso(1_000 - index) }));
+        }
+        for (let index = 0; index < 32; index += 1) await Promise.resolve();
+      });
+      expect(mounted.current.byId.get(target.id)?.error).toBe("second failure");
+      await act(async () => { ready(); for (let index = 0; index < 32; index += 1) await Promise.resolve(); });
+      await act(async () => { pages(); for (let index = 0; index < 64; index += 1) await Promise.resolve(); });
+      expect(result).toBe("done");
+      expect(mounted.current.byId.get(target.id)?.error).toBe("second failure");
+    } finally {
+      ready();
+      pages();
+      mounted.unmount();
+    }
+  });
+
+  it("keeps a failure learned during prefetch when a refresh overtakes the first scan", async () => {
+    const fake = createFakePaseo({ agents: [], workspaces: [workspace()] });
+    const target = activeAgent("prefetched-failure", { status: "idle", lastError: "failed", updatedAt: recentIso(600_000) });
+    await act(async () => {
+      holdTasks(fake.paseo, "intent", null);
+      for (let index = 0; index < 16; index += 1) await Promise.resolve();
+      fake.upsertAgent(target);
+      for (let index = 0; index < 200; index += 1) {
+        fake.upsertAgent(activeAgent(`new-${index}`, { status: "idle", updatedAt: recentIso(500_000 - index * 1_000) }));
+      }
+      for (let index = 0; index < 16; index += 1) await Promise.resolve();
+    });
+    const pages = fake.holdPageAnswers();
+    const mounted = await mountArchived(fake, false);
+    try {
+      expect(mounted.current.byId.get(target.id)?.lane).toBe("review");
+      let result: string | undefined;
+      await act(async () => {
+        void mounted.current.refresh().then((value) => { result = value; });
+        for (let index = 0; index < 32; index += 1) await Promise.resolve();
+      });
+      await act(async () => {
+        pages();
+        for (let index = 0; index < 64; index += 1) await Promise.resolve();
+      });
+      expect(result).toBe("done");
+      expect(mounted.current.byId.get(target.id)?.lane).toBe("review");
+    } finally {
+      pages();
+      mounted.unmount();
+      act(() => releaseTasksHolds());
+    }
+  });
+
+  it("keeps a known record while the refresh scan determines its newer failure state", async () => {
+    const target = activeAgent("missed-failure", { status: "idle", updatedAt: recentIso(600_000) });
+    const fake = createFakePaseo({ agents: [target], workspaces: [workspace()] });
+    const mounted = await mountArchived(fake, false);
+    try {
+      expect(mounted.current.byId.get(target.id)?.lane).toBe("done");
+      fake.setAgentSilently({ ...target, lastError: "failed" });
+      await act(async () => {
+        for (let index = 0; index < 200; index += 1) {
+          fake.upsertAgent(activeAgent(`new-${index}`, { status: "idle", updatedAt: recentIso(500_000 - index * 1_000) }));
+        }
+        for (let index = 0; index < 32; index += 1) await Promise.resolve();
+      });
+      const pages = fake.holdPageAnswers();
+      let result: string | undefined;
+      try {
+        await act(async () => {
+          void mounted.current.refresh().then((value) => { result = value; });
+          for (let index = 0; index < 32; index += 1) await Promise.resolve();
+        });
+        expect(mounted.current.byId.has(target.id)).toBe(true);
+        await act(async () => {
+          pages();
+          for (let index = 0; index < 64; index += 1) await Promise.resolve();
+        });
+        expect(result).toBe("done");
+        expect(mounted.current.byId.get(target.id)?.lane).toBe("review");
+      } finally {
+        pages();
+      }
+    } finally {
+      mounted.unmount();
+    }
+  });
+
+  it("keeps a known record when its refresh scan fails, then resolves it on retry", async () => {
+    const target = activeAgent("missed-failure", { status: "idle", updatedAt: recentIso(600_000) });
+    const fake = createFakePaseo({ agents: [target], workspaces: [workspace()] });
+    const mounted = await mountArchived(fake, false);
+    try {
+      fake.setAgentSilently({ ...target, lastError: "failed" });
+      await act(async () => {
+        for (let index = 0; index < 200; index += 1) {
+          fake.upsertAgent(activeAgent(`new-${index}`, { status: "idle", updatedAt: recentIso(500_000 - index * 1_000) }));
+        }
+        for (let index = 0; index < 32; index += 1) await Promise.resolve();
+      });
+      fake.failNextAgentList((options) => options.page?.limit === 200 && options.page?.cursor !== undefined, "scan page failed");
+      let result: string | undefined;
+      await act(async () => { result = await mounted.current.refresh(); });
+      expect(result).toBe("failed");
+      expect(mounted.current.error).toContain("scan page failed");
+      expect(mounted.current.byId.get(target.id)?.lane).toBe("done");
+      await act(async () => { result = await mounted.current.refresh(); });
+      expect(result).toBe("done");
+      expect(mounted.current.byId.get(target.id)?.lane).toBe("review");
+    } finally {
+      mounted.unmount();
+    }
+  });
+
+  it("retains a recovered archive when widening the window", async () => {
+    const day = 86_400_000;
+    const fixture = () => createFakePaseo({ agents: [
+      ...Array.from({ length: 200 }, (_, index) => activeAgent(`old-${index}`, { status: "idle", updatedAt: recentIso(2 * day + index * 1_000) })),
+      activeAgent("late-archive", { status: "closed", updatedAt: recentIso(3 * day), archivedAt: recentIso(1_000) }),
+    ], workspaces: [workspace()] });
+    const fake = fixture();
+    let narrow!: TasksHandle;
+    let setWindow!: (window: "24h" | "7d") => void;
+    function Probe() {
+      const [window, set] = React.useState<"24h" | "7d">("24h");
+      setWindow = set;
+      narrow = useTasks(fake.paseo, { doneWindow: window, includeDone: true, includeArchived: true });
+      return null;
+    }
+    let renderer!: Renderer;
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(Probe));
+      for (let index = 0; index < 64; index += 1) await Promise.resolve();
+    });
+    try {
+      expect(narrow.byId.get("late-archive")?.lane).toBe("archived");
+      await act(async () => {
+        setWindow("7d");
+        for (let index = 0; index < 64; index += 1) await Promise.resolve();
+      });
+      expect(narrow.byId.get("late-archive")?.lane).toBe("archived");
+    } finally {
+      act(() => renderer.unmount());
+    }
+  });
+
+  it("unions the recovery needs of views with different windows", async () => {
+    const day = 86_400_000;
+    const shared = createFakePaseo({ agents: [
+      ...Array.from({ length: 200 }, (_, index) => activeAgent(`old-${index}`, { status: "idle", updatedAt: recentIso(2 * day + index * 1_000) })),
+      activeAgent("late-archive", { status: "closed", updatedAt: recentIso(3 * day), archivedAt: recentIso(1_000) }),
+    ], workspaces: [workspace()] });
+    let narrow!: TasksHandle;
+    let broad!: TasksHandle;
+    let renderer!: Renderer;
+    function Narrow() { narrow = useTasks(shared.paseo, { doneWindow: "24h", includeDone: true, includeArchived: true }); return null; }
+    function Broad() { broad = useTasks(shared.paseo, { doneWindow: "7d", includeDone: true, includeArchived: true }); return null; }
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(React.Fragment, null, React.createElement(Narrow), React.createElement(Broad)));
+      for (let index = 0; index < 64; index += 1) await Promise.resolve();
+    });
+    try {
+      expect(narrow.byId.get("late-archive")?.lane).toBe("archived");
+      expect(narrow.lanes.archived.hasMore).toBe(false);
+      expect(broad.byId.get("late-archive")?.lane).toBe("archived");
+    } finally {
+      act(() => renderer.unmount());
+    }
+  });
+
+  it("does not treat a record awaiting delete confirmation as retained evidence when the window changes", async () => {
+    const old = 3 * 86_400_000;
+    const target = activeAgent("pending-delete", { status: "closed", updatedAt: recentIso(old + 300_000), archivedAt: recentIso(1_000) });
+    const fake = createFakePaseo({ agents: [
+      ...Array.from({ length: 200 }, (_, index) => activeAgent(`old-${index}`, { status: "idle", updatedAt: recentIso(old + index * 1_000) })), target,
+    ], workspaces: [workspace()] });
+    let current!: TasksHandle;
+    let setWindow!: (window: "24h" | "7d") => void;
+    function Probe() {
+      const [window, set] = React.useState<"24h" | "7d">("24h");
+      setWindow = set;
+      current = useTasks(fake.paseo, { doneWindow: window, includeDone: true, includeArchived: true });
+      return null;
+    }
+    let renderer!: Renderer;
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(Probe));
+      for (let index = 0; index < 64; index += 1) await Promise.resolve();
+    });
+    const reads = fake.holdRefreshes();
+    try {
+      expect(current.byId.has(target.id)).toBe(true);
+      await act(async () => {
+        fake.removeAgent(target.id);
+        setWindow("7d");
+        for (let index = 0; index < 64; index += 1) await Promise.resolve();
+      });
+      await act(async () => {
+        reads();
+        for (let index = 0; index < 64; index += 1) await Promise.resolve();
+      });
+      expect(current.byId.has(target.id)).toBe(false);
+    } finally {
+      reads();
+      act(() => renderer.unmount());
+    }
+  });
+
+  it("keeps a newer live update over a historical scan page in flight", async () => {
+    const old = 3 * 86_400_000;
+    const target = activeAgent("old-failure", { status: "closed", updatedAt: recentIso(old + 300_000), lastError: "failed" });
+    const fake = createFakePaseo({ agents: [
+      ...Array.from({ length: 200 }, (_, index) => activeAgent(`old-${index}`, { status: "idle", updatedAt: recentIso(old + index * 1_000) })),
+      target,
+    ], workspaces: [workspace()] });
+    const release = fake.holdPageAnswers();
+    const mounted = await mountArchived(fake, true);
+    try {
+      expect(fake.calls.some((call) => call.method === "agents.list" && (call.input as { page?: { limit?: number; cursor?: string } }).page?.limit === 200 && Boolean((call.input as { page?: { cursor?: string } }).page?.cursor))).toBe(true);
+      await act(async () => {
+        fake.upsertAgent({ ...target, status: "running", lastError: undefined, updatedAt: recentIso(0) });
+        release();
+        for (let index = 0; index < 32; index += 1) await Promise.resolve();
+      });
+      expect(mounted.current.byId.get(target.id)?.lane).toBe("running");
+    } finally {
+      release();
+      mounted.unmount();
+    }
+  });
+
+  it("keeps the last historical scan and reports a failed refresh", async () => {
+    const fake = createFakePaseo({ agents: [activeAgent("old-failure", { status: "closed", lastError: "failed", updatedAt: recentIso(3 * 86_400_000) })], workspaces: [workspace()] });
+    const mounted = await mountArchived(fake, true);
+    try {
+      expect(mounted.current.byId.get("old-failure")?.lane).toBe("review");
+      fake.failNextAgentList((options) => !options.subscribe && options.page?.limit === 200, "history scan failed");
+      let result: string | undefined;
+      await act(async () => { result = await mounted.current.refresh(); });
+      expect(result).toBe("failed");
+      expect(mounted.current.error).toContain("history scan failed");
+      expect(mounted.current.byId.get("old-failure")?.lane).toBe("review");
+    } finally {
+      mounted.unmount();
+    }
+  });
+
+  it("does not restore a deleted historical record from a page already answered", async () => {
+    const old = 3 * 86_400_000;
+    const target = activeAgent("deleted", { status: "closed", updatedAt: recentIso(old + 300_000), archivedAt: recentIso(1_000) });
+    const fake = createFakePaseo({ agents: [
+      ...Array.from({ length: 200 }, (_, index) => activeAgent(`filler-${index}`, { status: "idle", updatedAt: recentIso(old + index * 1_000) })), target,
+    ], workspaces: [workspace()] });
+    const release = fake.holdPageAnswers();
+    const mounted = await mountArchived(fake, true);
+    try {
+      expect(fake.pageCalls().some((call) => call.startsWith("agents.list:"))).toBe(true);
+      await act(async () => {
+        fake.removeAgent(target.id);
+        release();
+        for (let index = 0; index < 32; index += 1) await Promise.resolve();
+      });
+      expect(mounted.current.byId.has(target.id)).toBe(false);
+    } finally {
+      release();
+      mounted.unmount();
+    }
+  });
+
+  it("does not let an old historical scan replace a newer refresh", async () => {
+    const old = 3 * 86_400_000;
+    const target = activeAgent("archived-late", { status: "closed", title: "Old title", updatedAt: recentIso(old + 300_000), archivedAt: recentIso(1_000) });
+    const fake = createFakePaseo({ agents: [
+      ...Array.from({ length: 200 }, (_, index) => activeAgent(`filler-${index}`, { status: "idle", updatedAt: recentIso(old + index * 1_000) })), target,
+    ], workspaces: [workspace()] });
+    const release = fake.holdPageAnswers();
+    const mounted = await mountArchived(fake, true);
+    try {
+      expect(fake.pageCalls().some((call) => call.startsWith("agents.list:"))).toBe(true);
+      fake.setAgentSilently({ ...target, title: "New title" });
+      fake.passNewPageAnswers();
+      let result: string | undefined;
+      await act(async () => { result = await mounted.current.refresh(); });
+      expect(result).toBe("done");
+      expect(mounted.current.byId.get(target.id)?.title).toBe("New title");
+      await act(async () => {
+        release();
+        for (let index = 0; index < 32; index += 1) await Promise.resolve();
+      });
+      expect(mounted.current.byId.get(target.id)?.title).toBe("New title");
+    } finally {
+      release();
+      mounted.unmount();
+    }
+  });
+
+  it("changes the recovered archive set when the history window changes", async () => {
+    const day = 86_400_000;
+    const fake = createFakePaseo({ agents: [
+      ...Array.from({ length: 50 }, (_, index) => activeAgent(`old-${index}`, { status: "idle", updatedAt: recentIso(8 * day + index * 1_000) })),
+      activeAgent("six-day-archive", { status: "closed", updatedAt: recentIso(9 * day), archivedAt: recentIso(6 * day) }),
+    ], workspaces: [workspace()] });
+    let current!: TasksHandle;
+    let setWindow!: (window: "24h" | "7d" | "all") => void;
+    function Probe() {
+      const [window, set] = React.useState<"24h" | "7d" | "all">("24h");
+      setWindow = set;
+      current = useTasks(fake.paseo, { doneWindow: window, includeDone: true, includeArchived: true });
+      return null;
+    }
+    let renderer!: Renderer;
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(Probe));
+      for (let index = 0; index < 32; index += 1) await Promise.resolve();
+    });
+    try {
+      expect(current.byId.has("six-day-archive")).toBe(false);
+      await act(async () => {
+        setWindow("7d");
+        for (let index = 0; index < 32; index += 1) await Promise.resolve();
+      });
+      expect(current.byId.get("six-day-archive")?.lane).toBe("archived");
+      await act(async () => {
+        setWindow("all");
+        for (let index = 0; index < 32; index += 1) await Promise.resolve();
+      });
+      expect(current.byId.get("six-day-archive")?.lane).toBe("archived");
+      await act(async () => {
+        setWindow("24h");
+        for (let index = 0; index < 32; index += 1) await Promise.resolve();
+      });
+      expect(current.byId.has("six-day-archive")).toBe(false);
+    } finally {
+      act(() => renderer.unmount());
+    }
+  });
+
+  it("discards a historical page from a board closed and reopened", async () => {
+    const old = 3 * 86_400_000;
+    const target = activeAgent("late-archive", { status: "closed", title: "Before close", updatedAt: recentIso(old + 300_000), archivedAt: recentIso(1_000) });
+    const fake = createFakePaseo({ agents: [
+      ...Array.from({ length: 200 }, (_, index) => activeAgent(`old-${index}`, { status: "idle", updatedAt: recentIso(old + index * 1_000) })), target,
+    ], workspaces: [workspace()] });
+    const release = fake.holdPageAnswers();
+    const first = await mountArchived(fake, true);
+    expect(fake.pageCalls().some((call) => call.startsWith("agents.list:"))).toBe(true);
+    first.unmount();
+    fake.passNewPageAnswers();
+    fake.setAgentSilently({ ...target, title: "After reopen" });
+    const second = await mountArchived(fake, true);
+    try {
+      expect(second.current.byId.get(target.id)?.title).toBe("After reopen");
+      await act(async () => {
+        release();
+        for (let index = 0; index < 32; index += 1) await Promise.resolve();
+      });
+      expect(second.current.byId.get(target.id)?.title).toBe("After reopen");
+    } finally {
+      release();
+      second.unmount();
+    }
+  });
+
+  it("does not start a replacement historical scan as the board closes", async () => {
+    const fake = createFakePaseo({ agents: [], workspaces: [workspace()] });
+    const mounted = await mountArchived(fake, true, "24h");
+    const scans = () => fake.calls.filter((call) => call.method === "agents.list" && (call.input as { page?: { limit?: number }; subscribe?: unknown }).page?.limit === 200 && !(call.input as { subscribe?: unknown }).subscribe).length;
+    expect(scans()).toBe(1);
+    mounted.unmount();
+    await act(async () => { for (let index = 0; index < 8; index += 1) await Promise.resolve(); });
+    expect(scans()).toBe(1);
+  });
+
+  it("rechecks historical failures when the done subscription reconnects during the board's linger", async () => {
+    const target = activeAgent("old-failure", { status: "idle", lastError: "failed", updatedAt: recentIso(3 * 86_400_000) });
+    const fake = createFakePaseo({ agents: [target,
+      ...Array.from({ length: 201 }, (_, index) => activeAgent(`new-${index}`, { status: "idle", updatedAt: recentIso(1_000 + index) })),
+    ], workspaces: [workspace()] });
+    let counts!: ReturnType<typeof useTaskCounts>;
+    function Counts() { counts = useTaskCounts(fake.paseo, true); return null; }
+    let sidebar!: Renderer;
+    await act(async () => { sidebar = TestRenderer.create(React.createElement(Counts)); });
+    const board = await mountArchived(fake, false);
+    try {
+      expect(counts.review).toBe(1);
+      act(() => { holdTasks(fake.paseo, "linger", null); board.unmount(); });
+      fake.deleteAgentSilently(target.id);
+      await act(async () => {
+        fake.reconnectAgentSubscriptionWhere((options) => options.filter?.statuses?.includes("idle") === true);
+        for (let index = 0; index < 64; index += 1) await Promise.resolve();
+      });
+      expect(counts.review).toBe(0);
+    } finally {
+      act(() => { releaseTasksHolds(); sidebar.unmount(); });
+    }
+  });
+
+  it("upgrades an existing linger when the reopened board starts scanning history", async () => {
+    const target = activeAgent("old-failure", { status: "idle", lastError: "failed", updatedAt: recentIso(3 * 86_400_000) });
+    const fake = createFakePaseo({ agents: [target,
+      ...Array.from({ length: 201 }, (_, index) => activeAgent(`new-${index}`, { status: "idle", updatedAt: recentIso(1_000 + index) })),
+    ], workspaces: [workspace()] });
+    let counts!: ReturnType<typeof useTaskCounts>;
+    function Counts() { counts = useTaskCounts(fake.paseo, true); return null; }
+    let sidebar!: Renderer;
+    await act(async () => {
+      sidebar = TestRenderer.create(React.createElement(Counts));
+      holdTasks(fake.paseo, "linger", null);
+    });
+    const board = await mountArchived(fake, false);
+    try {
+      expect(counts.review).toBe(1);
+      act(() => { holdTasks(fake.paseo, "linger", null); board.unmount(); });
+      fake.deleteAgentSilently(target.id);
+      await act(async () => {
+        fake.reconnectAgentSubscriptionWhere((options) => options.filter?.statuses?.includes("idle") === true);
+        for (let index = 0; index < 64; index += 1) await Promise.resolve();
+      });
+      expect(counts.review).toBe(0);
+    } finally {
+      act(() => { releaseTasksHolds(); sidebar.unmount(); });
+    }
+  });
+
+  it("keeps historical failures reconciled after linger expires while intent remains", async () => {
+    const target = activeAgent("old-failure", { status: "idle", lastError: "failed", updatedAt: recentIso(3 * 86_400_000) });
+    const fake = createFakePaseo({ agents: [target,
+      ...Array.from({ length: 201 }, (_, index) => activeAgent(`new-${index}`, { status: "idle", updatedAt: recentIso(1_000 + index) })),
+    ], workspaces: [workspace()] });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    let counts!: ReturnType<typeof useTaskCounts>;
+    function Counts() { counts = useTaskCounts(fake.paseo, true); return null; }
+    let sidebar!: Renderer;
+    await act(async () => {
+      sidebar = TestRenderer.create(React.createElement(Counts));
+      holdTasks(fake.paseo, "intent", null);
+    });
+    const board = await mountArchived(fake, false);
+    try {
+      expect(counts.review).toBe(1);
+      act(() => { holdTasks(fake.paseo, "linger", 30_000); board.unmount(); });
+      await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+      fake.forgetAgent(target.id);
+      await act(async () => {
+        fake.reconnectAgentSubscriptionWhere((options) => options.filter?.statuses?.includes("idle") === true);
+        for (let index = 0; index < 64; index += 1) await Promise.resolve();
+      });
+      expect(counts.review).toBe(0);
+    } finally {
+      act(() => { releaseTasksHolds(); sidebar.unmount(); });
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not rescan history when the last board enters linger", async () => {
+    const fake = createFakePaseo({ agents: [], workspaces: [workspace()] });
+    const board = await mountArchived(fake, true, "24h");
+    const scans = () => fake.calls.filter((call) => call.method === "agents.list" && (call.input as { page?: { limit?: number }; subscribe?: unknown }).page?.limit === 200 && !(call.input as { subscribe?: unknown }).subscribe).length;
+    expect(scans()).toBe(1);
+    try {
+      act(() => { holdTasks(fake.paseo, "linger", null); board.unmount(); });
+      await act(async () => { for (let index = 0; index < 16; index += 1) await Promise.resolve(); });
+      expect(scans()).toBe(1);
+    } finally {
+      act(() => releaseTasksHolds());
+    }
+  });
+
+  it("confirms an absent historical failure still held by the done subscription", async () => {
+    const target = activeAgent("old-failure", { status: "closed", lastError: "failed", updatedAt: recentIso(3 * 86_400_000) });
+    const fake = createFakePaseo({ agents: [target,
+      ...Array.from({ length: 201 }, (_, index) => activeAgent(`new-${index}`, { status: "idle", updatedAt: recentIso(1_000 + index) })),
+    ], workspaces: [workspace()] });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const board = await mountArchived(fake, false);
+    try {
+      expect(board.current.byId.get(target.id)?.lane).toBe("review");
+      await act(async () => {
+        fake.upsertAgent({ ...target, updatedAt: recentIso(3 * 86_400_000 - 1_000) });
+        await vi.advanceTimersByTimeAsync(5_000);
+      });
+      act(() => { holdTasks(fake.paseo, "linger", null); board.unmount(); });
+      fake.forgetAgent(target.id);
+      // A reopen in the same window shares the lingering scan; another window scans again.
+      const reopened = await mountArchived(fake, false, "7d");
+      try {
+        await act(async () => { for (let index = 0; index < 64; index += 1) await Promise.resolve(); });
+        expect(reopened.current.byId.has(target.id)).toBe(false);
+      } finally {
+        reopened.unmount();
+      }
+    } finally {
+      act(() => releaseTasksHolds());
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a newer missing confirmation over an older by-id read", async () => {
+    const target = activeAgent("old-failure", { status: "closed", lastError: "failed", updatedAt: recentIso(3 * 86_400_000) });
+    const fake = createFakePaseo({ agents: [target,
+      ...Array.from({ length: 201 }, (_, index) => activeAgent(`new-${index}`, { status: "idle", updatedAt: recentIso(1_000 + index) })),
+    ], workspaces: [workspace()] });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const board = await mountArchived(fake, false);
+    let release: (() => void) | undefined;
+    try {
+      await act(async () => {
+        fake.upsertAgent({ ...target, updatedAt: recentIso(3 * 86_400_000 - 1_000) });
+        await vi.advanceTimersByTimeAsync(5_000);
+      });
+      release = fake.holdRefreshes();
+      await act(async () => {
+        fake.pushAgentSnapshot({ ...target, updatedAt: recentIso(3 * 86_400_000 + 1_000) });
+        for (let index = 0; index < 16; index += 1) await Promise.resolve();
+      });
+      act(() => { holdTasks(fake.paseo, "linger", null); board.unmount(); });
+      fake.forgetAgent(target.id);
+      fake.passNewRefreshes();
+      // A reopen in the same window shares the lingering scan; another window scans again.
+      const reopened = await mountArchived(fake, false, "7d");
+      try {
+        expect(reopened.current.byId.has(target.id)).toBe(false);
+        await act(async () => {
+          release?.();
+          for (let index = 0; index < 64; index += 1) await Promise.resolve();
+        });
+        expect(reopened.current.byId.has(target.id)).toBe(false);
+      } finally {
+        reopened.unmount();
+      }
+    } finally {
+      release?.();
+      act(() => releaseTasksHolds());
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a historical failure that moves ahead of a scan cursor until it is confirmed", async () => {
+    const target = activeAgent("old-failure", { status: "idle", lastError: "failed", updatedAt: recentIso(3 * 86_400_000) });
+    const fake = createFakePaseo({ agents: [target,
+      ...Array.from({ length: 201 }, (_, index) => activeAgent(`new-${index}`, { status: "idle", updatedAt: recentIso(1_000 + index) })),
+    ], workspaces: [workspace()] });
+    const board = await mountArchived(fake, false);
+    const pages = fake.holdPages();
+    const reads = fake.holdRefreshes();
+    try {
+      expect(board.current.byId.get(target.id)?.lane).toBe("review");
+      await act(async () => {
+        void board.current.refresh();
+        for (let index = 0; index < 32; index += 1) await Promise.resolve();
+      });
+      fake.setAgentSilently({ ...target, title: "After cursor move", updatedAt: recentIso(500) });
+      await act(async () => {
+        pages();
+        for (let index = 0; index < 64; index += 1) await Promise.resolve();
+      });
+      expect(board.current.byId.get(target.id)?.lane).toBe("review");
+      await act(async () => {
+        reads();
+        for (let index = 0; index < 64; index += 1) await Promise.resolve();
+      });
+      expect(board.current.byId.get(target.id)?.title).toBe("After cursor move");
+      expect(board.current.byId.get(target.id)?.lane).toBe("review");
+    } finally {
+      pages();
+      reads();
+      board.unmount();
+    }
+  });
+
+  it("keeps an absent historical failure and reports a failed confirmation", async () => {
+    const target = activeAgent("old-failure", { status: "idle", lastError: "failed", updatedAt: recentIso(3 * 86_400_000) });
+    const fake = createFakePaseo({ agents: [target,
+      ...Array.from({ length: 201 }, (_, index) => activeAgent(`new-${index}`, { status: "idle", updatedAt: recentIso(1_000 + index) })),
+    ], workspaces: [workspace()] });
+    const board = await mountArchived(fake, false);
+    const pages = fake.holdPages();
+    try {
+      await act(async () => {
+        void board.current.refresh();
+        for (let index = 0; index < 32; index += 1) await Promise.resolve();
+      });
+      fake.setAgentSilently({ ...target, updatedAt: recentIso(500) });
+      fake.failRefreshes(new Error("confirmation failed"));
+      await act(async () => {
+        pages();
+        for (let index = 0; index < 64; index += 1) await Promise.resolve();
+      });
+      expect(board.current.byId.get(target.id)?.lane).toBe("review");
+      expect(board.current.error).toContain("confirmation failed");
+    } finally {
+      pages();
+      fake.failRefreshes(null);
+      board.unmount();
+    }
+  });
+
+  it("confirms a known completed task that moves ahead of the scan cursor and fails", async () => {
+    const target = activeAgent("completed", { status: "idle", updatedAt: recentIso(600_000) });
+    const fake = createFakePaseo({ agents: [target,
+      ...Array.from({ length: 201 }, (_, index) => activeAgent(`old-${index}`, { status: "idle", updatedAt: recentIso(3 * 86_400_000 + index) })),
+    ], workspaces: [workspace()] });
+    const board = await mountArchived(fake, false);
+    for (let index = 0; index < 201; index += 1) {
+      fake.setAgentSilently(activeAgent(`new-${index}`, { status: "idle", updatedAt: recentIso(1_000 + index) }));
+    }
+    const pages = fake.holdPages();
+    const reads = fake.holdRefreshes();
+    try {
+      expect(board.current.byId.get(target.id)?.lane).toBe("done");
+      await act(async () => {
+        void board.current.refresh();
+        for (let index = 0; index < 32; index += 1) await Promise.resolve();
+      });
+      fake.setAgentSilently({ ...target, lastError: "failed", updatedAt: recentIso(500) });
+      await act(async () => {
+        pages();
+        for (let index = 0; index < 64; index += 1) await Promise.resolve();
+      });
+      expect(board.current.byId.has(target.id)).toBe(true);
+      await act(async () => {
+        reads();
+        for (let index = 0; index < 64; index += 1) await Promise.resolve();
+      });
+      expect(board.current.byId.get(target.id)?.lane).toBe("review");
+    } finally {
+      pages();
+      reads();
+      board.unmount();
+    }
+  });
+
+  it("waits for the historical confirmation before completing a refresh", async () => {
+    const target = activeAgent("old-failure", { status: "idle", lastError: "failed", updatedAt: recentIso(3 * 86_400_000) });
+    const fake = createFakePaseo({ agents: [target,
+      ...Array.from({ length: 201 }, (_, index) => activeAgent(`new-${index}`, { status: "idle", updatedAt: recentIso(1_000 + index) })),
+    ], workspaces: [workspace()] });
+    const board = await mountArchived(fake, false);
+    const reads = fake.holdRefreshes();
+    try {
+      fake.forgetAgent(target.id);
+      let result: string | undefined;
+      await act(async () => {
+        void board.current.refresh().then((value) => { result = value; });
+        for (let index = 0; index < 64; index += 1) await Promise.resolve();
+      });
+      expect(board.current.byId.has(target.id)).toBe(true);
+      expect(result).toBeUndefined();
+      await act(async () => {
+        reads();
+        for (let index = 0; index < 64; index += 1) await Promise.resolve();
+      });
+      expect(result).toBe("done");
+      expect(board.current.byId.has(target.id)).toBe(false);
+    } finally {
+      reads();
+      board.unmount();
+    }
+  });
+
+  it("fails a refresh when a historical confirmation fails, keeping the card", async () => {
+    const target = activeAgent("old-failure", { status: "idle", lastError: "failed", updatedAt: recentIso(3 * 86_400_000) });
+    const fake = createFakePaseo({ agents: [target,
+      ...Array.from({ length: 201 }, (_, index) => activeAgent(`new-${index}`, { status: "idle", updatedAt: recentIso(1_000 + index) })),
+    ], workspaces: [workspace()] });
+    const board = await mountArchived(fake, false);
+    const reads = fake.holdRefreshes();
+    try {
+      fake.forgetAgent(target.id);
+      let result: string | undefined;
+      await act(async () => {
+        void board.current.refresh().then((value) => { result = value; });
+        for (let index = 0; index < 64; index += 1) await Promise.resolve();
+      });
+      expect(result).toBeUndefined();
+      await act(async () => {
+        reads(new Error("confirmation failed"));
+        for (let index = 0; index < 64; index += 1) await Promise.resolve();
+      });
+      expect(result).toBe("failed");
+      expect(board.current.error).toContain("confirmation failed");
+      expect(board.current.byId.get(target.id)?.lane).toBe("review");
+    } finally {
+      reads();
+      board.unmount();
+    }
+  });
+
+  it("does not apply a historical confirmation after its refresh times out", async () => {
+    const target = activeAgent("old-failure", { status: "idle", lastError: "failed", updatedAt: recentIso(3 * 86_400_000) });
+    const fake = createFakePaseo({ agents: [target,
+      ...Array.from({ length: 201 }, (_, index) => activeAgent(`new-${index}`, { status: "idle", updatedAt: recentIso(1_000 + index) })),
+    ], workspaces: [workspace()] });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const board = await mountArchived(fake, false);
+    const reads = fake.holdRefreshes();
+    try {
+      fake.forgetAgent(target.id);
+      let result: string | undefined;
+      await act(async () => {
+        void board.current.refresh().then((value) => { result = value; });
+        for (let index = 0; index < 64; index += 1) await Promise.resolve();
+      });
+      expect(result).toBeUndefined();
+      await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+      expect(result).toBe("failed");
+      await act(async () => {
+        reads();
+        for (let index = 0; index < 64; index += 1) await Promise.resolve();
+      });
+      expect(board.current.byId.get(target.id)?.lane).toBe("review");
+      await act(async () => { result = await board.current.refresh(); });
+      expect(result).toBe("done");
+      expect(board.current.byId.has(target.id)).toBe(false);
+    } finally {
+      reads();
+      board.unmount();
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a newer live update over a historical confirmation in flight", async () => {
+    const target = activeAgent("old-failure", { status: "idle", lastError: "failed", updatedAt: recentIso(3 * 86_400_000) });
+    const fake = createFakePaseo({ agents: [target,
+      ...Array.from({ length: 201 }, (_, index) => activeAgent(`new-${index}`, { status: "idle", updatedAt: recentIso(1_000 + index) })),
+    ], workspaces: [workspace()] });
+    const board = await mountArchived(fake, false);
+    const reads = fake.holdRefreshes();
+    try {
+      fake.forgetAgent(target.id);
+      let result: string | undefined;
+      await act(async () => {
+        void board.current.refresh().then((value) => { result = value; });
+        for (let index = 0; index < 64; index += 1) await Promise.resolve();
+      });
+      expect(result).toBeUndefined();
+      await act(async () => {
+        fake.upsertAgent({ ...target, status: "running", lastError: undefined, updatedAt: recentIso(500) });
+        reads();
+        for (let index = 0; index < 64; index += 1) await Promise.resolve();
+      });
+      expect(result).toBe("done");
+      expect(board.current.byId.get(target.id)?.lane).toBe("running");
+    } finally {
+      reads();
+      board.unmount();
+    }
+  });
+
+  it("does not confirm attention tasks excluded from a history scan", async () => {
+    const agents = Array.from({ length: 12 }, (_, index) => activeAgent(`unread-${index}`, {
+      status: "idle", lastError: "failed", requiresAttention: true, attentionReason: "error", updatedAt: recentIso(3 * 86_400_000 + index),
+    }));
+    const fake = createFakePaseo({ agents, workspaces: [workspace()] });
+    const board = await mountArchived(fake, false);
+    try {
+      const before = fake.calls.length;
+      let result: string | undefined;
+      await act(async () => { result = await board.current.refresh(); });
+      expect(result).toBe("done");
+      expect(fake.calls.slice(before).filter((call) => call.method === "agents.ref.refresh")).toHaveLength(0);
+      expect(board.current.lanes.review.cards).toHaveLength(12);
+    } finally {
+      board.unmount();
+    }
+  });
+
+  it("confirms an excluded attention task when the refreshed attention list no longer holds it", async () => {
+    const target = activeAgent("unread-failure", {
+      status: "idle", lastError: "failed", requiresAttention: true, attentionReason: "error", updatedAt: recentIso(3 * 86_400_000),
+    });
+    const fake = createFakePaseo({ agents: [target], workspaces: [workspace()] });
+    const board = await mountArchived(fake, false);
+    try {
+      expect(board.current.byId.get(target.id)?.lane).toBe("review");
+      fake.forgetAgent(target.id);
+      let result: string | undefined;
+      await act(async () => { result = await board.current.refresh(); });
+      expect(result).toBe("done");
+      expect(board.current.byId.has(target.id)).toBe(false);
+    } finally {
+      board.unmount();
+    }
+  });
+
+  it("waits for the refreshed attention list when a window change replaces the scan", async () => {
+    const target = activeAgent("unread-failure", {
+      status: "idle", lastError: "failed", requiresAttention: true, attentionReason: "error", updatedAt: recentIso(3 * 86_400_000),
+    });
+    const fake = createFakePaseo({ agents: [target], workspaces: [workspace()] });
+    let current!: TasksHandle;
+    let setWindow!: (window: "24h" | "7d") => void;
+    function Probe() {
+      const [window, set] = React.useState<"24h" | "7d">("24h");
+      setWindow = set;
+      current = useTasks(fake.paseo, React.useMemo(() => ({ doneWindow: window, includeDone: true, includeArchived: false }), [window]));
+      return null;
+    }
+    let renderer!: Renderer;
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(Probe));
+      for (let index = 0; index < 32; index += 1) await Promise.resolve();
+    });
+    const ready = fake.holdReady();
+    try {
+      expect(current.byId.get(target.id)?.lane).toBe("review");
+      fake.forgetAgent(target.id);
+      let result: string | undefined;
+      await act(async () => {
+        void current.refresh().then((value) => { result = value; });
+        setWindow("7d");
+        for (let index = 0; index < 64; index += 1) await Promise.resolve();
+      });
+      expect(result).toBeUndefined();
+      await act(async () => {
+        ready();
+        for (let index = 0; index < 96; index += 1) await Promise.resolve();
+      });
+      expect(result).toBe("done");
+      expect(current.byId.has(target.id)).toBe(false);
+    } finally {
+      ready();
+      act(() => renderer.unmount());
+    }
+  });
+
+  it("lets a window-change scan confirm attention after the refresh times out", async () => {
+    const target = activeAgent("unread-failure", {
+      status: "idle", lastError: "failed", requiresAttention: true, attentionReason: "error", updatedAt: recentIso(3 * 86_400_000),
+    });
+    const fake = createFakePaseo({ agents: [target], workspaces: [workspace()] });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    let current!: TasksHandle;
+    let setWindow!: (window: "24h" | "7d") => void;
+    function Probe() {
+      const [window, set] = React.useState<"24h" | "7d">("24h");
+      setWindow = set;
+      current = useTasks(fake.paseo, React.useMemo(() => ({ doneWindow: window, includeDone: true, includeArchived: false }), [window]));
+      return null;
+    }
+    let renderer!: Renderer;
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(Probe));
+      for (let index = 0; index < 32; index += 1) await Promise.resolve();
+    });
+    const ready = fake.holdReady();
+    try {
+      fake.forgetAgent(target.id);
+      let result: string | undefined;
+      await act(async () => {
+        void current.refresh().then((value) => { result = value; });
+        setWindow("7d");
+        for (let index = 0; index < 64; index += 1) await Promise.resolve();
+      });
+      expect(current.byId.has(target.id)).toBe(true);
+      await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+      await act(async () => { for (let index = 0; index < 64; index += 1) await Promise.resolve(); });
+      expect(result).toBe("failed");
+      expect(current.byId.has(target.id)).toBe(false);
+    } finally {
+      ready();
+      act(() => renderer.unmount());
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not treat an attention snapshot older than a replacement scan as fresh", async () => {
+    const target = activeAgent("unread-failure", {
+      status: "idle", lastError: "failed", requiresAttention: true, attentionReason: "error", updatedAt: recentIso(3 * 86_400_000),
+    });
+    const fake = createFakePaseo({ agents: [target], workspaces: [workspace()] });
+    let current!: TasksHandle;
+    let setWindow!: (window: "24h" | "7d") => void;
+    function Probe() {
+      const [window, set] = React.useState<"24h" | "7d">("24h");
+      setWindow = set;
+      current = useTasks(fake.paseo, React.useMemo(() => ({ doneWindow: window, includeDone: true, includeArchived: false }), [window]));
+      return null;
+    }
+    let renderer!: Renderer;
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(Probe));
+      for (let index = 0; index < 32; index += 1) await Promise.resolve();
+    });
+    const agents = fake.paseo.agents as { list: (options: { subscribe?: unknown; filter?: { statuses?: string[] } }) => Promise<unknown> };
+    const list = agents.list.bind(agents);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    agents.list = async (options) => {
+      if (options.subscribe && options.filter?.statuses?.includes("running")) await gate;
+      return list(options);
+    };
+    try {
+      let result: string | undefined;
+      await act(async () => {
+        void current.refresh().then((value) => { result = value; });
+        for (let index = 0; index < 64; index += 1) await Promise.resolve();
+      });
+      expect(result).toBeUndefined();
+      fake.forgetAgent(target.id);
+      await act(async () => {
+        setWindow("7d");
+        for (let index = 0; index < 64; index += 1) await Promise.resolve();
+      });
+      await act(async () => {
+        release();
+        for (let index = 0; index < 96; index += 1) await Promise.resolve();
+      });
+      expect(result).toBe("done");
+      expect(current.byId.has(target.id)).toBe(false);
+    } finally {
+      release();
+      act(() => renderer.unmount());
+    }
+  });
+
+  it("confirms an excluded attention failure when done reconnects before attention", async () => {
+    const target = activeAgent("unread-failure", {
+      status: "idle", lastError: "failed", requiresAttention: true, attentionReason: "error", updatedAt: recentIso(3 * 86_400_000),
+    });
+    const fake = createFakePaseo({ agents: [target], workspaces: [workspace()] });
+    const board = await mountArchived(fake, false);
+    try {
+      fake.forgetAgent(target.id);
+      await act(async () => {
+        fake.reconnectAgentSubscriptionWhere((options) => options.filter?.statuses?.includes("idle") === true);
+        for (let index = 0; index < 64; index += 1) await Promise.resolve();
+      });
+      await act(async () => {
+        fake.reconnectAgentSubscriptionWhere((options) => options.filter?.requiresAttention === true);
+        for (let index = 0; index < 64; index += 1) await Promise.resolve();
+      });
+      expect(board.current.byId.has(target.id)).toBe(false);
+    } finally {
+      board.unmount();
+    }
+  });
+
+  it("uses a newer complete attention snapshot instead of confirming each excluded task", async () => {
+    const attention = Array.from({ length: 12 }, (_, index) => activeAgent(`unread-${index}`, {
+      status: "idle", lastError: "failed", requiresAttention: true, attentionReason: "error", updatedAt: recentIso(3 * 86_400_000 + index),
+    }));
+    const fake = createFakePaseo({ agents: [...attention,
+      ...Array.from({ length: 201 }, (_, index) => activeAgent(`done-${index}`, { status: "idle", updatedAt: recentIso(1_000 + index) })),
+    ], workspaces: [workspace()] });
+    const board = await mountArchived(fake, false);
+    const pages = fake.holdPages();
+    try {
+      const before = fake.calls.length;
+      await act(async () => {
+        fake.reconnectAgentSubscriptionWhere((options) => options.filter?.statuses?.includes("idle") === true);
+        for (let index = 0; index < 32; index += 1) await Promise.resolve();
+      });
+      await act(async () => {
+        fake.reconnectAgentSubscriptionWhere((options) => options.filter?.requiresAttention === true);
+        for (let index = 0; index < 32; index += 1) await Promise.resolve();
+      });
+      await act(async () => {
+        pages();
+        for (let index = 0; index < 64; index += 1) await Promise.resolve();
+      });
+      expect(fake.calls.slice(before).filter((call) => call.method === "agents.ref.refresh")).toHaveLength(0);
+      expect(board.current.lanes.review.cards).toHaveLength(12);
+    } finally {
+      pages();
+      board.unmount();
+    }
+  });
+
+  it("reuses the lingering history scan when the board reopens at once", async () => {
+    const attention = Array.from({ length: 12 }, (_, index) => activeAgent(`unread-${index}`, {
+      status: "idle", lastError: "failed", requiresAttention: true, attentionReason: "error", updatedAt: recentIso(3 * 86_400_000 + index),
+    }));
+    const fake = createFakePaseo({ agents: attention, workspaces: [workspace()] });
+    const scans = () => fake.calls.filter((call) => call.method === "agents.list" && (call.input as { page?: { limit?: number } }).page?.limit === 200 && !(call.input as { subscribe?: unknown }).subscribe).length;
+    const reads = () => fake.calls.filter((call) => call.method === "agents.ref.refresh").length;
+    const board = await mountArchived(fake, false);
+    await act(async () => { for (let index = 0; index < 64; index += 1) await Promise.resolve(); });
+    expect(board.current.lanes.review.cards).toHaveLength(12);
+    const before = { scans: scans(), reads: reads() };
+    act(() => { holdTasks(fake.paseo, "linger", null); board.unmount(); });
+    const reopened = await mountArchived(fake, false);
+    try {
+      await act(async () => { for (let index = 0; index < 64; index += 1) await Promise.resolve(); });
+      expect(reopened.current.lanes.review.cards).toHaveLength(12);
+      expect({ scans: scans(), reads: reads() }).toEqual(before);
+    } finally {
+      reopened.unmount();
+      act(() => releaseTasksHolds());
+    }
+  });
+
+  describe("history scan on a warm reopen", () => {
+    const oldFailure = () => activeAgent("old-failure", { status: "idle", lastError: "failed", updatedAt: recentIso(3 * 86_400_000) });
+    const withNewer = (target: ReturnType<typeof activeAgent>) => createFakePaseo({ agents: [target,
+      ...Array.from({ length: 201 }, (_, index) => activeAgent(`new-${index}`, { status: "idle", updatedAt: recentIso(1_000 + index) })),
+    ], workspaces: [workspace()] });
+    const isScan = (options: PaseoAgentListOptions) => options.page?.limit === 200 && !options.subscribe;
+    const scansOf = (fake: Fake) => fake.calls.filter((call) => call.method === "agents.list" &&
+      isScan(call.input as PaseoAgentListOptions) && !(call.input as PaseoAgentListOptions).page?.cursor).length;
+
+    it("shares a lingering scan still reading its pages", async () => {
+      const target = oldFailure();
+      const fake = withNewer(target);
+      const pages = fake.holdPages();
+      try {
+        const board = await mountArchived(fake, false);
+        expect(scansOf(fake)).toBe(1);
+        act(() => { holdTasks(fake.paseo, "linger", null); board.unmount(); });
+        const reopened = await mountArchived(fake, false);
+        try {
+          expect(scansOf(fake)).toBe(1);
+          await act(async () => {
+            pages();
+            for (let index = 0; index < 64; index += 1) await Promise.resolve();
+          });
+          expect(reopened.current.byId.get(target.id)?.lane).toBe("review");
+          expect(scansOf(fake)).toBe(1);
+          expect(fake.calls.filter((call) => call.method === "agents.ref.refresh")).toHaveLength(0);
+        } finally {
+          reopened.unmount();
+        }
+      } finally {
+        pages();
+        act(() => releaseTasksHolds());
+      }
+    });
+
+    it("scans again when the lingering scan failed", async () => {
+      const target = oldFailure();
+      const fake = withNewer(target);
+      fake.failNextAgentList(isScan);
+      const board = await mountArchived(fake, false);
+      try {
+        await act(async () => { for (let index = 0; index < 32; index += 1) await Promise.resolve(); });
+        expect(board.current.byId.has(target.id)).toBe(false);
+        act(() => { holdTasks(fake.paseo, "linger", null); board.unmount(); });
+        const reopened = await mountArchived(fake, false);
+        try {
+          await act(async () => { for (let index = 0; index < 64; index += 1) await Promise.resolve(); });
+          expect(scansOf(fake)).toBe(2);
+          expect(reopened.current.byId.get(target.id)?.lane).toBe("review");
+        } finally {
+          reopened.unmount();
+        }
+      } finally {
+        act(() => releaseTasksHolds());
+      }
+    });
+
+    it("scans again when a refresh that owned the scan timed out", async () => {
+      const target = oldFailure();
+      const fake = withNewer(target);
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      const board = await mountArchived(fake, false);
+      const pages = fake.holdPages();
+      try {
+        await act(async () => { for (let index = 0; index < 32; index += 1) await Promise.resolve(); });
+        expect(scansOf(fake)).toBe(1);
+        let result: string | undefined;
+        await act(async () => {
+          void board.current.refresh().then((value) => { result = value; });
+          for (let index = 0; index < 32; index += 1) await Promise.resolve();
+        });
+        expect(scansOf(fake)).toBe(2);
+        act(() => { holdTasks(fake.paseo, "linger", null); board.unmount(); });
+        await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+        expect(result).toBe("failed");
+        pages();
+        const reopened = await mountArchived(fake, false);
+        try {
+          await act(async () => { for (let index = 0; index < 64; index += 1) await Promise.resolve(); });
+          expect(scansOf(fake)).toBe(3);
+          expect(reopened.current.byId.get(target.id)?.lane).toBe("review");
+        } finally {
+          reopened.unmount();
+        }
+      } finally {
+        pages();
+        act(() => releaseTasksHolds());
+        vi.useRealTimers();
+      }
+    });
+
+    it("keeps a refresh's landed scan when another of its lists times out", async () => {
+      const target = oldFailure();
+      const fake = withNewer(target);
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      const board = await mountArchived(fake, false);
+      const ready = fake.holdReady();
+      try {
+        await act(async () => { for (let index = 0; index < 32; index += 1) await Promise.resolve(); });
+        let result: string | undefined;
+        await act(async () => {
+          void board.current.refresh().then((value) => { result = value; });
+          for (let index = 0; index < 64; index += 1) await Promise.resolve();
+        });
+        // The refresh's history scan landed; its new subscriptions are still waiting for ready.
+        expect(scansOf(fake)).toBe(2);
+        act(() => { holdTasks(fake.paseo, "linger", null); board.unmount(); });
+        await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+        expect(result).toBe("failed");
+        const reopened = await mountArchived(fake, false);
+        try {
+          await act(async () => { for (let index = 0; index < 64; index += 1) await Promise.resolve(); });
+          expect(scansOf(fake)).toBe(2);
+          expect(reopened.current.byId.get(target.id)?.lane).toBe("review");
+        } finally {
+          reopened.unmount();
+        }
+      } finally {
+        ready();
+        act(() => releaseTasksHolds());
+        vi.useRealTimers();
+      }
+    });
+
+    it("scans on its own when a refresh still owns the running scan, and keeps it past the refresh's timeout", async () => {
+      const target = oldFailure();
+      const fake = withNewer(target);
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      const board = await mountArchived(fake, false);
+      const pages = fake.holdPages();
+      try {
+        await act(async () => { for (let index = 0; index < 32; index += 1) await Promise.resolve(); });
+        fake.forgetAgent(target.id);
+        await act(async () => {
+          void board.current.refresh();
+          for (let index = 0; index < 32; index += 1) await Promise.resolve();
+        });
+        act(() => { holdTasks(fake.paseo, "linger", null); board.unmount(); });
+        const reopened = await mountArchived(fake, false);
+        try {
+          expect(scansOf(fake)).toBe(3);
+          await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+          await act(async () => {
+            pages();
+            for (let index = 0; index < 64; index += 1) await Promise.resolve();
+          });
+          // The board's own scan outlives the refresh and finds the record gone.
+          expect(reopened.current.byId.has(target.id)).toBe(false);
+        } finally {
+          reopened.unmount();
+        }
+      } finally {
+        pages();
+        act(() => releaseTasksHolds());
+        vi.useRealTimers();
+      }
+    });
+  });
+
+  it("does not restore an evicted task from a historical page after a null by-id read", async () => {
+    const target = activeAgent("evicted", { status: "idle", updatedAt: recentIso(600_000) });
+    const fake = createFakePaseo({ agents: [target], workspaces: [workspace()] });
+    const board = await mountArchived(fake, false);
+    let pages: (() => void) | undefined;
+    try {
+      await act(async () => {
+        for (let index = 0; index < 201; index += 1) {
+          fake.upsertAgent(activeAgent(`new-${index}`, { status: "idle", updatedAt: recentIso(1_000 + index) }));
+        }
+        for (let index = 0; index < 64; index += 1) await Promise.resolve();
+      });
+      await act(async () => { await board.current.refresh(); });
+      expect(board.current.byId.has(target.id)).toBe(false);
+      fake.setAgentSilently({ ...target, lastError: "failed", updatedAt: recentIso(599_000) });
+      pages = fake.holdPageAnswers();
+      let result: string | undefined;
+      await act(async () => {
+        void board.current.refresh().then((value) => { result = value; });
+        for (let index = 0; index < 64; index += 1) await Promise.resolve();
+      });
+      fake.forgetAgent(target.id);
+      await act(async () => {
+        fake.pushAgentSnapshot({ ...target, updatedAt: recentIso(601_000) });
+        for (let index = 0; index < 64; index += 1) await Promise.resolve();
+      });
+      expect(board.current.byId.has(target.id)).toBe(false);
+      await act(async () => {
+        pages?.();
+        for (let index = 0; index < 96; index += 1) await Promise.resolve();
+      });
+      expect(result).toBe("done");
+      expect(board.current.byId.has(target.id)).toBe(false);
+    } finally {
+      pages?.();
+      board.unmount();
+    }
+  });
+
+  it("rechecks recovered historical records after the done subscription reconnects", async () => {
+    const old = 3 * 86_400_000;
+    const target = activeAgent("late-archive", { status: "closed", updatedAt: recentIso(old + 300_000), archivedAt: recentIso(1_000) });
+    const fake = createFakePaseo({ agents: [
+      ...Array.from({ length: 50 }, (_, index) => activeAgent(`old-${index}`, { status: "idle", updatedAt: recentIso(old + index * 1_000) })), target,
+    ], workspaces: [workspace()] });
+    const mounted = await mountArchived(fake, true);
+    try {
+      expect(mounted.current.byId.get(target.id)?.lane).toBe("archived");
+      fake.setAgentSilently({ ...target, archivedAt: null });
+      await act(async () => {
+        fake.reconnectAgentSubscriptionWhere((options) => options.filter?.statuses?.includes("idle") === true);
+        for (let index = 0; index < 32; index += 1) await Promise.resolve();
+      });
+      expect(mounted.current.byId.has(target.id)).toBe(false);
+    } finally {
+      mounted.unmount();
+    }
+  });
+
+  it("lets a newer reconnect scan finish a refresh whose old scan page hangs", async () => {
+    const old = 3 * 86_400_000;
+    const target = activeAgent("late-archive", { status: "closed", title: "Before reconnect", updatedAt: recentIso(old + 300_000), archivedAt: recentIso(1_000) });
+    const fake = createFakePaseo({ agents: [
+      ...Array.from({ length: 200 }, (_, index) => activeAgent(`old-${index}`, { status: "idle", updatedAt: recentIso(old + index * 1_000) })), target,
+    ], workspaces: [workspace()] });
+    const mounted = await mountArchived(fake, true);
+    try {
+      expect(mounted.current.byId.get(target.id)?.title).toBe("Before reconnect");
+      const release = fake.holdPageAnswers();
+      let result: string | undefined;
+      await act(async () => {
+        void mounted.current.refresh().then((value) => { result = value; });
+        for (let index = 0; index < 16; index += 1) await Promise.resolve();
+      });
+      expect(result).toBeUndefined();
+      fake.passNewPageAnswers();
+      fake.setAgentSilently({ ...target, title: "After reconnect" });
+      await act(async () => {
+        fake.reconnectAgentSubscriptionWhere((options) => options.filter?.statuses?.includes("idle") === true);
+        for (let index = 0; index < 48; index += 1) await Promise.resolve();
+      });
+      expect(result).toBe("done");
+      expect(mounted.current.byId.get(target.id)?.title).toBe("After reconnect");
+      await act(async () => {
+        release();
+        for (let index = 0; index < 16; index += 1) await Promise.resolve();
+      });
+      expect(mounted.current.byId.get(target.id)?.title).toBe("After reconnect");
+    } finally {
+      mounted.unmount();
+    }
+  });
+
+  it("waits for a reconnect scan that starts after the refresh scan has finished", async () => {
+    const old = 3 * 86_400_000;
+    const target = activeAgent("late-archive", { status: "closed", title: "Before", updatedAt: recentIso(old + 300_000), archivedAt: recentIso(1_000) });
+    const fake = createFakePaseo({ agents: [
+      ...Array.from({ length: 200 }, (_, index) => activeAgent(`old-${index}`, { status: "idle", updatedAt: recentIso(old + index * 1_000) })), target,
+    ], workspaces: [workspace()] });
+    const mounted = await mountArchived(fake, true);
+    const ready = fake.holdReady();
+    let pages: (() => void) | undefined;
+    try {
+      let result: string | undefined;
+      await act(async () => {
+        void mounted.current.refresh().then((value) => { result = value; });
+        for (let index = 0; index < 64; index += 1) await Promise.resolve();
+      });
+      expect(result).toBeUndefined();
+      pages = fake.holdPageAnswers();
+      fake.setAgentSilently({ ...target, title: "After reconnect" });
+      await act(async () => {
+        fake.reconnectAgentSubscriptionWhere((options) => options.filter?.statuses?.includes("idle") === true);
+        for (let index = 0; index < 64; index += 1) await Promise.resolve();
+      });
+      await act(async () => {
+        ready();
+        for (let index = 0; index < 64; index += 1) await Promise.resolve();
+      });
+      expect(result).toBeUndefined();
+      expect(mounted.current.byId.get(target.id)?.title).toBe("Before");
+      await act(async () => {
+        pages?.();
+        for (let index = 0; index < 64; index += 1) await Promise.resolve();
+      });
+      expect(result).toBe("done");
+      expect(mounted.current.byId.get(target.id)?.title).toBe("After reconnect");
+    } finally {
+      ready();
+      pages?.();
+      mounted.unmount();
+    }
+  });
+
+  it("does not apply a refresh scan after that refresh times out", async () => {
+    const old = 3 * 86_400_000;
+    const target = activeAgent("late-archive", { status: "closed", title: "Before", updatedAt: recentIso(old + 300_000), archivedAt: recentIso(1_000) });
+    const fake = createFakePaseo({ agents: [
+      ...Array.from({ length: 200 }, (_, index) => activeAgent(`old-${index}`, { status: "idle", updatedAt: recentIso(old + index * 1_000) })), target,
+    ], workspaces: [workspace()] });
+    const mounted = await mountArchived(fake, true);
+    const pages = fake.holdPageAnswers();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      expect(mounted.current.byId.get(target.id)?.title).toBe("Before");
+      fake.setAgentSilently({ ...target, title: "After timeout" });
+      let result: string | undefined;
+      await act(async () => {
+        void mounted.current.refresh().then((value) => { result = value; });
+        for (let index = 0; index < 32; index += 1) await Promise.resolve();
+      });
+      await act(async () => {
+        vi.advanceTimersByTime(30_001);
+        for (let index = 0; index < 32; index += 1) await Promise.resolve();
+      });
+      expect(result).toBe("failed");
+      await act(async () => {
+        pages();
+        for (let index = 0; index < 32; index += 1) await Promise.resolve();
+      });
+      expect(mounted.current.byId.get(target.id)?.title).toBe("Before");
+    } finally {
+      pages();
+      vi.useRealTimers();
+      mounted.unmount();
+    }
+  });
+
+  it("keeps a reconnect scan alive after the refresh it overtook times out", async () => {
+    const old = 3 * 86_400_000;
+    const target = activeAgent("late-archive", { status: "closed", title: "Before", updatedAt: recentIso(old + 300_000), archivedAt: recentIso(1_000) });
+    const fake = createFakePaseo({ agents: [
+      ...Array.from({ length: 200 }, (_, index) => activeAgent(`old-${index}`, { status: "idle", updatedAt: recentIso(old + index * 1_000) })), target,
+    ], workspaces: [workspace()] });
+    const mounted = await mountArchived(fake, true);
+    const ready = fake.holdReady();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    let pages: (() => void) | undefined;
+    try {
+      let result: string | undefined;
+      await act(async () => {
+        void mounted.current.refresh().then((value) => { result = value; });
+        for (let index = 0; index < 64; index += 1) await Promise.resolve();
+      });
+      pages = fake.holdPageAnswers();
+      fake.setAgentSilently({ ...target, title: "After reconnect" });
+      await act(async () => {
+        fake.reconnectAgentSubscriptionWhere((options) => options.filter?.statuses?.includes("idle") === true);
+        for (let index = 0; index < 32; index += 1) await Promise.resolve();
+      });
+      await act(async () => {
+        vi.advanceTimersByTime(30_001);
+        for (let index = 0; index < 32; index += 1) await Promise.resolve();
+      });
+      expect(result).toBe("failed");
+      await act(async () => {
+        pages?.();
+        for (let index = 0; index < 32; index += 1) await Promise.resolve();
+      });
+      expect(mounted.current.byId.get(target.id)?.title).toBe("After reconnect");
+    } finally {
+      ready();
+      pages?.();
+      vi.useRealTimers();
+      mounted.unmount();
+    }
+  });
+
+  it("does not reclaim a loaded task deleted while its historical page and confirmation are in flight", async () => {
+    const old = 3 * 86_400_000;
+    const target = activeAgent("late-archive", { status: "closed", updatedAt: recentIso(old + 300_000), archivedAt: recentIso(1_000) });
+    const fake = createFakePaseo({ agents: [
+      ...Array.from({ length: 200 }, (_, index) => activeAgent(`old-${index}`, { status: "idle", updatedAt: recentIso(old + index * 1_000) })), target,
+    ], workspaces: [workspace()] });
+    const mounted = await mountArchived(fake, true);
+    const pages = fake.holdPageAnswers();
+    let reads: ((error?: Error) => void) | undefined;
+    try {
+      expect(mounted.current.byId.has(target.id)).toBe(true);
+      await act(async () => {
+        void mounted.current.refresh();
+        for (let index = 0; index < 32; index += 1) await Promise.resolve();
+      });
+      reads = fake.holdRefreshes();
+      await act(async () => {
+        fake.removeAgent(target.id);
+        for (let index = 0; index < 16; index += 1) await Promise.resolve();
+      });
+      await act(async () => {
+        pages();
+        for (let index = 0; index < 32; index += 1) await Promise.resolve();
+      });
+      await act(async () => {
+        reads?.();
+        for (let index = 0; index < 32; index += 1) await Promise.resolve();
+      });
+      expect(mounted.current.byId.has(target.id)).toBe(false);
+    } finally {
+      pages();
+      reads?.();
+      mounted.unmount();
+    }
+  });
+
+  it("keeps an empty archived lane loading until its first history scan finishes", async () => {
+    const old = 3 * 86_400_000;
+    const fake = createFakePaseo({ agents: [
+      ...Array.from({ length: 200 }, (_, index) => activeAgent(`old-${index}`, { status: "idle", updatedAt: recentIso(old + index * 1_000) })),
+      activeAgent("late-archive", { status: "closed", updatedAt: recentIso(old + 300_000), archivedAt: recentIso(1_000) }),
+    ], workspaces: [workspace()] });
+    const pages = fake.holdPageAnswers();
+    const mounted = await mountArchived(fake, true);
+    try {
+      expect(mounted.current.lanes.archived.cards).toHaveLength(0);
+      expect(mounted.current.lanes.archived.initialLoading).toBe(true);
+      await act(async () => {
+        pages();
+        for (let index = 0; index < 32; index += 1) await Promise.resolve();
+      });
+      expect(mounted.current.lanes.archived.initialLoading).toBe(false);
+      expect(mounted.current.byId.get("late-archive")?.lane).toBe("archived");
+    } finally {
+      pages();
+      mounted.unmount();
+    }
+  });
+
+  it("reports a background capability loss during the first history scan", async () => {
+    const old = 3 * 86_400_000;
+    const fake = createFakePaseo({ agents: [
+      ...Array.from({ length: 200 }, (_, index) => activeAgent(`old-${index}`, { status: "idle", updatedAt: recentIso(old + index * 1_000) })),
+      activeAgent("late-archive", { status: "closed", updatedAt: recentIso(old + 300_000), archivedAt: recentIso(1_000) }),
+    ], workspaces: [workspace()] });
+    fake.failNextAgentList((options) => options.page?.limit === 200 && options.page?.cursor !== undefined, "Update the host to use background workspaces.");
+    const mounted = await mountArchived(fake, true);
+    try {
+      expect(mounted.current.lanes.archived.initialLoading).toBe(false);
+      expect(mounted.current.error).toContain("Update the host to use background workspaces.");
+      let result: string | undefined;
+      await act(async () => { result = await mounted.current.refresh(); });
+      expect(result).toBe("done");
+      expect(mounted.current.error).toBeNull();
+      expect(mounted.current.byId.get("late-archive")?.lane).toBe("archived");
+    } finally {
+      mounted.unmount();
+    }
+  });
+
+  it("folds a recorded origin after both tasks are archived", async () => {
+    setSubagentLoader(async () => ({ version: "1", subagents: [] }));
+    setParentOriginsLoader(async () => ({ version: "1", origins: [{ agentId: "child", parentAgentId: "parent" }] }));
+    const fake = createFakePaseo({
+      agents: [
+        activeAgent("parent", { status: "closed", title: "Parent", updatedAt: recentIso(3_000), archivedAt: recentIso(2_000) }),
+        activeAgent("child", { status: "idle", title: "Child", updatedAt: recentIso(2_000), archivedAt: recentIso(1_000) }),
+      ],
+      workspaces: [workspace()],
+    });
+    const mounted = await mountArchived(fake, true, "all");
+    try {
+      expect(ids(mounted.current.lanes.archived)).toContain("child");
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 1_600));
+      });
+      expect(mounted.current.byId.get("child")?.parent?.detached).toBe(true);
+      const filtered = filterLanes(mounted.current.lanes, { ...EMPTY_FILTERS, hideSubtasks: true });
+      expect(ids(filtered.archived)).toEqual(["parent"]);
+      expect(filtered.archived.cards[0]?.children.map((row) => row.id)).toEqual(["child"]);
+      expect(mounted.current.byId.get("parent")?.children).toEqual([]);
+    } finally {
+      mounted.unmount();
+      setParentOriginsLoader(null);
+      setSubagentLoader(null);
+    }
+  });
+
   it("lists archived tasks and an archived workspace's in their own lane, in the done window, only when asked", async () => {
     const fake = createFakePaseo({
       agents: [
@@ -2688,15 +6955,17 @@ describe("Tasks data store, archived lane", () => {
         activeAgent("running", { status: "running", activeTurn: { turnId: "t", startedAt: recentIso(4_000) } }),
       ],
       workspaces: [workspace()],
+      archivedWorkspaceIds: ["ws-archived"],
     });
     const off = await mountArchived(fake, false);
+    await settleWorkspaceCheck();
     try {
       expect(ids(off.current.lanes.done)).toEqual(["done"]);
       expect(ids(off.current.lanes.archived)).toEqual([]);
       expect(off.current.byId.has("archived")).toBe(false);
       expect(off.current.byId.has("stale")).toBe(false);
       // Off, the done list asks for no archived agent.
-      const doneLists = fake.calls.filter((call) => call.method === "agents.list" && (call.input as { filter?: { statuses?: string[] } }).filter?.statuses?.includes("idle"));
+      const doneLists = fake.calls.filter((call) => call.method === "agents.list" && (call.input as { subscribe?: unknown }).subscribe !== undefined && (call.input as { filter?: { statuses?: string[] } }).filter?.statuses?.includes("idle"));
       expect(doneLists.map((call) => (call.input as { filter: { includeArchived?: boolean } }).filter.includeArchived)).toEqual([undefined]);
 
       await off.setArchived(true);
@@ -2744,7 +7013,7 @@ describe("Tasks data store, archived lane", () => {
     });
     try {
       const before = renders;
-      const doneLists = () => fake.calls.filter((call) => call.method === "agents.list" && (call.input as { filter?: { statuses?: string[] } }).filter?.statuses?.includes("idle"));
+      const doneLists = () => fake.calls.filter((call) => call.method === "agents.list" && (call.input as { subscribe?: unknown }).subscribe !== undefined && (call.input as { filter?: { statuses?: string[] } }).filter?.statuses?.includes("idle"));
       const listsBefore = doneLists().length;
       act(() => {
         setTasksArchivedLane(fake.paseo, true);
@@ -2774,9 +7043,11 @@ describe("Tasks data store, archived lane", () => {
         activeAgent("child-l", { status: "running", labels: { "paseo.parent-agent-id": "live" } }),
       ],
       workspaces: [workspace()],
+      archivedWorkspaceIds: ["ws-archived"],
     });
     const on = await mountArchived(fake, true);
     try {
+      await settleWorkspaceCheck();
       expect(on.current.byId.get("child-a")?.parent).toMatchObject({ id: "archived", missing: false, archived: false, archivedAs: "agent" });
       expect(on.current.byId.get("child-w")?.parent).toMatchObject({ id: "stale", missing: false, archivedAs: "workspace" });
       expect(on.current.byId.get("child-l")?.parent).not.toHaveProperty("archivedAs");
@@ -2794,6 +7065,7 @@ describe("Tasks data store, archived lane", () => {
         activeAgent("running", { status: "running", activeTurn: { turnId: "t", startedAt: recentIso(4_000) } }),
       ],
       workspaces: [workspace()],
+      archivedWorkspaceIds: ["ws-archived"],
     });
     const totals: number[] = [];
     let setArchived!: (on: boolean) => void;
@@ -2809,6 +7081,7 @@ describe("Tasks data store, archived lane", () => {
       renderer = TestRenderer.create(React.createElement(Probe));
       for (let index = 0; index < 8; index += 1) await Promise.resolve();
     });
+    await settleWorkspaceCheck();
     try {
       const lists = () => fake.calls.filter((call) => call.method === "agents.list").length;
       const listsBefore = lists();
@@ -2821,8 +7094,8 @@ describe("Tasks data store, archived lane", () => {
       });
       expect(new Set(totals)).toEqual(new Set([2, 4]));
       expect(totals.indexOf(4)).toBe(totals.lastIndexOf(2) + 1);
-      // Only the done list is read again; the board keeps its other subscriptions.
-      expect(lists()).toBe(listsBefore + 1);
+      // The done subscription and history scan read again; the other subscriptions stay.
+      expect(lists()).toBe(listsBefore + 2);
 
       totals.length = 0;
       await act(async () => {
@@ -2830,7 +7103,7 @@ describe("Tasks data store, archived lane", () => {
         for (let index = 0; index < 8; index += 1) await Promise.resolve();
       });
       expect(new Set(totals)).toEqual(new Set([2]));
-      expect(lists()).toBe(listsBefore + 2);
+      expect(lists()).toBe(listsBefore + 4);
     } finally {
       act(() => renderer.unmount());
     }
@@ -2893,6 +7166,7 @@ describe("Tasks data store, archived lane", () => {
         activeAgent("ordinary", { status: "closed", workspaceId: "ws-helper", archivedAt: recentIso(2_000), updatedAt: recentIso(2_000) }),
       ],
       workspaces: [workspace()],
+      archivedWorkspaceIds: ["ws-helper"],
     });
     const mounted = await mountArchived(fake, true);
     try {
@@ -2903,10 +7177,611 @@ describe("Tasks data store, archived lane", () => {
     }
   });
 
+  it("hides timeline translation helpers even after their background workspace is archived", async () => {
+    const fake = createFakePaseo({
+      agents: [
+        activeAgent("tl-helper", { status: "closed", workspaceId: "ws-tl", archivedAt: recentIso(2_000), updatedAt: recentIso(2_000), labels: { "better-paseo.purpose": "timeline-translation" } }),
+        activeAgent("ordinary", { status: "closed", workspaceId: "ws-tl", archivedAt: recentIso(2_000), updatedAt: recentIso(2_000) }),
+      ],
+      workspaces: [workspace()],
+      archivedWorkspaceIds: ["ws-tl"],
+    });
+    const mounted = await mountArchived(fake, true);
+    try {
+      expect(ids(mounted.current.lanes.archived)).toEqual(["ordinary"]);
+      expect(mounted.current.byId.has("tl-helper")).toBe(false);
+    } finally {
+      mounted.unmount();
+    }
+  });
+
+  it("archives a task of a workspace archived while disconnected when its list comes back after the workspaces", async () => {
+    const fake = createFakePaseo({
+      agents: [activeAgent("old", { status: "idle", requiresAttention: true, updatedAt: recentIso(5_000) })],
+      workspaces: [workspace()],
+      archivedWorkspaceIds: ["ws-gone"],
+    });
+    const mounted = await mountArchived(fake, true);
+    try {
+      await settleWorkspaceCheck();
+      // Meanwhile, out of the board's sight: a task waits for review in a workspace that was then archived.
+      fake.setAgentSilently(activeAgent("ghost", { status: "idle", requiresAttention: true, workspaceId: "ws-gone", updatedAt: recentIso(1_000), lastUserMessageAt: recentIso(1_000) }));
+      // The workspaces come back first (complete, without it), then the unread list.
+      await act(async () => {
+        fake.reconnectOldestWorkspaceSubscription();
+        for (let index = 0; index < 16; index += 1) await Promise.resolve();
+      });
+      await act(async () => {
+        fake.reconnectAgentSubscriptionWhere((options) => options.filter?.requiresAttention === true);
+        for (let index = 0; index < 16; index += 1) await Promise.resolve();
+      });
+      expect(ids(mounted.current.lanes.review)).not.toContain("ghost");
+      await settleWorkspaceCheck();
+      expect(mounted.current.byId.get("ghost")?.lane).toBe("archived");
+      expect(ids(mounted.current.lanes.review)).not.toContain("ghost");
+    } finally {
+      mounted.unmount();
+    }
+  });
+
+  it("does not flash a refreshed task of a new workspace into the archived lane while the workspaces' pages load", async () => {
+    const fillers = Array.from({ length: 4 }, (_, index) => makeWorkspace({ id: `filler-${index}`, projectId: "project-id", name: `filler-${index}` }));
+    const fake = createFakePaseo({
+      agents: [activeAgent("old", { status: "idle", requiresAttention: true, updatedAt: recentIso(5_000) })],
+      workspaces: [...fillers, workspace()],
+      workspacePageSize: 2,
+    });
+    const mounted = await mountArchived(fake, true);
+    try {
+      await settleWorkspaceCheck();
+      expect(mounted.current.byId.get("old")?.lane).toBe("review");
+      // Made while the board was not looking: a workspace (on a later page) and a task running in it.
+      fake.setWorkspaceSilently(makeWorkspace({ id: "z-new", projectId: "project-id", name: "z-new" }));
+      fake.setAgentSilently(activeAgent("new-runner", { status: "running", workspaceId: "z-new", updatedAt: recentIso(0), lastUserMessageAt: recentIso(0) }));
+      const release = fake.holdPages();
+      let refreshed!: Promise<unknown>;
+      await act(async () => {
+        refreshed = mounted.current.refresh();
+        for (let index = 0; index < 24; index += 1) await Promise.resolve();
+      });
+      expect(ids(mounted.current.lanes.archived)).not.toContain("new-runner");
+      await settleWorkspaceCheck();
+      expect(ids(mounted.current.lanes.archived)).not.toContain("new-runner");
+      await act(async () => {
+        release();
+        for (let index = 0; index < 24; index += 1) await Promise.resolve();
+      });
+      await settleWorkspaceCheck();
+      await act(async () => { await refreshed; });
+      expect(mounted.current.byId.get("new-runner")?.lane).toBe("running");
+    } finally {
+      mounted.unmount();
+    }
+  });
+
+  for (const which of ["workspaces", "agents"] as const) {
+    it(`makes a list whose first subscription failed live again on its own (${which}), and clears the error`, async () => {
+      const fake = createFakePaseo({
+        agents: [
+          activeAgent("live", { status: "idle", requiresAttention: true, updatedAt: recentIso(2_000) }),
+          activeAgent("other", { status: "idle", requiresAttention: true, workspaceId: "ws-other", updatedAt: recentIso(3_000) }),
+        ],
+        workspaces: [workspace(), makeWorkspace({ id: "ws-other", projectId: "project-id", name: "ws-other" })],
+      });
+      // The first subscription request fails once; later ones answer.
+      let failed = false;
+      if (which === "workspaces") {
+        const api = fake.paseo.workspaces as { list: (options: { subscribe?: unknown }) => Promise<unknown> };
+        const list = api.list.bind(api);
+        api.list = async (options) => {
+          if (options.subscribe && !failed) { failed = true; throw new Error("list failed"); }
+          return list(options);
+        };
+      } else {
+        const api = fake.paseo.agents as { list: (options: { subscribe?: unknown; filter?: { requiresAttention?: boolean } }) => Promise<unknown> };
+        const list = api.list.bind(api);
+        api.list = async (options) => {
+          if (options.subscribe && options.filter?.requiresAttention && !failed) { failed = true; throw new Error("list failed"); }
+          return list(options);
+        };
+      }
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      const mounted = await mountArchived(fake, true);
+      try {
+        expect(failed).toBe(true);
+        expect(mounted.current.error).toBe("list failed");
+        for (let round = 0; round < 4; round += 1) {
+          await act(async () => {
+            vi.advanceTimersByTime(round === 0 ? LIST_RECOVERY_DELAYS_MS[0]! + 10 : 10);
+            for (let index = 0; index < 64; index += 1) await Promise.resolve();
+          });
+        }
+        expect(mounted.current.error).toBeNull();
+        // Live again: the daemon's next changes reach the board.
+        await act(async () => {
+          if (which === "workspaces") fake.removeWorkspace("ws-other");
+          else fake.upsertAgent(activeAgent("fresh", { status: "idle", requiresAttention: true, updatedAt: recentIso(0) }));
+          for (let index = 0; index < 16; index += 1) await Promise.resolve();
+        });
+        if (which === "workspaces") expect(mounted.current.byId.get("other")?.lane).toBe("archived");
+        else expect(mounted.current.byId.get("fresh")?.lane).toBe("review");
+      } finally {
+        vi.useRealTimers();
+        mounted.unmount();
+      }
+    });
+  }
+
+  async function advanceRecovery(rounds: number, step: number) {
+    for (let round = 0; round < rounds; round += 1) {
+      await act(async () => {
+        vi.advanceTimersByTime(step);
+        for (let index = 0; index < 64; index += 1) await Promise.resolve();
+      });
+    }
+  }
+
+  it("keeps recovering a failed workspace subscription until it is live, though the first refresh skips it while the status list pages", async () => {
+    const runners = Array.from({ length: 201 }, (_, index) => activeAgent(`run-${index}`, { status: "running", updatedAt: recentIso(10_000 + index), lastUserMessageAt: recentIso(10_000 + index) }));
+    const fake = createFakePaseo({
+      agents: [...runners, activeAgent("other", { status: "idle", requiresAttention: true, workspaceId: "ws-other", updatedAt: recentIso(3_000) })],
+      workspaces: [workspace(), makeWorkspace({ id: "ws-other", projectId: "project-id", name: "ws-other" })],
+    });
+    const api = fake.paseo.workspaces as { list: (options: { subscribe?: unknown }) => Promise<unknown> };
+    const list = api.list.bind(api);
+    let subscribes = 0;
+    api.list = async (options) => {
+      if (options.subscribe) {
+        subscribes += 1;
+        if (subscribes === 1) throw new Error("list failed");
+      }
+      return list(options);
+    };
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    // The status list's later page hangs: the board is still loading it when the first recovery runs.
+    const release = fake.holdPages();
+    const mounted = await mountArchived(fake, true);
+    try {
+      await advanceRecovery(1, LIST_RECOVERY_DELAYS_MS[0]! + 10);
+      await advanceRecovery(3, 10);
+      release();
+      await advanceRecovery(1, 10);
+      await advanceRecovery(1, LIST_RECOVERY_DELAYS_MS[1]! + 10);
+      await advanceRecovery(3, 10);
+      expect(subscribes).toBeGreaterThanOrEqual(2);
+      await act(async () => {
+        fake.removeWorkspace("ws-other");
+        for (let index = 0; index < 16; index += 1) await Promise.resolve();
+      });
+      expect(mounted.current.byId.get("other")?.lane).toBe("archived");
+    } finally {
+      vi.useRealTimers();
+      mounted.unmount();
+    }
+  });
+
+  for (const which of ["status", "attention", "workspaces"] as const) {
+    it(`recovers the ${which} list lost while its first pages were still loading`, async () => {
+      const many = Array.from({ length: 201 }, (_, index) => activeAgent(`a-${index}`, which === "attention"
+        ? { status: "idle", requiresAttention: true, updatedAt: recentIso(10_000 + index) }
+        : { status: "running", updatedAt: recentIso(10_000 + index), lastUserMessageAt: recentIso(10_000 + index) }));
+      const fillers = Array.from({ length: 4 }, (_, index) => makeWorkspace({ id: `filler-${index}`, projectId: "project-id", name: `filler-${index}` }));
+      const fake = createFakePaseo({
+        agents: many,
+        workspaces: [...fillers, workspace()],
+        ...(which === "workspaces" ? { workspacePageSize: 2 } : {}),
+      });
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      const release = fake.holdPages();
+      const mounted = await mountArchived(fake, true);
+      try {
+        expect(mounted.current.ready).toBe(false);
+        // The reconnect's re-subscribe fails while the first pages are still out.
+        await act(async () => {
+          if (which === "workspaces") fake.failWorkspaceResubscribe();
+          else if (which === "attention") fake.failAgentResubscribeWhere((options) => options.filter?.requiresAttention === true);
+          else fake.failAgentResubscribeWhere((options) => options.filter?.statuses?.includes("running") === true);
+          for (let index = 0; index < 8; index += 1) await Promise.resolve();
+        });
+        release();
+        fake.passNewPages();
+        await advanceRecovery(3, 10);
+        await advanceRecovery(1, LIST_RECOVERY_DELAYS_MS[0]! + 10);
+        await advanceRecovery(4, 10);
+        await advanceRecovery(1, LIST_RECOVERY_DELAYS_MS[1]! + 10);
+        await advanceRecovery(4, 10);
+        expect(mounted.current.ready).toBe(true);
+        expect(mounted.current.error).toBeNull();
+        expect(mounted.current.byId.has("a-0")).toBe(true);
+        expect(mounted.current.byId.has("a-200")).toBe(true);
+      } finally {
+        vi.useRealTimers();
+        mounted.unmount();
+      }
+    });
+  }
+
+  for (const which of ["workspaces", "agents"] as const) {
+    it(`recovers a live ${which} subscription whose reconnect's re-subscribe failed`, async () => {
+      const fake = createFakePaseo({
+        agents: [
+          activeAgent("live", { status: "idle", requiresAttention: true, updatedAt: recentIso(2_000) }),
+          activeAgent("other", { status: "idle", requiresAttention: true, workspaceId: "ws-other", updatedAt: recentIso(3_000) }),
+        ],
+        workspaces: [workspace(), makeWorkspace({ id: "ws-other", projectId: "project-id", name: "ws-other" })],
+      });
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      const mounted = await mountArchived(fake, true);
+      try {
+        expect(mounted.current.byId.get("other")?.lane).toBe("review");
+        await act(async () => {
+          if (which === "workspaces") fake.failWorkspaceResubscribe();
+          else fake.failAgentResubscribeWhere((options) => options.filter?.requiresAttention === true);
+          for (let index = 0; index < 8; index += 1) await Promise.resolve();
+        });
+        expect(mounted.current.error).toBe("resubscribe failed");
+        await advanceRecovery(1, LIST_RECOVERY_DELAYS_MS[0]! + 10);
+        await advanceRecovery(3, 10);
+        expect(mounted.current.error).toBeNull();
+        await act(async () => {
+          if (which === "workspaces") fake.removeWorkspace("ws-other");
+          else fake.upsertAgent(activeAgent("fresh", { status: "idle", requiresAttention: true, updatedAt: recentIso(0) }));
+          for (let index = 0; index < 16; index += 1) await Promise.resolve();
+        });
+        if (which === "workspaces") expect(mounted.current.byId.get("other")?.lane).toBe("archived");
+        else expect(mounted.current.byId.get("fresh")?.lane).toBe("review");
+      } finally {
+        vi.useRealTimers();
+        mounted.unmount();
+      }
+    });
+  }
+
+  const HOST_GATE = "Update the host to use background workspaces.";
+
+  /**
+   * Inclusive lists throw the host gate until `accept` is true. Counts the fallback subscriptions.
+   * `defer`, when it returns a promise, holds a list call until it resolves; the gate is checked after.
+   */
+  function gateBackgroundLists(fake: Fake, accept: () => boolean, defer?: (options: { subscribe?: unknown; filter?: { includeBackground?: boolean } }) => Promise<void> | undefined) {
+    let inclusive = 0;
+    let plainSubscribes = 0;
+    const wrap = <T extends { subscribe?: unknown; filter?: { includeBackground?: boolean } }>(list: (options: T) => Promise<unknown>) => async (options: T) => {
+      const held = defer?.(options);
+      if (held) await held;
+      if (options.subscribe && !options.filter?.includeBackground) plainSubscribes += 1;
+      if (options.filter?.includeBackground && !accept()) {
+        inclusive += 1;
+        throw new Error(HOST_GATE);
+      }
+      return list(options);
+    };
+    const agents = fake.paseo.agents as { list: (options: { subscribe?: unknown; filter?: { includeBackground?: boolean } }) => Promise<unknown> };
+    const workspaces = fake.paseo.workspaces as { list: (options: { subscribe?: unknown; filter?: { includeBackground?: boolean } }) => Promise<unknown> };
+    agents.list = wrap(agents.list.bind(agents));
+    workspaces.list = wrap(workspaces.list.bind(workspaces));
+    return { get inclusive() { return inclusive; }, get plainSubscribes() { return plainSubscribes; } };
+  }
+
+  async function flushLists() {
+    await act(async () => {
+      for (let index = 0; index < 48; index += 1) await Promise.resolve();
+    });
+  }
+
+  it("lists tasks without toasting when the host has not advertised background workspaces, and keeps that list", async () => {
+    const fake = createFakePaseo({
+      agents: [activeAgent("running", { status: "running" })],
+      workspaces: [workspace()],
+    });
+    const gate = gateBackgroundLists(fake, () => false);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const mounted = await mountTasks(fake);
+    try {
+      await flushLists();
+      expect(mounted.current.error).toBeNull();
+      expect(mounted.current.byId.get("running")?.lane).toBe("running");
+      const fallbacks = gate.plainSubscribes;
+      expect(fallbacks).toBeGreaterThan(0);
+      const refused = gate.inclusive;
+      await advanceRecovery(1, LIST_RECOVERY_DELAYS_MS[0]! + 10);
+      await advanceRecovery(4, 10);
+      await advanceRecovery(1, LIST_RECOVERY_DELAYS_MS[1]! + 10);
+      await advanceRecovery(4, 10);
+      expect(mounted.current.error).toBeNull();
+      expect(mounted.current.byId.get("running")?.lane).toBe("running");
+      // The inclusive list is asked again. The fallback already serving is not opened again.
+      expect(gate.inclusive).toBeGreaterThan(refused);
+      expect(gate.plainSubscribes).toBe(fallbacks);
+    } finally {
+      vi.useRealTimers();
+      mounted.unmount();
+    }
+  });
+
+  it("asks for background workspaces again once the host advertises them", async () => {
+    const fake = createFakePaseo({
+      agents: [
+        activeAgent("parent", { status: "running" }),
+        activeAgent("child", { status: "running", workspaceId: "ws-bg", labels: { "paseo.parent-agent-id": "parent" } }),
+      ],
+      workspaces: [workspace(), makeWorkspace({ id: "ws-bg", projectId: "project-id", name: "background", background: true })],
+    });
+    let accept = false;
+    gateBackgroundLists(fake, () => accept);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const mounted = await mountTasks(fake);
+    try {
+      await flushLists();
+      expect(mounted.current.error).toBeNull();
+      expect(mounted.current.byId.has("child")).toBe(false);
+      expect(mounted.current.byId.get("parent")?.children.map((child) => child.id)).toEqual([]);
+      accept = true;
+      await advanceRecovery(1, LIST_RECOVERY_DELAYS_MS[0]! + 10);
+      await advanceRecovery(8, 10);
+      expect(mounted.current.error).toBeNull();
+      expect(mounted.current.byId.get("parent")?.children.map((child) => child.id)).toContain("child");
+      expect(mounted.current.lanes.running.cards.map((card) => card.id)).not.toContain("child");
+    } finally {
+      vi.useRealTimers();
+      mounted.unmount();
+    }
+  });
+
+  it("keeps the background child on its parent when the host gate rejects after an inclusive list landed", async () => {
+    const fake = createFakePaseo({
+      agents: [
+        activeAgent("parent", { status: "idle", updatedAt: recentIso(5_000) }),
+        activeAgent("child", { status: "running", workspaceId: "ws-bg", labels: { "paseo.parent-agent-id": "parent" } }),
+      ],
+      workspaces: [workspace(), makeWorkspace({ id: "ws-bg", projectId: "project-id", name: "background", background: true })],
+    });
+    let accept = true;
+    const gate = gateBackgroundLists(fake, () => accept);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const mounted = await mountTasks(fake);
+    try {
+      await flushLists();
+      expect(mounted.current.byId.get("parent")?.children.map((child) => child.id)).toContain("child");
+      expect(mounted.current.byId.get("parent")?.lane).toBe("running");
+      expect(mounted.current.lanes.running.cards.map((card) => card.id)).not.toContain("child");
+      const plain = gate.plainSubscribes;
+      // The client's hello flag goes away, then the status list's re-subscribe fails.
+      accept = false;
+      await act(async () => {
+        fake.failAgentResubscribeWhere((options) => options.filter?.statuses?.includes("running") === true);
+        for (let index = 0; index < 8; index += 1) await Promise.resolve();
+      });
+      await advanceRecovery(1, LIST_RECOVERY_DELAYS_MS[0]! + 10);
+      await advanceRecovery(4, 10);
+      // A refresh while the gate still rejects.
+      await act(async () => {
+        void mounted.current.refresh();
+        for (let index = 0; index < 64; index += 1) await Promise.resolve();
+      });
+      await advanceRecovery(1, LIST_RECOVERY_DELAYS_MS[1]! + 10);
+      await advanceRecovery(4, 10);
+      // The independent history scan cannot finish while the gate rejects it.
+      expect(mounted.current.error).toBe(HOST_GATE);
+      expect(mounted.current.byId.get("parent")?.children.map((child) => child.id)).toContain("child");
+      expect(mounted.current.byId.get("parent")?.lane).toBe("running");
+      expect(mounted.current.lanes.running.cards.map((card) => card.id)).not.toContain("child");
+      expect(gate.plainSubscribes).toBe(plain);
+      accept = true;
+      let result: string | undefined;
+      await act(async () => { result = await mounted.current.refresh(); });
+      expect(result).toBe("done");
+      expect(mounted.current.error).toBeNull();
+    } finally {
+      vi.useRealTimers();
+      mounted.unmount();
+    }
+  });
+
+  it("does not know a background workspace gone when the gate rejects a later page of the inclusive workspace list", async () => {
+    // A parent whose provider subagent failed, read by id since no list holds it yet: in a background workspace.
+    const prompted = "2026-10-22T09:10:56.339Z";
+    setSubagentLoader(async () => ({
+      version: "1",
+      subagents: [{
+        id: "sub",
+        parentAgentId: "bg-task",
+        provider: "claude",
+        title: "general-purpose",
+        description: "RRD-sub task",
+        status: "failed",
+        createdAt: "2026-10-22T09:12:00.000Z",
+        updatedAt: "2026-10-22T09:18:55.000Z",
+        subtitle: "general-purpose",
+      }],
+    }));
+    const fake = createFakePaseo({
+      agents: [activeAgent("bg-task", { status: "idle", workspaceId: "zz-bg", lastUserMessageAt: prompted, updatedAt: recentIso(60_000) })],
+      // Two a page, by id: the background workspace is on the second.
+      workspaces: [
+        makeWorkspace({ id: "a-0", projectId: "project-id", name: "a-0" }),
+        makeWorkspace({ id: "a-1", projectId: "project-id", name: "a-1" }),
+        workspace(),
+        makeWorkspace({ id: "zz-bg", projectId: "project-id", name: "background", background: true }),
+      ],
+      workspacePageSize: 2,
+    });
+    // The inclusive workspace subscription answers; the hello flag goes away before its next page.
+    let inclusiveWorkspaces = 0;
+    let rejecting = true;
+    const workspacesApi = fake.paseo.workspaces as { list: (options: { subscribe?: unknown; filter?: { includeBackground?: boolean } }) => Promise<unknown> };
+    const listWorkspaces = workspacesApi.list.bind(workspacesApi);
+    workspacesApi.list = async (options) => {
+      if (options.filter?.includeBackground) {
+        inclusiveWorkspaces += 1;
+        if (inclusiveWorkspaces > 1 && rejecting) throw new Error(HOST_GATE);
+      }
+      return listWorkspaces(options);
+    };
+    // The agent lists answer only once the flag is back: no inclusive agent list lands meanwhile.
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const agentsApi = fake.paseo.agents as { list: (options: unknown) => Promise<unknown> };
+    const listAgents = agentsApi.list.bind(agentsApi);
+    agentsApi.list = async (options) => {
+      await held;
+      return listAgents(options);
+    };
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const mounted = await mountArchived(fake, true);
+    try {
+      await flushLists();
+      // The subagent read, the parent's read by id, and the check of its unplaced workspace.
+      await advanceRecovery(8, 10);
+      expect(inclusiveWorkspaces).toBeGreaterThan(2);
+      expect(mounted.current.error).toBeNull();
+      expect(mounted.current.byId.get("bg-task")?.lane).not.toBe("archived");
+      rejecting = false;
+      await act(async () => {
+        release();
+        for (let index = 0; index < 64; index += 1) await Promise.resolve();
+      });
+      await advanceRecovery(1, 5_010);
+      await advanceRecovery(4, 10);
+      expect(mounted.current.error).toBeNull();
+      expect(mounted.current.byId.get("bg-task")?.lane).not.toBe("archived");
+      expect(mounted.current.lanes.archived.cards.map((card) => card.id)).not.toContain("bg-task");
+    } finally {
+      vi.useRealTimers();
+      mounted.unmount();
+      setSubagentLoader(null);
+    }
+  });
+
+  it("asks for the inclusive list of a list that fell back while a recovery refresh was in flight", async () => {
+    const fake = createFakePaseo({
+      agents: [
+        activeAgent("running", { status: "running" }),
+        activeAgent("done", { status: "idle", updatedAt: recentIso(5_000) }),
+      ],
+      workspaces: [workspace()],
+    });
+    let accept = false;
+    let deferring = false;
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    gateBackgroundLists(fake, () => accept, (options) => (deferring && options.subscribe ? held : undefined));
+    const doneSubscribes = () => fake.calls.filter((call) => {
+      const input = call.input as { subscribe?: unknown; filter?: { statuses?: string[]; includeBackground?: boolean } };
+      return call.method === "agents.list" && input.subscribe && input.filter?.statuses?.includes("closed") && input.filter.includeBackground === true;
+    }).length;
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    // A board without the done lane: the done list is opened later.
+    const board = await mountTasks(fake, "24h", false);
+    let doneBoard: Awaited<ReturnType<typeof mountTasks>> | null = null;
+    try {
+      await flushLists();
+      expect(board.current.error).toBeNull();
+      // The recovery refresh's inclusive lists hang on the wire.
+      deferring = true;
+      await advanceRecovery(1, LIST_RECOVERY_DELAYS_MS[0]! + 10);
+      deferring = false;
+      // The done list opens meanwhile, and the gate refuses it.
+      doneBoard = await mountTasks(fake, "24h", true);
+      await flushLists();
+      expect(doneSubscribes()).toBe(0);
+      // The host advertises the feature: the refresh's lists land inclusive.
+      accept = true;
+      await act(async () => {
+        release();
+        for (let index = 0; index < 64; index += 1) await Promise.resolve();
+      });
+      await advanceRecovery(1, LIST_RECOVERY_DELAYS_MS[1]! + 10);
+      await advanceRecovery(4, 10);
+      await advanceRecovery(1, LIST_RECOVERY_DELAYS_MS[2]! + 10);
+      await advanceRecovery(4, 10);
+      expect(doneSubscribes()).toBeGreaterThan(0);
+      expect(board.current.error).toBeNull();
+      expect(doneBoard.current.error).toBeNull();
+    } finally {
+      vi.useRealTimers();
+      if (doneBoard) doneBoard.unmount();
+      board.unmount();
+    }
+  });
+
+  it("reads a workspace restored while the board was closed again, though the reopened board's first list fails", async () => {
+    const fake = createFakePaseo({
+      agents: [activeAgent("task", { status: "idle", requiresAttention: true, workspaceId: "ws-x", updatedAt: recentIso(1_000) })],
+      workspaces: [workspace(), makeWorkspace({ id: "ws-x", projectId: "project-id", name: "ws-x" })],
+    });
+    const first = await mountArchived(fake, true);
+    await settleWorkspaceCheck();
+    expect(first.current.byId.get("task")?.lane).toBe("review");
+    await act(async () => {
+      fake.removeWorkspace("ws-x");
+      for (let index = 0; index < 8; index += 1) await Promise.resolve();
+    });
+    expect(first.current.byId.get("task")?.lane).toBe("archived");
+    first.unmount();
+    // Restored while no board is open; the reopened board's first workspace list fails.
+    fake.setWorkspaceSilently(makeWorkspace({ id: "ws-x", projectId: "project-id", name: "ws-x" }));
+    const workspacesApi = fake.paseo.workspaces as { list: (options: { subscribe?: unknown }) => Promise<unknown> };
+    const list = workspacesApi.list.bind(workspacesApi);
+    let failed = false;
+    workspacesApi.list = async (options) => {
+      if (options.subscribe && !failed) {
+        failed = true;
+        throw new Error("list failed");
+      }
+      return list(options);
+    };
+    const again = await mountArchived(fake, true);
+    try {
+      await settleWorkspaceCheck();
+      expect(failed).toBe(true);
+      expect(again.current.byId.get("task")?.lane).toBe("review");
+    } finally {
+      again.unmount();
+    }
+  });
+
+  for (const [name, pageSize] of [["its first request", undefined], ["a later page", 2]] as const) {
+    it(`settles a task of an unlisted workspace when the first workspace list fails (${name})`, async () => {
+      const fillers = Array.from({ length: 4 }, (_, index) => makeWorkspace({ id: `filler-${index}`, projectId: "project-id", name: `filler-${index}` }));
+      const fake = createFakePaseo({
+        agents: [
+          activeAgent("ghost", { status: "idle", requiresAttention: true, workspaceId: "ws-gone", updatedAt: recentIso(1_000) }),
+          activeAgent("live", { status: "idle", requiresAttention: true, updatedAt: recentIso(2_000) }),
+        ],
+        workspaces: [...fillers, workspace()],
+        archivedWorkspaceIds: ["ws-gone"],
+        ...(pageSize ? { workspacePageSize: pageSize } : {}),
+      });
+      // One request of the subscription's fails (its first, or a later page); every other read answers.
+      const workspacesApi = fake.paseo.workspaces as { list: (options: { subscribe?: unknown; page?: { cursor?: string } }) => Promise<unknown> };
+      const list = workspacesApi.list.bind(workspacesApi);
+      let failed = false;
+      workspacesApi.list = async (options) => {
+        const target = pageSize ? Boolean(options.page?.cursor) : Boolean(options.subscribe);
+        if (target && !failed) {
+          failed = true;
+          throw new Error("list failed");
+        }
+        return list(options);
+      };
+      const mounted = await mountArchived(fake, true);
+      try {
+        await settleWorkspaceCheck();
+        expect(failed).toBe(true);
+        expect(mounted.current.byId.get("ghost")?.lane).toBe("archived");
+        expect(mounted.current.byId.get("live")?.lane).toBe("review");
+      } finally {
+        mounted.unmount();
+      }
+    });
+  }
+
   it("removes a restored background helper from the archived lane", async () => {
     const fake = createFakePaseo({
       agents: [activeAgent("helper", { status: "closed", workspaceId: "ws-helper", archivedAt: recentIso(2_000), updatedAt: recentIso(2_000) })],
       workspaces: [workspace()],
+      archivedWorkspaceIds: ["ws-helper"],
     });
     const mounted = await mountArchived(fake, true);
     try {

@@ -3,16 +3,28 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const copy = vi.hoisted(() => vi.fn(async (_text: string, _options?: object) => true));
 const list = React.createContext<{ getScrollMetrics(): { offset: number } } | null>(null);
-vi.mock("react-native", async () => ({ ...await import("./helpers/rn-mock"), VirtualizedList: { get contextType() { return list; } } }));
+vi.mock("react-native", async () => ({
+  ...await import("./helpers/rn-mock"),
+  VirtualizedList: { get contextType() { return list; } },
+  processColor: (color: unknown) => color === "#1C76F2" ? 0xff1c76f2 : color,
+}));
 vi.mock("../../client/ui/use-copy", () => ({ useCopy: () => ({ copy }) }));
-vi.mock("@getpaseo/plugin/client/react-native", async () => {
+vi.mock("@getpaseo/plugin/client/ui", async () => {
   const rn = await import("./helpers/rn-mock");
   return { Icon: (props: object) => React.createElement("Icon", props), ScrollView: rn.ScrollView,
-    Modal: rn.View, TextInput: rn.TextInput, useRevealedText: (text: string) => text };
+    Modal: Object.assign((props: Record<string, unknown>) => React.createElement(rn.View, props), {
+      Content: (props: { children?: React.ReactNode }) => React.createElement(rn.View, null, props.children),
+    }), TextInput: rn.TextInput };
 });
+const translate = vi.hoisted(() => vi.fn());
+const paseo = vi.hoisted(() => ({}));
+const readHome = vi.hoisted(() => async () => ({ home: "/Users/me" }));
 vi.mock("@getpaseo/plugin/client", () => ({
   useSettings: () => ({ data: undefined }),
-  useRpc: () => async () => ({ dataUri: null, mime: null, width: null, height: null, bytes: null, error: "File not found" }),
+  usePaseo: () => paseo,
+  useRpc: (definition?: { name?: string }) => definition?.name === "translation.translate" ? translate
+    : definition?.name === "file.home" ? readHome
+    : async () => ({ dataUri: null, mime: null, width: null, height: null, bytes: null, error: "File not found" }),
 }));
 await import("./helpers/quiet-renderer");
 const { default: TestRenderer, act } = await import("react-test-renderer");
@@ -61,11 +73,21 @@ afterEach(() => {
   vi.useRealTimers(); vi.unstubAllGlobals(); vi.restoreAllMocks();
 });
 
+describe("web Markdown block boundaries", () => {
+  it("marks separate paragraphs without adding layout boxes", () => {
+    os.__rnMockOS = "web";
+    render("First paragraph.\n\nSecond paragraph.");
+    const blocks = renderer!.root.findAll((node) => node.type === "span" && node.props["data-bcblock"] === "");
+    expect(blocks).toHaveLength(2);
+    expect(blocks.map((node) => node.props.style.display)).toEqual(["contents", "contents"]);
+  });
+});
+
 describe("iOS single Markdown block selection", () => {
   it("keeps a small unordered marker within the existing list column", () => {
     render("- 第一项内容换行时与正文对齐\n- Second item");
     const style = native()[0]!.props.markdownStyle.list;
-    expect(style.bulletSize).toBe(4);
+    expect(style.bulletSize).toBe(3);
     expect(style.markerMinWidth + style.gapWidth).toBe(22);
     render("1. Ordered item");
     const ordered = native()[0]!.props.markdownStyle.list;
@@ -149,13 +171,126 @@ describe("iOS single Markdown block selection", () => {
     const root = renderer!.root.findAll((node) => String(node.type) === "View" && node.props.dataSet?.bcselection)[0]!;
     act(() => root.props.onTouchStart()); expect(menus()).toHaveLength(0);
   });
-  it.each(["web", "android"])("leaves %s selection unchanged", (platform) => {
-    os.__rnMockOS = platform; render("First.\n\nSecond.");
+  it("paints selected text in a fixed light blue, behind the text", () => {
+    const light = buildThemeTokens({ surface0: "#ffffff", surface1: "#f7f7f8", surface2: "#ececee", border: "#e4e4e6",
+      foreground: "#1b1b1f", foregroundMuted: "#6b6b70", accent: "#20744a", accentForeground: "#ffffff",
+      statusSuccess: "#00aa00", statusWarning: "#ffaa00", statusDanger: "#ff0000" });
+    // At 0.2 over white the fill is #D2E4FC; the host's accent plays no part.
+    expect(light.textSelection).toBe("rgba(28, 118, 242, 0.2)");
+    expect(tokens.textSelection).toBe("rgba(28, 118, 242, 0.3)");
+    render("First.\n\nSecond.");
+    tap(1, 100); tap(1, 230);
+    const highlight = highlights()[0]!;
+    expect(StyleSheet.flatten(highlight.props.style).backgroundColor).toBe(tokens.textSelection);
+    const frame = frames()[1]!;
+    const order = frame.findAll((node) => node === highlight || String(node.type) === "EnrichedMarkdownText");
+    expect(order[0]).toBe(highlight);
+  });
+  it("passes the blue selection tint unprocessed to both iOS Markdown views", () => {
+    render("Paragraph.");
+    expect(native().map((node) => [node.type, node.props.selectionColor])).toEqual([
+      ["EnrichedMarkdownText", "#1C76F2"],
+    ]);
+    render("- List item");
+    expect(native().map((node) => [node.type, node.props.selectionColor])).toEqual([
+      ["EnrichedMarkdown", "#1C76F2"],
+    ]);
+  });
+  it("gives Android's native drag selection the same blue", () => {
+    os.__rnMockOS = "android"; render("First **bold**.");
+    const prose = frames()[0]!.findAll((node) => String(node.type) === "Text")[0]!;
+    expect(prose.props.selectionColor).toBe(tokens.textSelection);
+  });
+  it("leaves web selection unchanged", () => {
+    os.__rnMockOS = "web"; render("First.\n\nSecond.");
     expect(frames()).toHaveLength(0); expect(menus()).toHaveLength(0);
+  });
+  it("selects one block on Android without taking native text selection or the responder", async () => {
+    os.__rnMockOS = "android"; render("First.\n\nSecond **bold**.");
+    const prose = (index: number) => frames()[index]!.findAll((node) => String(node.type) === "Text")[0]!;
+    // Observers only: no responder props, so a long press still starts native range selection.
+    for (const frame of frames()) {
+      expect(Object.keys(frame.props).filter((key) => /Responder/.test(key))).toEqual([]);
+    }
+    expect([prose(0).props.selectable, prose(1).props.selectable]).toEqual([true, true]);
+    tap(1, 100); tap(1, 230);
+    expect(highlights()).toHaveLength(1);
+    // The selected block drops a natively selected word; its neighbour keeps native selection.
+    expect([prose(0).props.selectable, prose(1).props.selectable]).toEqual([true, false]);
+    await act(async () => menus()[0]!.props.onPress());
+    expect(copy).toHaveBeenCalledExactlyOnceWith("Second bold.", { feedback: "toast" });
+    expect(highlights()).toHaveLength(0);
+    expect(prose(1).props.selectable).toBe(true);
+  });
+  it("keeps an open translation sheet when the list moves under it, and dismisses the menu before", async () => {
+    const { SelectionTranslationScope } = await import("../../client/translation/ui");
+    const { DEFAULT_TIMELINE_TRANSLATION_SETTINGS, publishTranslationSettings, resetTranslationSettingsStoreForTests } = await import("../../client/translation/settings-store");
+    const { resetTranslationStoreForTests } = await import("../../client/translation/store");
+    resetTranslationStoreForTests();
+    publishTranslationSettings({ ...DEFAULT_TIMELINE_TRANSLATION_SETTINGS, enabled: true, mode: "openai", endpoint: "https://api.example.test/v1", endpointModel: "gpt-5" }, "scroll");
+    translate.mockResolvedValue({ state: "done", translation: "译文", targetLanguageCode: "zh-CN", origin: "https://api.example.test", model: "gpt-5" });
+    const scoped = (text: string) => React.createElement(list.Provider, { value: { getScrollMetrics: () => ({ offset }) } },
+      React.createElement(SelectionTranslationScope, { agentId: "agent-1", kind: "assistant_message", streaming: false,
+        children: React.createElement(MarkdownView, { text, tokens, variant: "document" }) }));
+    try {
+      act(() => { renderer = TestRenderer.create(scoped("Paragraph.")); });
+      const translateButton = () => renderer!.root.findAll((node) => String(node.type) === "Pressable" && node.props.accessibilityLabel === "Translate selected block");
+      // The menu alone still leaves when the list scrolls.
+      tap(0, 100); tap(0, 230);
+      expect(translateButton()).toHaveLength(1);
+      offset = 40; act(() => { vi.advanceTimersByTime(16); });
+      expect(highlights()).toHaveLength(0);
+
+      tap(0, 400); tap(0, 530);
+      await act(async () => translateButton()[0]!.props.onPress());
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+      expect(JSON.stringify(renderer!.toJSON())).toContain("译文");
+      // A reply streaming below moves the list; the sheet over it stays.
+      offset = 120; act(() => { vi.advanceTimersByTime(48); });
+      expect(highlights()).toHaveLength(1);
+      expect(JSON.stringify(renderer!.toJSON())).toContain("译文");
+    } finally {
+      resetTranslationSettingsStoreForTests();
+      resetTranslationStoreForTests();
+      translate.mockReset();
+    }
+  });
+});
+
+describe("Markdown quote controls", () => {
+  it.each(["web", "ios", "android"])("copies a quote without a fold control on %s", async (platform) => {
+    os.__rnMockOS = platform;
+    render("> 请读取 `path/to/file.md`\n>\n> **第二段**");
+    const button = (label: string) => renderer!.root.find((node) =>
+      String(node.type) === "Pressable" && node.props.accessibilityLabel === label);
+    await act(async () => button("Copy quote").props.onPress());
+    expect(copy).toHaveBeenCalledWith("请读取 path/to/file.md\n\n第二段", { feedback: "icon", label: "Copy quote" });
+    expect(renderer!.root.findAll((node) => String(node.type) === "Pressable" &&
+      ["Collapse quote", "Expand quote"].includes(node.props.accessibilityLabel))).toHaveLength(0);
+  });
+  it("copies code and table content inside a quote", () => {
+    expect(blockSelectionText(Lexer.lex("> ```\n> code\n> ```\n>\n> | A | B |\n> | - | - |\n> | 1 | 2 |")))
+      .toBe("code\n\nA\tB\n1\t2");
   });
 });
 
 describe("mobile nested list markers", () => {
+  it.each(["ios", "android"] as const)("makes document bullets slightly smaller on %s", (platform) => {
+    os.__rnMockOS = platform;
+    const mobileTokens = { ...tokens, platform };
+    const size = (variant: "document" | "compact") => {
+      act(() => {
+        const element = React.createElement(MarkdownView, {
+          text: "- First\n  - Nested", tokens: mobileTokens, variant, compact: true,
+        });
+        if (renderer) renderer.update(element);
+        else renderer = TestRenderer.create(element);
+      });
+      const marker = renderer!.root.find((node) => String(node.type) === "Text" && node.props.children === "•");
+      return StyleSheet.flatten(marker.props.style).fontSize;
+    };
+    expect(size("document")).toBe(size("compact") - 1);
+  });
   it.each(["ios", "android"] as const)("keeps nesting and marker columns on %s while streaming and settled", (platform) => {
     os.__rnMockOS = platform;
     const mobileTokens = { ...tokens, platform };
@@ -178,7 +313,7 @@ describe("mobile nested list markers", () => {
       })).toEqual([0, 20, 40, 0]);
       for (const marker of markers) {
         const style = StyleSheet.flatten(marker.props.style);
-        expect(style.width).toBe(22);
+        expect(style.width).toBe(14);
         expect(style.fontSize).toBeLessThan(tokens.typography.content.size);
       }
       expect(renderer!.root.findAll((node) => String(node.type) === "Text" && node.props.children === "1.")).toHaveLength(1);

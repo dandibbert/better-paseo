@@ -1,5 +1,5 @@
-import React, { useCallback, useContext, useEffect, useMemo, useState } from "react";
-import { View, Text, Pressable, StyleSheet } from "react-native";
+import React, { useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
+import { Platform, View, Text, Pressable, StyleSheet } from "react-native";
 import type { TextStyle, ViewStyle } from "react-native";
 import { Glyph } from "./glyph";
 import { surfaceProps } from "./view-props";
@@ -22,9 +22,10 @@ import { isImagePath } from "../image-file";
 import type { ImageFile } from "../image-file";
 import { selectableSurface, unselectable } from "./selection";
 import { selectionCodeText, selectionSurface } from "./selection-actions";
-import { useToast } from "@getpaseo/plugin/client/react-native";
+import { useToast } from "@getpaseo/plugin/client/ui";
 import { DISCLOSURE_HEADER, DisclosureHeader, RowIcon, RowPaletteContext, RowText } from "../ui/disclosure-header";
 import { STICKY_SUPPORTED, StickyCard } from "../ui/sticky-header";
+import { DetailsStickyCard, DetailsStickySourceContext, StickyStepContext, type StickyStepHandle } from "../details/sticky-step";
 import { useScrollAnchor } from "../ui/scroll-anchor";
 import { PathContext, PathText } from "../ui/path-text";
 import { RunningDot } from "../ui/running-dot";
@@ -40,7 +41,7 @@ import { CommandBand, PreviewPath } from "../ui/command-band";
 import { CommandFontProbe } from "../debug/font-probe";
 import { FadeIn } from "../ui/fade-in";
 import { SelectableSpan, SelectableText } from "../ui/prose-text";
-import { formatPath } from "../paths/format-path";
+import { formatPath, shortenHome } from "../paths/format-path";
 import { lineRangeLabel, summarizeTool } from "../tools/summarize";
 import { TYPE, UI_SCALE, blockProseBase } from "../ui/tokens/typography";
 import { codeSurface } from "./host-font-escape";
@@ -52,11 +53,18 @@ import { summarizeToolCall, summarizeToolGroup } from "../tools/group";
 import { toolHasDetail } from "../tools/detail";
 import { mcpServiceIcon } from "../tools/mcp-service-icon";
 import { commandIcon } from "../tools/command-icon";
-import type { CopyItem } from "../details/contracts";
+import { BlockPlacementContext, type CopyItem } from "../details/contracts";
+import { InlineTranslateButtonWithTokens, InlineTranslationNoticeWithTokens, type InlineTranslationState } from "../translation/inline";
+import { TranslationGroup, translationGroupState } from "../translation/group";
+import { toolTranslationTargets, translatedTool, type ToolTranslationTarget } from "../translation/tool-preview";
 import { useZoomedTokens } from "../ui/text-zoom";
 import { toolbarLabel } from "../i18n/toolbar-strings";
 import { useHostLanguageVersion } from "../i18n/host-language";
 import { useEnhancerPreferences } from "../preferences";
+import { bindSelectionScopeElement, selectionScopeDataSet, SelectionTranslationContext } from "../translation/selection";
+import { selectionColorProps } from "./text-selection";
+import { Favicon, FaviconStack, OpenLinkButton, WebLinkTarget, WebResultRow } from "./web-favicon";
+import { distinctHosts, parseWebLink } from "../tools/web-link";
 
 /**
  * The muted icon a settled call shows in the row's status slot: one Lucide
@@ -151,6 +159,8 @@ interface ToolCalloutProps {
   tokens: ExtendedThemeTokens;
   /** `layout.compact`: 28px header and shorter truncation budgets. */
   compact?: boolean;
+  /** A fixed-width prefix for this call's header. */
+  leading?: { content: React.ReactNode; width: number };
   /** Uncontrolled start state. The live renderer passes `expanded` instead. */
   defaultExpanded?: boolean;
   /** Controlled open state (the disclosure store's value). */
@@ -190,6 +200,7 @@ export function ToolCallout({
   groupCalls,
   tokens,
   compact = false,
+  leading,
   defaultExpanded = false,
   expanded: controlledExpanded,
   onExpandedChange,
@@ -197,6 +208,17 @@ export function ToolCallout({
   imageFile,
   requestImage,
 }: ToolCalloutProps) {
+  const placement = useContext(BlockPlacementContext);
+  // A work step in the details panel pins its opened row under the toolbar.
+  const stickyStep = useContext(StickyStepContext);
+  const stickySource = useContext(DetailsStickySourceContext);
+  const selectionScope = useContext(SelectionTranslationContext);
+  const scopeData = Platform.OS === "web" ? selectionScopeDataSet(selectionScope) : null;
+  const bindSelectionScope = useCallback((node: View | Text | null) => {
+    if (!node || !selectionScope) return;
+    bindSelectionScopeElement(node, selectionScope);
+    return () => bindSelectionScopeElement(node, null);
+  }, [selectionScope]);
   const [localExpanded, setLocalExpanded] = useState(defaultExpanded);
   // A body that would only repeat the row is never shown, whatever the store says.
   const budget = compact ? DISCLOSURE_HEADER.targetBudget.compact : DISCLOSURE_HEADER.targetBudget.desktop;
@@ -206,7 +228,12 @@ export function ToolCallout({
   );
   const expanded = hasDetail && (controlledExpanded ?? localExpanded);
   const setExpanded = onExpandedChange ?? setLocalExpanded;
-  const onToggle = useCallback(() => setExpanded(!expanded), [setExpanded, expanded]);
+  // A pinned work step being closed first brings the body back to its row.
+  const stickyHandle = useRef<StickyStepHandle>(null);
+  const onToggle = useCallback(() => {
+    if (expanded) stickyHandle.current?.collapsing();
+    setExpanded(!expanded);
+  }, [setExpanded, expanded]);
   // Owned here, not by the row: an opened card moves the row into `StickyCard`.
   const scrollAnchor = useScrollAnchor(expanded);
 
@@ -244,8 +271,16 @@ export function ToolCallout({
   const tone = running ? "active" : "quiet";
   // On a phone a created agent's row shows its harness as the grey mark, not as words.
   const provider = compact ? summary.agent?.provider : undefined;
+  // A web search for an address (Codex opening a page) names the site first:
+  // its favicon in the icon slot, the domain, and an arrow out to the page.
+  const webSearch = !groupCalls && data.tool === "search" && data.search?.toolName === "web_search" ? data.search : undefined;
+  const webQuery = webSearch && parseWebLink(webSearch.query) ? webSearch.query : undefined;
+  const webHosts = useMemo(() => distinctHosts(webSearch?.webResults?.map((row) => row.url) ?? []), [webSearch]);
+  const webHost = webQuery ? parseWebLink(webQuery)?.host : undefined;
   const statusIcon = running ? (
     <RunningDot color={tokens.accent} />
+  ) : webHost && !failed ? (
+    <Favicon host={webHost} size={DISCLOSURE_HEADER.icon} tokens={tokens} />
   ) : (
     <RowIcon name={provider ? `provider:${provider}` : summary.agent?.icon ?? iconName}
       color={agentTone ?? (failed ? tokens.danger : summary.iconTone === "success" ? tokens.success : undefined)} />
@@ -254,6 +289,9 @@ export function ToolCallout({
   const target =
     summary.agent ? (
       <AgentRowTarget summary={summary} tokens={tokens} />
+    ) : webQuery ? (
+      <WebLinkTarget href={webQuery} tokens={tokens} budget={budget}
+        fontSize={tokens.typography.block.target.size} lineHeight={tokens.typography.block.target.lineHeight} />
     ) : summary.targetIsPath && summary.target ? (
       <PathText
         path={summary.target}
@@ -278,6 +316,10 @@ export function ToolCallout({
   });
   const metaLead = summary.metaPath ? (
     <MetaPath path={summary.metaPath} tokens={tokens} compact={compact} />
+  ) : webQuery ? (
+    <OpenLinkButton href={webQuery} compact={compact} />
+  ) : webHosts.length > 0 ? (
+    <FaviconStack hosts={webHosts} tokens={tokens} />
   ) : undefined;
 
   // Mounted only while the row shows its actions, so the plan is built then.
@@ -341,6 +383,7 @@ export function ToolCallout({
       scrollAnchor={scrollAnchor}
       tokens={tokens}
       compact={compact}
+      leading={leading}
       tone={tone}
       inert={!hasDetail}
       icon={statusIcon}
@@ -362,8 +405,8 @@ export function ToolCallout({
       pressPreview={!viewsImage}
       previewKey={previewKey}
       detailsTitle={{ text: summary.agent ? [verb, agentTarget.text].filter(Boolean).join(" · ")
-        : groupCalls ? [summary.verb, summary.target].filter(Boolean).join(" ")
-        : data.shell?.command || data.command || (summary.targetIsPath ? data.filePath : undefined) || summary.target || verb,
+        : groupCalls ? [summary.verb, summary.targetIsPath && summary.target ? shortenHome(summary.target, pathContext.home) : summary.target].filter(Boolean).join(" ")
+        : data.shell?.command || data.command || (summary.targetIsPath && data.filePath ? shortenHome(data.filePath, pathContext.home) : undefined) || summary.target || verb,
         mono: !summary.agent && Boolean(summary.targetIsPath || data.command || data.shell?.command) }}
       detailsSubtitle={drawsImage ? imageMenuSubtitle(imageFile, filePath) : [data.status, ...summaryMeta]}
       detailsTone={running ? "accent" : failed ? "danger" : summary.tone === "warning" ? "warning" : "muted"}
@@ -376,7 +419,7 @@ export function ToolCallout({
           <GroupedPreview calls={groupCalls} resolvePath={resolvePath} tokens={tokens} compact={compact} imageFile={imageFile}
             path={filePath ? resolvePath(filePath) : undefined} revealFile={revealFile} displayPath={displayPath} onViewImage={openViewer} />
         ) : (
-          <ToolPreviewContent key={data.callId ?? data.id} data={data} resolvePath={resolvePath} tokens={tokens} compact={compact}
+          <ToolPreviewContent key={data.callId ?? data.id} data={data} translationAgentId={placement?.agentId ?? selectionScope?.agentId} resolvePath={resolvePath} tokens={tokens} compact={compact}
             imageFile={imageFile} drawsImage={drawsImage} revealFile={revealFile} displayPath={displayPath}
             onViewImage={openViewer} />
         )
@@ -384,9 +427,10 @@ export function ToolCallout({
     />
   );
   const body = expanded ? (
-    <FadeIn style={[styles.body, { backgroundColor: tokens.row.outputBg },
+    <FadeIn style={[styles.body, leading && { marginLeft: leading.width }, { backgroundColor: tokens.row.outputBg },
       summary.tone === "warning" && { borderWidth: 1, borderColor: permissionBorder(tokens) }]}>
-      <View {...surfaceProps(selectionSurface)} style={styles.bodyInner}>
+      <View ref={scopeData ? bindSelectionScope : undefined}
+        {...(scopeData ? surfaceProps(selectionSurface, { dataSet: scopeData } as never) : selectionSurface)} style={styles.bodyInner}>
         {groupCalls ? (
           <GroupedToolDetails calls={groupCalls} tokens={tokens} compact={compact} imageFile={imageFile}
             revealFile={revealFile} displayPath={displayPath} />
@@ -405,6 +449,15 @@ export function ToolCallout({
     </FadeIn>
   ) : null;
 
+  if (expanded && stickyStep && stickySource) {
+    return (
+      <DetailsStickyCard source={stickySource} tokens={tokens} stripe={stickyStep.stripe} header={header} handle={stickyHandle}>
+        {viewer}
+        {body}
+      </DetailsStickyCard>
+    );
+  }
+
   // An opened card on a host with the sticky header API pins its row while it
   // scrolls past (S6). Collapsed rows never reach the hook.
   if (expanded && STICKY_SUPPORTED) {
@@ -422,11 +475,13 @@ export function ToolCallout({
       {viewer}
       {summary.errorLine && !expanded ? (
         <Text
-          {...(surfaceProps(selectionSurface, codeSurface) as object)}
-          selectable
+          ref={scopeData ? bindSelectionScope : undefined}
+          {...(surfaceProps(selectionSurface, codeSurface, ...(scopeData ? [{ dataSet: scopeData } as never] : [])) as object)}
+          selectable {...selectionColorProps()}
           numberOfLines={1}
           style={[
             styles.errorLine,
+            leading && { marginLeft: leading.width },
             {
               color: tokens.row.meta,
               fontFamily: tokens.fontMono,
@@ -489,11 +544,22 @@ function isMarkdownWrite(data: ToolCallView): boolean {
  * body and the error. Also drawn outside a panel's layer by the settings page
  * (`PreviewPanelSample`), so a reader sees the panel options take effect.
  */
-export function ToolPreviewContent({ data, resolvePath, drawsImage = false, pager, ...rest }: Omit<ToolBodyProps, "preview"> & {
+type PreviewContentProps = Omit<ToolBodyProps, "preview"> & {
+  translationAgentId?: string;
   resolvePath: ResolvePath;
   drawsImage?: boolean;
   pager?: React.ReactNode;
-}) {
+};
+type PreviewTranslations = Partial<Record<ToolTranslationTarget["id"], InlineTranslationState>>;
+
+export function ToolPreviewContent(props: PreviewContentProps) {
+  const targets = toolTranslationTargets(props.data);
+  return <TranslationGroup key={props.data.callId ?? props.data.id} agentId={props.translationAgentId} fields={targets}>
+    {(translations) => <ToolPreviewContentInner {...props} translations={translations} />}
+  </TranslationGroup>;
+}
+
+function ToolPreviewContentInner({ data, resolvePath, drawsImage = false, pager, translations, translationAgentId, ...rest }: PreviewContentProps & { translations: PreviewTranslations }) {
   const { tokens, imageFile } = rest;
   const [raw, setRaw] = useState(false);
   const createAgent = data.tool === "paseo" && data.paseo?.tool === "create_agent" && Boolean(data.paseo.createAgent);
@@ -501,9 +567,15 @@ export function ToolPreviewContent({ data, resolvePath, drawsImage = false, page
   const subAgent = data.tool === "sub_agent" && Boolean(data.subAgent);
   const markdown = isMarkdownWrite(data) || agentTool || subAgent || Boolean(data.agentStatus);
   const streaming = data.status === "running";
+  const values: Partial<Record<ToolTranslationTarget["id"], string>> = {};
+  for (const id of ["prompt", "result"] as const) {
+    const state = translations[id];
+    if (state?.active && state.view?.status === "done") values[id] = state.view.result.translation;
+  }
+  const bodyData = translatedTool(data, values);
   const questions = useMemo(() => readUserQuestions(data), [data]);
   if (questions) {
-    return <UserQuestions key={data.callId ?? data.id} questions={questions} tokens={tokens}
+    return <UserQuestions key={data.callId ?? data.id} questions={questions} tokens={tokens} translationAgentId={translationAgentId}
       rawBody={<ToolBody data={data} {...rest} preview raw />}
       renderHeader={(controls) => <ToolPreviewActions call={data} resolvePath={resolvePath} tokens={tokens}
         title={data.name ?? "Questions"} streaming={streaming} pager={controls} fitControls />}>
@@ -512,17 +584,18 @@ export function ToolPreviewContent({ data, resolvePath, drawsImage = false, page
   }
   const content = (
     <>
-      <ToolPreviewActions call={data} resolvePath={resolvePath} tokens={tokens} streaming={streaming} fitControls={agentTool || subAgent || Boolean(data.agentStatus)}
+      <ToolPreviewActions call={data} resolvePath={resolvePath} tokens={tokens} translations={raw ? {} : translations} streaming={streaming} fitControls={agentTool || subAgent || Boolean(data.agentStatus)}
         pager={<>{pager}{markdown ? <ToolbarButton icon={raw ? "FileText" : "Code"}
           label={raw ? "Render Markdown" : "Show raw text"} onPress={() => setRaw((value) => !value)} tokens={tokens} /> : null}</>}
         meta={drawsImage ? <ImageMeta file={imageFile ?? null} tokens={tokens} /> : undefined} />
       <HoverPreviewBody key={markdown && !raw ? "markdown" : "raw"} streaming={streaming}>
+        {!raw && Object.entries(translations).map(([id, state]) => state ? <InlineTranslationNoticeWithTokens key={id} state={state} tokens={tokens} /> : null)}
         {data.filePath ? <PreviewPath path={resolvePath(data.filePath)} tokens={tokens} /> : null}
-        {data.agentStatus ? <AgentStatusView data={data.agentStatus} tokens={tokens} raw={raw} compact={rest.compact} /> :
-          subAgent ? <SubAgentView data={data} tokens={tokens} raw={raw} compact={rest.compact} /> :
-          agentTool ? <PaseoToolCallout data={data.paseo!} tokens={tokens} raw={raw} compact={rest.compact} error={data.error} /> :
+        {data.agentStatus ? <AgentStatusView data={(raw ? data : bodyData).agentStatus!} tokens={tokens} raw={raw} compact={rest.compact} translationAgentId={translationAgentId} /> :
+          subAgent ? <SubAgentView data={raw ? data : bodyData} tokens={tokens} raw={raw} compact={rest.compact} /> :
+          agentTool ? <PaseoToolCallout data={(raw ? data : bodyData).paseo!} tokens={tokens} raw={raw} compact={rest.compact} error={data.error} translationAgentId={translationAgentId} /> :
           markdown && !raw ? <MarkdownView text={data.code!} tokens={tokens} variant="document"
-          streaming={streaming} size={blockProseBase(tokens.typography)} /> : <ToolBody data={data} {...rest} preview />}
+          streaming={streaming} size={blockProseBase(tokens.typography)} /> : <ToolBody data={bodyData} {...rest} preview />}
         {data.error && !drawsOwnError(data) ? <PreviewError text={data.error} tokens={tokens} quiet={data.rejected} /> : null}
       </HoverPreviewBody>
     </>
@@ -558,6 +631,26 @@ function GroupedPreview({ calls, resolvePath, path, onViewImage, ...rest }: Grou
     </>
   );
 }
+
+/**
+ * One file's folded edits in the details panel (`turn-work-card.tsx`): the
+ * merged-row preview, one call at a time, so only the call on view is parsed
+ * and highlighted.
+ */
+export function FileEditsPreview({ calls, resolvePath, tokens, compact }: {
+  calls: readonly ToolCallView[];
+  resolvePath: ResolvePath;
+  tokens: ExtendedThemeTokens;
+  compact: boolean;
+}) {
+  const first = calls[0];
+  if (!first) return null;
+  const path = first.filePath ? resolvePath(first.filePath) : undefined;
+  if (calls.length === 1) return <ToolPreviewContent data={first} resolvePath={resolvePath} tokens={tokens} compact={compact} />;
+  return <GroupedPreview calls={calls} resolvePath={resolvePath} tokens={tokens} compact={compact} path={path} onViewImage={noop} />;
+}
+
+function noop() {}
 
 /** Keyed by call at the call site, so a page's own state (folded lines) does not carry over to the next. */
 function GroupedCallBody({ call, preview, onViewImage, ...rest }: Omit<GroupedBodyProps, "calls"> & {
@@ -663,7 +756,8 @@ function ToolCopyButtons({ call, resolvePath, tokens }: {
  * The preview's toolbar: a merged row's pager at the left, the tool's icon
  * and name or picture size in the middle, and copies at the right.
  */
-function ToolPreviewActions({ call, resolvePath, tokens, title, pager, meta, streaming = false, fitControls = false }: {
+function ToolPreviewActions({ call, resolvePath, tokens, title, pager, meta, translations, streaming = false, fitControls = false }: {
+  translations?: PreviewTranslations;
   call: ToolCallView;
   resolvePath: ResolvePath;
   tokens: ExtendedThemeTokens;
@@ -690,13 +784,14 @@ function ToolPreviewActions({ call, resolvePath, tokens, title, pager, meta, str
     <HoverPreviewHeader tokens={tokens} streaming={streaming} icon={meta ? "Image" : <RowIcon
       name={agent?.icon ?? toolCallIconName(call)} color={agentColor ?? tokens.foregroundMuted} />}
       iconLabel={title ?? agentLabel ?? (call.tool === "activity" ? toolbarLabel(summary.verb, language) : summary.verb)}
-      left={pager} center={meta} fitControls={fitControls}>
+      left={<>{pager}{translations && translationGroupState(translations) ? <InlineTranslateButtonWithTokens state={translationGroupState(translations)!} tokens={tokens} timeline
+        testID={call.paseo?.createAgent ? "create-agent-prompt-translate" : "detail-translate"} /> : null}</>} center={meta} fitControls={fitControls}>
       <View style={styles.previewActions}>
         {call.paseo?.sendAgentPrompt ? <>
-          <ToolbarCopyButton text={call.paseo.sendAgentPrompt.prompt} label="Copy prompt" tokens={tokens} />
+          <ToolbarCopyButton text={call.paseo.sendAgentPrompt.prompt} icon={COPY_ICON.prompt} label="Copy prompt" tokens={tokens} />
           <ToolCopyButtons call={call} resolvePath={resolvePath} tokens={tokens} />
         </> : call.tool === "paseo" && call.paseo?.createAgent ?
-          <ToolbarCopyButton text={call.paseo.createAgent.initialPrompt} label="Copy prompt" tokens={tokens} /> :
+          <ToolbarCopyButton text={call.paseo.createAgent.initialPrompt} icon={COPY_ICON.prompt} label="Copy prompt" tokens={tokens} /> :
           <ToolCopyButtons call={call} resolvePath={resolvePath} tokens={tokens} />}
       </View>
     </HoverPreviewHeader>
@@ -730,6 +825,7 @@ function MetaPath({
       compact={compact}
       copyOnHover={false}
       budget={compact ? 20 : 32}
+      boldName
       style={{ fontSize: tokens.typography.block.meta.size, color: palette?.meta ?? tokens.foregroundMuted }}
     />
   );
@@ -1089,15 +1185,14 @@ function ToolBody({ data, tokens: given, compact, imageFile, revealFile, display
               ) : null}
             </View>
           ) : null}
+          {/* Codex reports an opened page by its address alone: draw it as its one result. */}
+          {!data.search.webResults && data.search.toolName === "web_search" && parseWebLink(data.search.query) ? (
+            <WebResultRow title="" url={parseWebLink(data.search.query)!.href} tokens={tokens}
+              titleStyle={styles.plainText} metaSize={tokens.typography.block.meta.size} />
+          ) : null}
           {data.search.webResults?.map((row, index) => (
-            <View key={`${index}:${row.url}`} style={styles.webRow}>
-              <SelectableText numberOfLines={1} style={styles.plainText}>
-                {row.title}
-              </SelectableText>
-              <SelectableText {...(codeSurface as object)} numberOfLines={1} style={[styles.monoText, styles.mutedColor]}>
-                {row.url}
-              </SelectableText>
-            </View>
+            <WebResultRow key={`${index}:${row.url}`} title={row.title} url={row.url} tokens={tokens}
+              titleStyle={styles.plainText} metaSize={tokens.typography.block.meta.size} />
           ))}
           {/* A web search's own answer: markdown prose, drawn as a fetch's result is. */}
           {data.search.annotations ? (
@@ -1110,7 +1205,8 @@ function ToolBody({ data, tokens: given, compact, imageFile, revealFile, display
               </SelectableText>
             </View>
           ) : null}
-          {!data.search.files && !data.search.webResults && !data.search.annotations && !data.search.content ? (
+          {!data.search.files && !data.search.webResults && !data.search.annotations && !data.search.content
+            && !(data.search.toolName === "web_search" && parseWebLink(data.search.query)) ? (
             <Text style={styles.silentText}>{isRunning ? "Searching…" : "No results."}</Text>
           ) : null}
         </View>
@@ -1260,7 +1356,6 @@ interface BodyStyles {
   inlineRow: ViewStyle;
   flex: ViewStyle;
   fileRow: ViewStyle;
-  webRow: ViewStyle;
   terminalWindow: ViewStyle;
   terminalOutput: TextStyle;
   commandLine: TextStyle;
@@ -1286,7 +1381,6 @@ function useBodyStyles(tokens: ExtendedThemeTokens, compact: boolean): BodyStyle
         inlineRow: { flexDirection: "row", alignItems: "center", gap: 6 },
         flex: { flex: 1, minWidth: 0 },
         fileRow: { height: compact ? 28 : 24, justifyContent: "center" },
-        webRow: { gap: 1 },
         // The opened body is already the code surface (S7 3.1): command
         // output sits on it directly, with no inner panel.
         terminalWindow: {

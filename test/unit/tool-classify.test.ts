@@ -117,6 +117,47 @@ describe("classifyTool", () => {
     expect(classifyTool(call("Glob", { type: "search", query: "*.ts", durationMs: 12, durationSeconds: 9 })).durationMs).toBe(12);
   });
 
+  it("reads OpenCode's websearch, which the daemon passes on as an unknown tool, as a web search", () => {
+    const output = [
+      "## [View · React Native](https://reactnative.dev/docs/view)",
+      "Published: 2025-01-01T00:00:00.000Z",
+      "",
+      "Body text with an inline [link](https://noise.dev/x) that is not a hit.",
+      "",
+      "## [Understanding React Native&#39;s onLayout](https://picostitch.com/blog/onlayout)",
+      "",
+      "More text.",
+    ].join("\n");
+    const view = classifyTool(call("websearch", { type: "unknown", input: { query: "react native onLayout" }, output }));
+    expect(view.tool).toBe("search");
+    expect(view.search?.toolName).toBe("web_search");
+    expect(view.search?.query).toBe("react native onLayout");
+    expect(view.search?.webResults).toEqual([
+      { title: "View · React Native", url: "https://reactnative.dev/docs/view" },
+      { title: "Understanding React Native's onLayout", url: "https://picostitch.com/blog/onlayout" },
+    ]);
+    expect(view.search?.content).toBeUndefined();
+  });
+
+  it("reads an Oh My Pi web search's numbered hits as its results", () => {
+    const content = "Note: answered by Exa\n[1] View · React Native\n    https://reactnative.dev/docs/view\n[2] N/A\n    https://example.dev/a";
+    const view = classifyTool(call("web_search", { type: "search", query: "onLayout", toolName: "web_search", content }));
+    expect(view.search?.webResults).toEqual([
+      { title: "View · React Native", url: "https://reactnative.dev/docs/view" },
+      { title: "https://example.dev/a", url: "https://example.dev/a" },
+    ]);
+    expect(view.search?.content).toBeUndefined();
+    // Hits the daemon reported keep the row free of the text that repeats them.
+    const reported = classifyTool(call("web_search", { type: "search", query: "onLayout", toolName: "web_search", content,
+      webResults: [{ title: "View", url: "https://reactnative.dev/docs/view" }] }));
+    expect(reported.search?.webResults).toEqual([{ title: "View", url: "https://reactnative.dev/docs/view" }]);
+    expect(reported.search?.content).toBeUndefined();
+    // A grep's output is never read as links, whatever it holds.
+    const grep = classifyTool(call("Grep", { type: "search", query: "x", toolName: "grep", content }));
+    expect(grep.search?.webResults).toBeUndefined();
+    expect(grep.search?.content).toBe(content);
+  });
+
   it("splits Codex's `server.tool` MCP name and unwraps its result", () => {
     const view = classifyTool(
       call("custom.run", {

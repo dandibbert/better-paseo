@@ -7,7 +7,7 @@ import { describe, expect, it } from "vitest";
 import type { Tokens } from "../../client/vendor/marked";
 import { lexBlock } from "../../client/components/markdown/lex";
 import { isImagePath } from "../../client/image-file";
-import { localImagePath, localPath, splitLocalImages } from "../../client/components/markdown/render/local-path";
+import { localImagePath, localPath, resolveLocalLink, splitLocalImages } from "../../client/components/markdown/render/local-path";
 
 function paragraphTokens(markdown: string) {
   const [block] = lexBlock(markdown);
@@ -33,6 +33,10 @@ describe("localImagePath", () => {
 });
 
 describe("localPath", () => {
+  it("preserves home-relative destinations and resolves ordinary relative links", () => {
+    expect(resolveLocalLink("~/notes/plan.md", "/repo")).toBe("~/notes/plan.md");
+    expect(resolveLocalLink("docs/plan.md", "/repo")).toBe("/repo/docs/plan.md");
+  });
   it("takes a path link as the file it names", () => {
     expect(localPath("/Users/me/.agents/handoffs/handoff-20261012-083930.md")).toBe(
       "/Users/me/.agents/handoffs/handoff-20261012-083930.md",
@@ -54,6 +58,18 @@ describe("localPath", () => {
     expect(localPath("#usage")).toBeNull();
     expect(localPath("here")).toBeNull();
     expect(localPath("/tmp/%E0%A4%A.md")).toBeNull();
+  });
+
+  it("refuses network shares and device paths (issue #25)", () => {
+    expect(localPath("\\\\server\\share\\a.png")).toBeNull();
+    expect(localPath("\\\\?\\UNC\\server\\share\\a.png")).toBeNull();
+    expect(localPath("\\\\?\\C:\\tmp\\a.png")).toBeNull();
+    expect(localPath("\\\\.\\pipe\\a.png")).toBeNull();
+    expect(localPath("\\??\\UNC\\server\\share\\a.png")).toBeNull();
+    expect(localPath("/??/UNC/server/share/a.png")).toBeNull();
+    expect(localPath("\\??\\C:\\tmp\\a.png")).toBeNull();
+    expect(localPath("file:////server/share/a.png")).toBeNull();
+    expect(localPath("%5C%5Cserver%5Cshare%5Ca.png")).toBeNull();
   });
 });
 
@@ -102,5 +118,14 @@ describe("isImagePath", () => {
     expect(isImagePath("shot.png:1-20")).toBe(true);
     expect(isImagePath("/tmp/notes.txt")).toBe(false);
     expect(isImagePath("/tmp/a.png.d/notes")).toBe(false);
+  });
+
+  it("never treats a network share or device path as an image (issue #25)", () => {
+    expect(isImagePath("\\\\server\\share\\a.png")).toBe(false);
+    expect(isImagePath("//server/share/a.png")).toBe(false);
+    expect(isImagePath("\\\\?\\UNC\\server\\share\\a.png")).toBe(false);
+    expect(isImagePath("\\\\.\\pipe\\a.png")).toBe(false);
+    expect(isImagePath("\\??\\UNC\\server\\share\\a.png")).toBe(false);
+    expect(isImagePath("/??/UNC/server/share/a.png")).toBe(false);
   });
 });

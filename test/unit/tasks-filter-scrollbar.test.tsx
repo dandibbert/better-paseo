@@ -1,3 +1,4 @@
+vi.mock("../../client/state/home-directory", () => ({ useHomeDirectory: () => undefined }));
 import React from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import TestRenderer, { act } from "react-test-renderer";
@@ -5,7 +6,7 @@ import { Animated } from "react-native";
 import "./helpers/quiet-renderer";
 
 vi.mock("react-native", async () => import("./helpers/rn-mock"));
-vi.mock("@getpaseo/plugin/client/react-native", async () => {
+vi.mock("@getpaseo/plugin/client/ui", async () => {
   const rn = await import("./helpers/rn-mock");
   return { ScrollView: rn.ScrollView, TextInput: rn.TextInput, Icon: () => null };
 });
@@ -238,7 +239,7 @@ describe("project filter", () => {
     });
     const find = (id: string) => renderer!.root.find((node) => typeof node.type === "string" && node.props.testID === id);
     const order = renderer!.root.findAll((node) => typeof node.type === "string" && ["filter-sheet-agents-toggle", "filter-sheet-projects-toggle", "filter-sheet-workspaces-toggle", "filter-sheet-labels-toggle"].includes(node.props.testID)).map((node) => node.props.testID);
-    expect(order).toEqual(["filter-sheet-agents-toggle", "filter-sheet-projects-toggle", "filter-sheet-workspaces-toggle", "filter-sheet-labels-toggle"]);
+    expect(order).toEqual(["filter-sheet-agents-toggle", "filter-sheet-labels-toggle", "filter-sheet-projects-toggle", "filter-sheet-workspaces-toggle"]);
     expect(find("filter-sheet-projects-toggle").props.accessibilityLabel).toBe("项目");
     act(() => find("filter-sheet-projects-toggle").props.onPress());
     const input = find("filter-sheet-project-header").find((node) => typeof node.type === "string" && node.props.accessibilityLabel === BOARD_STRINGS.zh.sheetSearch);

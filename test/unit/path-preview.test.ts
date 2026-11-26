@@ -8,7 +8,7 @@ vi.mock("react-native", async () => {
   return import("./helpers/rn-mock");
 });
 const clipboard = vi.hoisted(() => ({ copyText: vi.fn(async () => {}), show: vi.fn(), error: vi.fn() }));
-vi.mock("@getpaseo/plugin/client/react-native", async () => {
+vi.mock("@getpaseo/plugin/client/ui", async () => {
   const rn = await import("./helpers/rn-mock");
   return {
     Icon: rn.View,
@@ -34,9 +34,10 @@ vi.mock("../../client/web", () => ({
     return () => {};
   },
   openPreviewLayer: () => () => {},
+  pinTooltipLayer: () => () => {},
 }));
 import { buildThemeTokens } from "../../client/components/theme-tokens";
-import { PathText } from "../../client/ui/path-text";
+import { PathContext, PathText } from "../../client/ui/path-text";
 import { PREVIEW_OPEN_MS } from "../../client/ui/hover-preview";
 import { resetEnhancerPreferences } from "../../client/preferences";
 
@@ -57,6 +58,54 @@ beforeEach(() => {
 });
 afterEach(() => {
   vi.useRealTimers();
+});
+
+describe("path action accessibility", () => {
+  it("announces opening or revealing when the path is clickable", () => {
+    let renderer!: ReturnType<typeof TestRenderer.create>;
+    act(() => { renderer = TestRenderer.create(React.createElement(PathText, { path: "/tmp/project/a.ts", tokens, onReveal() {} })); });
+    const path = renderer.root.find((node) => (node.type as unknown) === "Pressable" && node.props.accessibilityLabel === "/tmp/project/a.ts");
+    expect(path.props.accessibilityHint).toBe("Opens or reveals the path");
+    act(() => renderer.unmount());
+  });
+});
+
+describe("home path display", () => {
+  it("shows the shortened path while opening and copying the absolute path", async () => {
+    const reveal = vi.fn();
+    const path = "/home/alice/project/a.ts";
+    let renderer!: ReturnType<typeof TestRenderer.create>;
+    act(() => { renderer = TestRenderer.create(React.createElement(PathContext.Provider,
+      { value: { roots: [], mode: "absolute", home: "/home/alice", reveal } },
+      React.createElement(PathText, { path, tokens }))); });
+    expect(JSON.stringify(renderer.toJSON())).toContain("~/project/a.ts");
+    const button = renderer.root.find((node) => (node.type as unknown) === "Pressable" && node.props.accessibilityLabel === path);
+    act(() => button.props.onPress());
+    expect(reveal).toHaveBeenCalledWith(path);
+    act(() => pointer.rowEnter?.());
+    const copy = button.find((node) => (node.type as unknown) === "Pressable" && node.props.accessibilityLabel === "Copy path");
+    await act(async () => copy.props.onPress());
+    expect(clipboard.copyText).toHaveBeenCalledWith(path);
+    act(() => renderer.unmount());
+  });
+});
+
+describe("path name emphasis", () => {
+  it("bolds only the final segment while keeping the original path action", () => {
+    const reveal = vi.fn();
+    let renderer!: ReturnType<typeof TestRenderer.create>;
+    act(() => { renderer = TestRenderer.create(React.createElement(PathText, {
+      path: "/tmp/project/.worktrees/work-details-dismiss", tokens, boldName: true, onReveal: reveal,
+    })); });
+    const button = renderer.root.find((node) => (node.type as unknown) === "Pressable" &&
+      node.props.accessibilityLabel === "/tmp/project/.worktrees/work-details-dismiss");
+    const bold = button.find((node) => (node.type as unknown) === "Text" && node.props.style?.fontWeight === "700");
+    expect(bold.children).toEqual(["work-details-dismiss"]);
+    expect(JSON.stringify(renderer.toJSON())).toContain("/tmp/project/.worktrees/");
+    act(() => button.props.onPress());
+    expect(reveal).toHaveBeenCalledWith("/tmp/project/.worktrees/work-details-dismiss");
+    act(() => renderer.unmount());
+  });
 });
 
 describe("a path's desktop preview", () => {

@@ -5,10 +5,17 @@ import "./helpers/quiet-renderer";
 
 vi.mock("react-native", () => import("./helpers/rn-mock"));
 vi.mock("@getpaseo/plugin/client", async (original) => {
-  const rpc = async () => ({ state: "idle" });
-  return { ...await original<object>(), useRpc: () => rpc };
+  const rpc = async () => ({ state: "idle", entries: [], error: null });
+  // Every plugin surface renders under its installation's Paseo client.
+  const paseo = {};
+  return {
+    ...await original<object>(),
+    usePaseo: () => paseo,
+    useRpc: () => rpc,
+    useSettings: () => ({ status: "loading", saving: false, saveError: null, save: async () => true, reset: async () => true }),
+  };
 });
-vi.mock("@getpaseo/plugin/client/react-native", async () => {
+vi.mock("@getpaseo/plugin/client/ui", async () => {
   const rn = await import("./helpers/rn-mock");
   return { Icon: rn.View, TextInput: rn.TextInput, ScrollView: rn.ScrollView };
 });
@@ -17,12 +24,15 @@ vi.mock("../../client/settings-preview", () => ({ SettingsPreview: () => null })
 vi.mock("../../client/tasks/chunk/load", () => ({ TasksSettingsPanel: () => null }));
 vi.mock("../../client/ui/wide-host-column", () => ({ useWideHostColumn() {} }));
 
+import { Section, SettingRow } from "../../client/settings-controls";
 import { BetterPaseoSettingsPage } from "../../client/settings-page";
 import { SettingsPreview } from "../../client/settings-preview";
-import { resetEnhancerPreferences } from "../../client/preferences";
+import { DEFAULT_PREFERENCES, getEnhancerPreferences, resetEnhancerPreferences, updateEnhancerPreferences } from "../../client/preferences";
 import { SETTINGS_STRINGS } from "../../client/i18n/settings-page-strings";
 import { StyleSheet } from "./helpers/rn-mock";
+import { hostChildren, measureHostTree } from "./helpers/yoga-host-layout";
 import { setSettingsTab } from "../../client/settings-tab";
+import { openTranslationSettings, registerTranslationSettingsOpener } from "../../client/translation/navigation";
 import {
   RECHECK_MS,
   resetHostAppearanceForTests,
@@ -56,6 +66,83 @@ afterEach(() => {
   resetHostAppearanceForTests();
   vi.restoreAllMocks();
   delete (globalThis as { __rnMockOS?: string }).__rnMockOS;
+});
+
+describe("translation settings placement", () => {
+  it.each([[500, false, "en"], [500, false, "zh"], [320, true, "en"], [320, true, "zh"]] as const)("keeps timeline choices readable at %i points, compact %s, %s", async (width, compact, language) => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = "android";
+    resetEnhancerPreferences();
+    updateEnhancerPreferences({ language });
+    setSettingsTab("display");
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(BetterPaseoSettingsPage, {
+        theme: { colors }, layout: { platform: "android", compact }, host: { id: "host" },
+      } as never));
+    });
+    const row = renderer!.root.findAllByType(SettingRow).find((item) => item.props.title === SETTINGS_STRINGS[language].timelineTitle)!;
+    const root = hostChildren(row)[0]!;
+    const frames = measureHostTree(root, { width, wrapText: true });
+    const choices = root.findAll((node) => typeof node.type === "string" && node.props.accessibilityRole === "radio");
+    expect(choices).toHaveLength(3);
+    for (const choice of choices) {
+      expect(frames.get(choice)!.width).toBeGreaterThan(80);
+      expect(frames.get(choice)!.height).toBeLessThan(400);
+    }
+  });
+
+  it("opens at the translation section when requested from the popup", async () => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = "ios";
+    resetEnhancerPreferences();
+    const paseo = {};
+    const open = vi.fn();
+    const release = registerTranslationSettingsOpener(paseo, open);
+    openTranslationSettings(paseo as never);
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(BetterPaseoSettingsPage, {
+        theme: { colors }, layout: { platform: "ios", compact: true }, host: { id: "host" },
+      } as never));
+    });
+    const sections = renderer!.root.findAllByType(Section);
+    expect(sections[0]?.props.title).toBe("Translation");
+    expect(sections.filter((section) => section.props.title === "Translation")).toHaveLength(1);
+    expect(open).toHaveBeenCalledWith("chat-presentation");
+    release();
+  });
+
+  it("places its own section immediately after the timeline mode", async () => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = "web";
+    resetEnhancerPreferences();
+    setSettingsTab("display");
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(BetterPaseoSettingsPage, {
+        theme: { colors }, layout: { platform: "web", compact: false }, host: { id: "host" },
+      } as never));
+    });
+    const sections = renderer!.root.findAllByType(Section);
+    const generalIndex = sections.findIndex((section) => section.props.title === SETTINGS_STRINGS.en.sectionGeneral);
+    expect(generalIndex).toBeGreaterThanOrEqual(0);
+    const general = sections[generalIndex]!;
+    expect(general.findAllByType(SettingRow).at(-1)?.props.title).toBe(SETTINGS_STRINGS.en.timelineTitle);
+    expect(sections[generalIndex + 1]?.props.title).toBe("Translation");
+  });
+
+  it("restores display defaults only after the scoped confirmation", async () => {
+    resetEnhancerPreferences();
+    setSettingsTab("display");
+    const hoverPreview = !DEFAULT_PREFERENCES.hoverPreview;
+    updateEnhancerPreferences({ language: "en", hoverPreview });
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(BetterPaseoSettingsPage, {
+        theme: { colors }, layout: { platform: "web", compact: false }, host: { id: "host" },
+      } as never));
+    });
+    const button = (label: string) => renderer!.root.find((node) => typeof node.type === "string" && node.props.accessibilityLabel === label);
+    expect(renderer!.root.findAll((node) => typeof node.type === "string" && node.props.accessibilityLabel === "Reset · Restore default translation settings")).toHaveLength(0);
+    await act(async () => button("Reset · Reset all settings").props.onPress());
+    expect(getEnhancerPreferences().hoverPreview).toBe(hoverPreview);
+    await act(async () => button("Confirm · Reset all settings").props.onPress());
+    expect(getEnhancerPreferences().hoverPreview).toBe(DEFAULT_PREFERENCES.hoverPreview);
+  });
 });
 
 describe("settings preview host typography", () => {

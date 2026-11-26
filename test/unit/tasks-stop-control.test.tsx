@@ -1,3 +1,4 @@
+vi.mock("../../client/state/home-directory", () => ({ useHomeDirectory: () => undefined }));
 import { afterEach, describe, expect, it, vi } from "vitest";
 import React from "react";
 import TestRenderer, { act, type ReactTestInstance, type ReactTestRenderer } from "react-test-renderer";
@@ -6,7 +7,7 @@ vi.hoisted(() => {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 });
 vi.mock("react-native", async () => import("./helpers/rn-mock"));
-vi.mock("@getpaseo/plugin/client/react-native", async () => {
+vi.mock("@getpaseo/plugin/client/ui", async () => {
   const react = await import("react");
   return {
     Icon: (props: Record<string, unknown>) => react.createElement("Icon", props),
@@ -94,7 +95,8 @@ describe("split Stop button", () => {
     for (const label of ["Stop", "Stop options"]) {
       const style = flat(button(root, label));
       // No adjoining native borders, per-side colours or negative overlap.
-      expect(Object.keys(style).filter((key) => /^(border.*(?:Width|Color)|boxShadow|marginLeft)$/.test(key))).toEqual([]);
+      expect(Object.keys(style).filter((key) => /^(border.*(?:Width|Color)|boxShadow|marginLeft)$/.test(key) && !(label === "Stop" && key === "borderWidth"))).toEqual([]);
+      if (label === "Stop") expect(style.borderWidth).toBe(0);
     }
     expect(flat(host(root, "task-card-stop-divider"))).toMatchObject({
       position: "absolute", left: 0, top: 0, bottom: 0, width: 0.5,
@@ -146,7 +148,7 @@ describe("split Stop button", () => {
     const root = await render();
     await act(async () => button(root, "Stop options").props.onPress());
     await act(async () => root.find((node) => (node.type as unknown) === "Modal").props.onShow());
-    expect(flat(host(root, "task-card-stop-menu-anchor"))).toMatchObject({ left: 8, top: 192, opacity: 1 });
+    expect(flat(host(root, "task-card-stop-menu-anchor"))).toMatchObject({ left: 8, top: 184, opacity: 1 });
   });
 
   it("keeps the web menu inside its trigger boundary without a modal backdrop", async () => {
@@ -179,6 +181,22 @@ describe("split Stop button", () => {
     const root = await render({ card: { ...CARD, children: [] } });
     expect(flat(button(root, "Stop"))).toMatchObject({ borderWidth: 0.5, borderColor: THEME.colors.statusDanger });
     expect(root.findAll((node) => typeof node.type === "string" && node.props.testID === "task-card-stop-divider")).toHaveLength(0);
+  });
+
+  // A removed borderWidth reaches Android as NaN; the overflow-hidden half then clips to a NaN padding box and its icon and label vanish.
+  it.each([
+    ["a running task starts subtasks", { children: [] }, "Stop"],
+    ["an idle parent resumes", { stoppable: false, waitingOnSubtasks: true }, "Stop subtasks"],
+  ] satisfies [string, Partial<typeof CARD>, string][])("sets the stop half's border width to 0 rather than removing it when %s", async (_, before, label) => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = "android";
+    const root = await render({ card: { ...CARD, ...before } });
+    const single = flat(button(root, label));
+    expect(single.borderWidth).toBe(0.5);
+    await act(async () => renderer!.update(<TaskCardView {...(renderer!.root.findByType(TaskCardView).props as TaskCardViewProps)} card={CARD} />));
+    expect(host(root, "task-card-stop-divider")).toBeTruthy();
+    const split = flat(button(root, "Stop"));
+    expect(split.borderWidth).toBe(0);
+    expect(split.overflow).toBe("hidden");
   });
 
   it.each(["ios", "android", "web"])("offers a single children-only stop for an idle parent on %s", async (os) => {

@@ -1,5 +1,9 @@
 # Developing Better Paseo
 
+**English** | [简体中文](development-zh.md)
+
+[← Back to README](../README.md)
+
 ## Project structure
 
 ```text
@@ -36,9 +40,13 @@ better-paseo/
 npm install
 npm run typecheck
 npm test
+npm test markdown   # after changing Markdown rendering
 npm run check:hermes
+npm run build:client
 paseo plugin reload better-paseo
 ```
+
+`npm test` runs the unit suite without the two exhaustive Markdown sweeps (`test/unit/markdown-blocks-exhaustive.test.ts` and `test/unit/markdown-streaming-height-exhaustive.test.ts`), which feed every stream fixture through the Markdown splitter and lexer one character at a time and take minutes. Run them with `npm test markdown` (or `npm run test:markdown`) after changing Markdown rendering: `client/components/markdown/`, `client/vendor/marked.js`, the stream fixtures or the sweeps themselves. CI runs both. Other arguments after `npm test` go to `vitest run` unchanged. `npm run test:local` is the same as `npm test`.
 
 Paseo installs the plugin from GitHub, so a change on a local branch is not what a client runs
 until it is pushed and the plugin is updated (`paseo plugin update better-paseo`).
@@ -137,8 +145,8 @@ Code only leaves the startup path when it leaves the bundle.
 
 ## Media and benchmark production
 
-Video scripts, screenshot tooling, benchmark reports and raw samples are maintained separately in the private [better-paseo-media repository](https://github.com/RoundRedDot/better-paseo-media).
-The public README and gallery use final image assets hosted on this repository's GitHub Releases. Media and raw measurements are not part of a plugin checkout or install.
+Video scripts, screenshot tooling, and media production assets are maintained separately in the private [better-paseo-media repository](https://github.com/RoundRedDot/better-paseo-media).
+The public README and gallery use final image assets hosted on this repository's GitHub Releases. Media assets and raw benchmark measurements are not stored in Git or included in a plugin checkout/install; raw benchmark runs are kept in local, git-ignored directories.
 Unit-test fixtures and pure test helpers stay under `test/`, so plugin tests do not require access to the private repository.
 
 ## Plugin directory release information

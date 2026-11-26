@@ -4,7 +4,7 @@ import { act, create } from "react-test-renderer";
 import "./helpers/quiet-renderer";
 
 vi.mock("react-native", () => import("./helpers/rn-mock"));
-vi.mock("@getpaseo/plugin/client/react-native", () => ({
+vi.mock("@getpaseo/plugin/client/ui", () => ({
   Icon: (props: Record<string, unknown>) => React.createElement("Icon", props),
   copyText: vi.fn(async () => {}),
   useToast: () => ({ show: vi.fn(), error: vi.fn() }),
@@ -31,7 +31,7 @@ describe("Pi provider mark", () => {
     expect(normalizeProvider(input)).toBe(expected);
   });
 
-  it.each([false, true])("uses the daemon's Pi bitmap in the footer and both detail rows (compact=%s)", (compact) => {
+  it.each([false, true])("uses the daemon's Pi bitmap in the footer and the model detail row (compact=%s)", (compact) => {
     const id = "provider:pi";
     expect(MARK_IDS.has(id)).toBe(true);
     expect(MONO_MARKS.has(id)).toBe(true);
@@ -59,7 +59,7 @@ describe("Pi provider mark", () => {
       };
       check(1);
       act(() => { renderer.root.findByProps({ testID: "footer-toolbar" }).props.onLongPress(); });
-      check(3);
+      check(2);
     } finally {
       act(() => renderer.unmount());
     }

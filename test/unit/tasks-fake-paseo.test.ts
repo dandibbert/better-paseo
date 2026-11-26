@@ -27,6 +27,26 @@ describe("fake PaseoApi", () => {
     }
   });
 
+  it("answers a subscribed list only once its subscription is ready, with that snapshot, and rejects it when ready fails", async () => {
+    const fake = createFakePaseo({ agents: [makeAgent({ id: "a", status: "running" })], workspaces: [makeWorkspace({ id: "ws" })] });
+    const release = fake.holdReady();
+    let agentsAnswered = false;
+    let workspacesAnswered = false;
+    const agents = fake.paseo.agents.list({ subscribe: {} }).then((result) => { agentsAnswered = true; return result; });
+    const workspaces = fake.paseo.workspaces.list({ subscribe: {} }).then((result) => { workspacesAnswered = true; return result; });
+    for (let index = 0; index < 16; index += 1) await Promise.resolve();
+    expect([agentsAnswered, workspacesAnswered]).toEqual([false, false]);
+    release();
+    const [agentList, workspaceList] = await Promise.all([agents, workspaces]);
+    expect(await agentList.subscription.ready).toEqual(expect.objectContaining({ entries: agentList.entries }));
+    expect(workspaceList.entries.map((entry) => entry.id)).toEqual(["ws"]);
+    await agentList.subscription.release();
+    await workspaceList.subscription.release();
+    fake.failNextReady(() => true, "subscription failed");
+    await expect(fake.paseo.agents.list({ subscribe: {} })).rejects.toThrow("subscription failed");
+    expect(fake.openSubscriptions()).toBe(0);
+  });
+
   it("filters, sorts and pages agents", async () => {
     const fake = createFakePaseo({
       agents: [
@@ -74,12 +94,38 @@ describe("fake PaseoApi", () => {
     const result = await fake.paseo.agents.list({ filter: { statuses: ["running"] }, subscribe: {} });
     const snapshots: unknown[] = [];
     result.subscription.subscribe({ snapshot: (snapshot) => snapshots.push(snapshot), update() {} });
+    // As the SDK does, subscribing replays the snapshot `ready` resolves with, the very object.
+    expect(snapshots).toHaveLength(1);
+    expect(snapshots[0]).toBe(await result.subscription.ready);
     fake.setAgentSilently(makeAgent({ id: "a", status: "idle" }));
     fake.reconnectSubscriptions();
-    expect(snapshots).toEqual([
-      expect.objectContaining({ entries: [], pageInfo: expect.objectContaining({ hasMore: false }) }),
-    ]);
+    expect(snapshots).toHaveLength(2);
+    expect(snapshots[1]).toEqual(expect.objectContaining({ entries: [], pageInfo: expect.objectContaining({ hasMore: false }) }));
     await result.subscription.release();
+  });
+
+  it("lists the agents of an archived workspace but not those whose workspace record is gone", async () => {
+    const fake = createFakePaseo({
+      agents: [makeAgent({ id: "kept", workspaceId: "ws-archived" }), makeAgent({ id: "orphan", workspaceId: "ws-gone" }), makeAgent({ id: "live", workspaceId: "ws" })],
+      workspaces: [makeWorkspace({ id: "ws" })],
+      archivedWorkspaceIds: ["ws-archived"],
+    });
+    const listed = await fake.paseo.agents.list({ filter: { includeBackground: true } });
+    expect(listed.entries.map((entry) => entry.agent.id).sort()).toEqual(["kept", "live"]);
+    const workspaces = await fake.paseo.workspaces.list({ filter: { includeBackground: true } });
+    expect(workspaces.entries.map((workspace) => workspace.id)).toEqual(["ws"]);
+  });
+
+  it("pages workspaces by key, so one archived after the first page does not shift the next", async () => {
+    const fake = createFakePaseo({
+      workspaces: ["w0", "w1", "w2", "w3"].map((id) => makeWorkspace({ id })),
+      workspacePageSize: 2,
+    });
+    const first = await fake.paseo.workspaces.list({ filter: { includeBackground: true } });
+    expect(first.entries.map((workspace) => workspace.id)).toEqual(["w0", "w1"]);
+    fake.removeWorkspace("w0");
+    const next = await fake.paseo.workspaces.list({ filter: { includeBackground: true }, page: { limit: 2, cursor: first.pageInfo.nextCursor! } });
+    expect(next.entries.map((workspace) => workspace.id)).toEqual(["w2", "w3"]);
   });
 
   it("offers label definitions and project icons only on new hosts", async () => {

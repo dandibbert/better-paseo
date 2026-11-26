@@ -1,6 +1,6 @@
 import React, { memo, useCallback, useEffect, useRef, useState, useMemo, type ReactNode } from "react";
 import { Platform, View, Text, Pressable, StyleSheet } from "react-native";
-import { Icon } from "@getpaseo/plugin/client/react-native";
+import { Icon } from "@getpaseo/plugin/client/ui";
 import type { StyleProp, TextProps, TextStyle } from "react-native";
 import { surfaceProps } from "./view-props";
 import { radiusV2, space, type ExtendedThemeTokens } from "./theme-tokens";
@@ -13,10 +13,13 @@ import { useHighlightedLines } from "../highlight";
 import { perfCount } from "../debug/perf";
 import { CopyButton } from "../ui/copy-button";
 import { ToolbarButton } from "../ui/toolbar-button";
+import { useHover } from "../ui/use-hover";
+import { iconHoverSize } from "../ui/icon-hover-size";
 import { SelectableSpan } from "../ui/prose-text";
 import { useZoomedTokens } from "../ui/text-zoom";
 import type { HighlightLine, HighlightToken } from "../../shared/highlight-rpc";
 import { textChunks, TEXT_CHUNK_CHARS } from "../ui/text-chunks";
+import { selectionColorProps } from "./text-selection";
 
 interface SyntaxHighlightProps {
   code: string;
@@ -66,7 +69,7 @@ export const LARGE_BLOCK_LINES = 400;
  */
 const APPEND_BATCH = 400;
 /** Code header height (S7 design spec §3.6): 32 on touch platforms, 30 on desktop. */
-const HEADER_HEIGHT = Platform.OS === "web" ? 30 : 32;
+export const CODE_HEADER_HEIGHT = Platform.OS === "web" ? 30 : 32;
 
 const scheduleFrame: (callback: () => void) => () => void =
   typeof requestAnimationFrame === "function"
@@ -220,6 +223,19 @@ function patchedFileIsCode(filename?: string): boolean {
 
 /** How far into a block a diff must announce itself before it reads as code. */
 const DIFF_SCAN_LINES = 8;
+
+const codeBlockMargin = (compact: boolean) => compact ? space.xs : space.sm;
+
+/**
+ * The center of a framed block's first line, from the block's top margin: its
+ * header row when it has one, or else its first line of code. Mirrors the
+ * `container`, `header` and `codeArea` styles of `SyntaxHighlightBlock`.
+ */
+export function codeBlockFirstLineCenter(code: string, language: string, compact: boolean, monoLineHeight: number): number {
+  const lines = code.trimEnd().split("\n");
+  const header = codeLanguageLabel(language === "diff" || looksLikeUnifiedDiff(lines) ? "diff" : language) !== "";
+  return codeBlockMargin(compact) + (header ? CODE_HEADER_HEIGHT / 2 : space.sm + monoLineHeight / 2);
+}
 
 /**
  * Whether a block is a unified diff whatever its label says. A tool labels a
@@ -565,10 +581,10 @@ export function SyntaxHighlightBlock({
               backgroundColor: tokens.v2.surfaceCode,
               borderRadius: radiusV2.block,
               overflow: "hidden",
-              marginVertical: compact ? space.xs : space.sm,
+              marginVertical: codeBlockMargin(compact),
             },
         header: {
-          height: HEADER_HEIGHT,
+          height: CODE_HEADER_HEIGHT,
           flexDirection: "row",
           alignItems: "center",
           gap: space.sm,
@@ -694,7 +710,7 @@ export function SyntaxHighlightBlock({
           )}
           {Platform.OS !== "web" && line.length > TEXT_CHUNK_CHARS ? (
             <View style={{ flex: 1 }}><LongNativeLine text={line} tokens={tokens} style={scroll ? styles.lineNoWrap : styles.lineContent} /></View>
-          ) : <Text selectable style={scroll ? styles.lineNoWrap : styles.lineContent}>
+          ) : <Text selectable {...selectionColorProps()} style={scroll ? styles.lineNoWrap : styles.lineContent}>
             {isDiff
               ? renderDiffLine(line, parsedDiff![idx]!, tokens, filename, bodyLine, shikiLine)
               : shikiLine
@@ -768,7 +784,7 @@ export function SyntaxHighlightBlock({
               </Text>
             </Pressable>
           ) : (
-            <Text selectable numberOfLines={1} style={styles.filename}>
+            <Text selectable {...selectionColorProps()} numberOfLines={1} style={styles.filename}>
               {filename ?? ""}
             </Text>
           )}
@@ -777,7 +793,7 @@ export function SyntaxHighlightBlock({
               <>
                 {scrollX ? (
                   <ToggleIconButton
-                    icon="WrapText"
+                    icon={wrapped ? "WrapText" : "AlignLeft"}
                     label={wrapped ? "Do not wrap lines" : "Wrap lines"}
                     active={wrapped}
                     onPress={() => setWrapped((value) => !value)}
@@ -873,7 +889,7 @@ export function codeLanguageLabel(language: string | undefined, filename?: strin
   return LANGUAGE_LABELS[key] ?? key;
 }
 
-/** A 24pt icon button with a pressed-in look while `active` (Wrap). */
+/** A 24pt icon button for the block's Wrap toggle. The glyph already shows which state is on, so the resting fill stays empty. */
 function ToggleIconButton({
   icon,
   label,
@@ -887,6 +903,9 @@ function ToggleIconButton({
   onPress(): void;
   tokens: ExtendedThemeTokens;
 }) {
+  const { hovered, hoverProps } = useHover();
+  const iconSize = TYPE.button.size + 1;
+  const fill = iconHoverSize(iconSize);
   return (
     <Pressable
       accessibilityRole="button"
@@ -895,12 +914,19 @@ function ToggleIconButton({
       aria-pressed={active}
       hitSlop={4}
       onPress={onPress}
-      style={({ pressed }) => [
-        toggleStyles.button,
-        (active || pressed) && { backgroundColor: tokens.v2.surface2 },
-      ]}
+      {...hoverProps}
+      style={toggleStyles.button}
     >
-      <Icon name={icon} size={TYPE.button.size + 1} color={active ? tokens.foreground : tokens.foregroundMuted} />
+      {({ pressed }) => (
+        <View pointerEvents="none" testID={hovered || pressed ? "block-icon-hover" : undefined}
+          style={hovered || pressed ? {
+            width: fill, height: fill, borderRadius: fill / 2,
+            alignItems: "center", justifyContent: "center",
+            backgroundColor: tokens.v2.surface2,
+          } : toggleStyles.icon}>
+          <Icon name={icon} size={iconSize} color={tokens.foregroundMuted} />
+        </View>
+      )}
     </Pressable>
   );
 }
@@ -909,7 +935,13 @@ const toggleStyles = StyleSheet.create({
   button: {
     width: 24,
     height: 24,
-    borderRadius: radiusV2.chip,
+    borderRadius: 12,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  icon: {
+    width: TYPE.button.size + 1,
+    height: TYPE.button.size + 1,
     alignItems: "center",
     justifyContent: "center",
   },
@@ -1059,7 +1091,7 @@ function LongNativeLine({ text, tokens, style, textProps, tail = false }: {
   const rows = useBatchedRows(parts.length, 1, parts, tail);
   return <>
     {parts.slice(tail ? parts.length - rows.shown : 0, tail ? parts.length : rows.shown).map((part, index) => (
-      <Text key={tail ? parts.length - rows.shown + index : index} selectable {...textProps} style={style}>{part}</Text>
+      <Text key={tail ? parts.length - rows.shown + index : index} selectable {...selectionColorProps()} {...textProps} style={style}>{part}</Text>
     ))}
     <FoldFooter total={parts.length} shown={rows.shown} expanding={rows.expanding} expanded={rows.expanded}
       onShowAll={rows.showAll} onShowLess={rows.showLess} tokens={tokens} bare unit="parts" earlier={tail} />
@@ -1112,9 +1144,9 @@ function CodeRowsBody({ from, to, lines, row }: CodeRowsProps) {
 const CodeRows = memo(CodeRowsBody);
 
 /** The gutter fits the largest line number at the code size, plus its gap. */
-export function lineNumberWidth(largest: number, size: number): number {
+export function lineNumberWidth(largest: number, size: number, minDigits = 2): number {
   const digits = String(Math.max(1, largest)).length;
-  return Math.max(2, digits) * Math.ceil(size * 0.62) + space.sm;
+  return Math.max(minDigits, digits) * Math.ceil(size * 0.62) + space.sm;
 }
 
 /** Largest line number in a diff; null rows count as zero. */
@@ -1628,7 +1660,7 @@ const OutputChunk = memo(OutputChunkBody);
 
 const NativeOutputChunk = memo(function NativeOutputChunk({ text, tokens, style, textProps }: TerminalOutputProps) {
   const lines = text.split("\n");
-  return <Text selectable {...textProps} style={style}>
+  return <Text selectable {...selectionColorProps()} {...textProps} style={style}>
     {lines.map((line, index) => renderTerminalLine(line, index, tokens, index < lines.length - 1 ? "\n" : ""))}
   </Text>;
 });
@@ -1679,7 +1711,7 @@ export function TerminalOutput({ text, tokens, style, textProps }: TerminalOutpu
           earlier
         />
       )}
-      {Platform.OS === "web" ? <Text selectable {...textProps} style={style}>
+      {Platform.OS === "web" ? <Text selectable {...selectionColorProps()} {...textProps} style={style}>
         {chunks}
       </Text> : nativeChunks.filter((chunk) => chunk.offset === 0 && chunk.from + chunk.lines.length > from).map((chunk) => (
         lines[chunk.from]!.length > TEXT_CHUNK_CHARS

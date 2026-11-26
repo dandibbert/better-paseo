@@ -2,8 +2,22 @@ import { Platform } from "react-native";
 import type { DeviceTasksStore } from "./device-store";
 import { shortcutFromEvent } from "./shortcut-model";
 
-export function isShortcutMac(): boolean {
-  return typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform);
+interface PlatformHints {
+  userAgent?: string;
+  userAgentData?: { platform?: string };
+}
+
+/**
+ * Whether shortcuts use the Mac modifiers (⌘ rather than Ctrl). Reads
+ * `userAgentData.platform` where the runtime has it (Chromium, so the desktop
+ * app), else the user agent; `navigator.platform` is deprecated. iPadOS Safari
+ * reports a Mac user agent, which is what the old `MacIntel` platform said too.
+ */
+export function isShortcutMac(hints: PlatformHints | null = typeof navigator !== "undefined" ? navigator as PlatformHints : null): boolean {
+  if (!hints) return false;
+  const platform = hints.userAgentData?.platform;
+  if (platform) return /mac|ios/i.test(platform);
+  return /Mac|iPhone|iPad/.test(hints.userAgent ?? "");
 }
 
 interface Registration { open(): void }
@@ -27,7 +41,11 @@ export function selectTasksShortcut(open: () => void): void {
   runtime().selected = registration;
 }
 
-export function bindTasksShortcut(store: DeviceTasksStore, open: () => void): () => void {
+/**
+ * `store` answers the device store when a key is pressed: a plugin update can replace it while
+ * this listener lives (`device-preferences.ts`), and the shortcut follows the current one.
+ */
+export function bindTasksShortcut(store: () => DeviceTasksStore, open: () => void): () => void {
   if (Platform.OS !== "web" || typeof window === "undefined") return () => {};
   const own = { open };
   registration = own;
@@ -42,7 +60,7 @@ export function bindTasksShortcut(store: DeviceTasksStore, open: () => void): ()
       return;
     }
     if (shared.selected !== own) return;
-    const shortcut = store.snapshot().values?.openShortcut;
+    const shortcut = store().current()?.openShortcut;
     if (!shortcut || shortcutFromEvent(event, isShortcutMac()) !== shortcut) return;
     consume(event);
     if (!event.repeat) own.open();

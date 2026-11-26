@@ -4,7 +4,7 @@ import TestRenderer, { act, type ReactTestInstance } from "react-test-renderer";
 import "./helpers/quiet-renderer";
 
 vi.mock("react-native", () => import("./helpers/rn-mock"));
-vi.mock("@getpaseo/plugin/client/react-native", async () => {
+vi.mock("@getpaseo/plugin/client/ui", async () => {
   const rn = await import("./helpers/rn-mock");
   return { Icon: rn.View, ScrollView: rn.ScrollView, TextInput: rn.TextInput,
     copyText: async () => {}, useToast: () => ({ show() {}, error() {} }) };
@@ -27,6 +27,7 @@ import { HScroll } from "../../client/ui/h-scroll";
 import { ToolbarButton } from "../../client/ui/toolbar-button";
 import { toolCopyPlan } from "../../client/tools/copy";
 import { toolHasDetail } from "../../client/tools/detail";
+import { TextZoomContext, type TextZoom } from "../../client/ui/text-zoom";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 const tokens = buildThemeTokens({ surface0: "#fff", surface1: "#eee", surface2: "#ddd", border: "#ccc",
@@ -51,6 +52,13 @@ function button(root: ReactTestInstance, label: string) {
 }
 
 describe("AskUserQuestion transcript data", () => {
+  it("reads Claude's current custom answer summary", () => {
+    const question = 'Kafka 地址是否修正？';
+    const answer = '改成局域网的地址，内部 Kafka 只绑定 127.0.0.1';
+    const output = `The user answered: "${question}"="${answer}". Read the answers carefully — they may request clarification, changes, or that you not proceed — and follow what they actually say.`;
+    const data = call({ questions: [{ question, options: [{ label: "先查使用方" }, { label: "先不动" }] }] }, output);
+    expect(readUserQuestions(data)!.questions[0]!.answer).toBe(answer);
+  });
   it.each(["request_user_input", "request_user_input_async", "ask", "ask_user_question", "question", "custom-agent-form"])("reads provider-independent metadata for %s", (name) => {
     const data = classifyTool({ name, status: "completed", detail: { type: "plain_text", text: "Short" },
       questionData: { questions: [{ id: "scope", question: "Which platforms?", options: ["iOS", "Web"], multiSelect: true }],
@@ -127,6 +135,25 @@ describe("AskUserQuestion transcript data", () => {
 });
 
 describe("AskUserQuestion presentation", () => {
+  it.each<[TextZoom, number, number]>([
+    [0, tokens.typography.block.label.size, tokens.typography.block.meta.size],
+    [20, 20, Math.round(tokens.typography.block.meta.size * 20 / tokens.typography.block.label.size)],
+    [12, 12, Math.round(tokens.typography.block.meta.size * 12 / tokens.typography.block.label.size)],
+    [{ scale: 1.5 }, Math.round(tokens.typography.block.label.size * 1.5), Math.round(tokens.typography.block.meta.size * 1.5)],
+  ])("sets the question's text to the details text size %j", (zoom, prose, meta) => {
+    const data = call();
+    let view!: ReturnType<typeof TestRenderer.create>;
+    act(() => { view = TestRenderer.create(React.createElement(TextZoomContext.Provider, { value: zoom },
+      React.createElement(ToolPreviewContent, { data, tokens, compact: false, resolvePath: (p) => p }))); });
+    try {
+      const size = (node: ReactTestInstance) => ([node.props.style].flat(Infinity) as Array<{ fontSize?: number } | null | undefined>)
+        .reduce<number | undefined>((found, entry) => entry?.fontSize ?? found, undefined);
+      const question = view.root.find((node) => typeof node.type === "string" && text(node) === questions[0]!.question);
+      const header = view.root.find((node) => typeof node.type === "string" && text(node) === questions[0]!.header);
+      expect(size(question)).toBe(prose);
+      expect(size(header)).toBe(meta);
+    } finally { act(() => view.unmount()); }
+  });
   it.each([false, true])("starts a long question row at the beginning (compact: %s)", (compact) => {
     const question = `拍板 1/12: ${"问题内容很长".repeat(30)}`;
     const data = call({ questions: [{ question, options: [{ label: "Yes" }] }] });

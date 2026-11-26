@@ -5,10 +5,17 @@ import "./helpers/quiet-renderer";
 
 vi.mock("react-native", () => import("./helpers/rn-mock"));
 vi.mock("@getpaseo/plugin/client", async (original) => {
-  const rpc = async () => ({ state: "idle" });
-  return { ...await original<object>(), useRpc: () => rpc };
+  const rpc = async () => ({ state: "idle", entries: [], error: null });
+  // Every plugin surface renders under its installation's Paseo client.
+  const paseo = {};
+  return {
+    ...await original<object>(),
+    usePaseo: () => paseo,
+    useRpc: () => rpc,
+    useSettings: () => ({ status: "loading", saving: false, saveError: null, save: async () => true, reset: async () => true }),
+  };
 });
-vi.mock("@getpaseo/plugin/client/react-native", async () => {
+vi.mock("@getpaseo/plugin/client/ui", async () => {
   const rn = await import("./helpers/rn-mock");
   return { Icon: rn.View, TextInput: rn.TextInput, ScrollView: rn.ScrollView };
 });
@@ -46,8 +53,15 @@ describe("independent details size in settings", () => {
         theme: { colors }, layout: { platform: "ios", compact: true }, host: { id: "host" },
       } as never));
     });
-    const group = renderer!.root.findAll((node) => typeof node.type === "string" && node.props.accessibilityLabel === "Accent colour")[0]!;
+    const t = SETTINGS_STRINGS.en;
+    const group = renderer!.root.findAll((node) => typeof node.type === "string" && node.props.accessibilityLabel === t.accentTitle)[0]!;
     expect(group.props.style.flexWrap).toBe("wrap");
+    // The same hue order as the inline code row, so the two rows line up.
+    const accentLabels = [...new Set(group.findAll((node) => node.props.accessibilityRole === "radio").map((node) => node.props.accessibilityLabel))];
+    expect(accentLabels).toEqual([
+      t.accentHost, t.accentRose, t.accentClaude, t.accentAmber, t.accentJade,
+      t.accentZinc, t.accentMidnight, t.accentGhostty, t.accentViolet, t.accentPureBlack,
+    ].map((label) => t.accentOption(label)));
     for (const [id, label] of [["zinc", "Zinc"], ["midnight", "Midnight"], ["claude", "Claude"], ["ghostty", "Ghostty"], ["pureBlack", "Pure black"]] as const) {
       const swatch = renderer!.root.findAll((node) => typeof node.type === "string" && node.props.accessibilityLabel === `Accent: ${label}`)[0]!;
       expect(swatch.props.style[1].backgroundColor).toBe(ACCENT_PRESETS[id]);
@@ -70,7 +84,18 @@ describe("independent details size in settings", () => {
     const t = SETTINGS_STRINGS.en;
     const group = renderer!.root.findAll((node) => typeof node.type === "string" && node.props.accessibilityLabel === t.inlineCodeTitle)[0]!;
     expect(group.props.style.flexWrap).toBe("wrap");
-    for (const [id, label] of [["jade", t.accentJade], ["amber", t.accentAmber], ["rose", t.accentRose], ["zinc", t.accentZinc], ["midnight", t.accentMidnight], ["claude", t.accentClaude], ["ghostty", t.accentGhostty], ["pureBlack", t.accentPureBlack]] as const) {
+    // One shade per hue: the palette no longer repeats blue, red or grey.
+    const labels = [...new Set(group.findAll((node) => node.props.accessibilityRole === "radio").map((node) => node.props.accessibilityLabel))];
+    expect(labels).toEqual([
+      t.inlineCodeGrey, t.inlineCodeCoral, t.accentClaude, t.accentAmber, t.accentJade,
+      t.inlineCodeGreen, t.accentMidnight, t.inlineCodeBlue, t.inlineCodeViolet, t.accentPureBlack,
+    ].map((label) => t.inlineCodeOption(label)));
+    for (const [id, label] of [
+      ["grey", t.inlineCodeGrey], ["coral", t.inlineCodeCoral], ["claude", t.accentClaude],
+      ["amber", t.accentAmber], ["jade", t.accentJade], ["green", t.inlineCodeGreen],
+      ["midnight", t.accentMidnight], ["blue", t.inlineCodeBlue], ["violet", t.inlineCodeViolet],
+      ["pureBlack", t.accentPureBlack],
+    ] as const) {
       const swatch = renderer!.root.findAll((node) => typeof node.type === "string" && node.props.accessibilityLabel === t.inlineCodeOption(label))[0]!;
       act(() => swatch.props.onPress());
       expect(getEnhancerPreferences().inlineCodeColor).toBe(id);
@@ -102,7 +127,7 @@ describe("independent details size in settings", () => {
     expect(getEnhancerPreferences().detailsFontSize).toBe(18);
     act(() => updateEnhancerPreferences({ detailsFontSize: 26 }));
     expect(control(t.detailsSizeLarger).props.disabled).toBe(true);
-    act(() => updateEnhancerPreferences({ detailsFontSize: 12 }));
+    act(() => updateEnhancerPreferences({ detailsFontSize: 9 }));
     expect(control(t.detailsSizeSmaller).props.disabled).toBe(true);
     press(t.detailsSizeReset);
     expect(getEnhancerPreferences().detailsFontSize).toBe(14);

@@ -16,9 +16,11 @@ import {
   CHAR_RATIO_MONO,
   CHAR_RATIO_UI,
   TABLE_CELL_PADDING,
+  TABLE_CELL_PADDING_Y,
   TABLE_DIVIDER_WIDTH,
   type VariantMetrics,
 } from "./styles";
+import { selectionColorProps } from "../../text-selection";
 
 /**
  * React Native offers no synchronous text measurement, so a column's width is
@@ -120,7 +122,7 @@ export function MdTable({
   const keeps = useCallback((event: PointerEvent) => addsCellRange(event)
     && ((frameRef.current as unknown as HTMLElement | null)?.contains(event.target as Node) ?? false), []);
   rowRefs.current.length = token.rows.length + 1;
-  const selectedText = rangeText(token, selection.ranges);
+  const selectedText = rangeText(token, selection.ranges, context.literalCodex);
   // Ranges of empty cells have nothing to copy, so they are not drawn once let go.
   const ranges = selection.dragging || selectedText ? selection.ranges : NO_RANGES;
   const align = (column: number) => styles[ALIGN_KEYS[aligns[column] ?? "left"]];
@@ -158,7 +160,7 @@ export function MdTable({
             testID={TABLE_CELL_TEST_ID}
             // On iOS and Android a held cell starts a range, which the
             // platform's own text selection would take over.
-            selectable={Platform.OS === "web"}
+            selectable={Platform.OS === "web"} {...selectionColorProps()}
             {...contentTextProps()}
             {...(Platform.OS === "web" ? { dataSet: { tableCellRow: row, tableCellColumn: column } } : {})}
             style={[
@@ -166,7 +168,7 @@ export function MdTable({
               align(column),
               ...frame(column),
               contentTextStyle(),
-              rangeHas(ranges, row, column) && { backgroundColor: context.tokens.selectionFill },
+              rangeHas(ranges, row, column) && { backgroundColor: context.tokens.textSelection },
             ]}
           >
             {renderInline(cell.tokens, context, cellKey)}
@@ -204,17 +206,32 @@ export function MdTable({
       {/* Over the scroller rather than in it: a scroller clips what passes its
           edges, and the open menu's border and shadow reach past the left one. */}
       <TableCopyMenu source={source} frame={frameRef} tokens={context.tokens}
-        selected={selectedText && !selection.dragging ? { text: selectedText, dismiss: selection.dismiss, keeps } : undefined} />
+        selected={selectedText && !selection.dragging ? {
+          text: selectedText,
+          translationText: () => rangeText(token, ranges, context.literalCodex, "translate"),
+          dismiss: selection.dismiss,
+          keeps,
+        } : undefined} />
     </View>
   );
 }
 
+/**
+ * The center of a table's header line from the table's top: the corner
+ * control's room, the frame's border and the header cell's padding.
+ */
+export function tableFirstLineCenter(cellLineHeight: number): number {
+  return CORNER_ROOM + TABLE_DIVIDER_WIDTH + TABLE_CELL_PADDING_Y + cellLineHeight / 2;
+}
+
+// Room for the corner control outside the columns: half its side, so its
+// centre sits on the table's corner.
+const CORNER_ROOM = FLOAT.control / 2;
+
 const copyStyles = StyleSheet.create({
   outer: { position: "relative" },
-  // Room for the corner control outside the columns: half its side, so its
-  // centre sits on the table's corner.
   content: {
-    paddingTop: FLOAT.control / 2,
-    paddingLeft: FLOAT.control / 2,
+    paddingTop: CORNER_ROOM,
+    paddingLeft: CORNER_ROOM,
   },
 });

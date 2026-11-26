@@ -6,7 +6,7 @@ import "./helpers/quiet-renderer";
 const motion = vi.hoisted(() => ({ reduced: false }));
 vi.mock("../../client/ui/use-reduced-motion", () => ({ useReducedMotion: () => motion.reduced }));
 vi.mock("react-native", () => import("./helpers/rn-mock"));
-vi.mock("@getpaseo/plugin/client/react-native", async () => {
+vi.mock("@getpaseo/plugin/client/ui", async () => {
   const rn = await import("./helpers/rn-mock");
   const React = await import("react");
   return {
@@ -156,10 +156,10 @@ describe("menu geometry and keys", () => {
     const projects = [
       project("beautiful-chat", "/Users/luke/workspace/rrd/beautiful-chat"),
       project("srv", "/srv/app"),
-      project("deep", "/home/luke/workspace/clients/acme/services/billing"),
+      project("deep", "/Users/luke/workspace/clients/acme/services/billing"),
       project("none", null),
     ];
-    const [section] = projectMenuSections({ workspaceGroups: [], projects, agents: [], labels: [] }, BOARD_STRINGS.en, "host", () => {});
+    const [section] = projectMenuSections({ workspaceGroups: [], projects, agents: [], labels: [] }, BOARD_STRINGS.en, "host", () => {}, "/Users/luke");
     expect(section!.items.map((item) => item.detail)).toEqual(["~/workspace/…/beautiful-chat", "/srv/app", "~/workspace/…/billing", undefined]);
   });
 
@@ -216,10 +216,10 @@ describe("menu geometry and keys", () => {
 
 describe("menu chrome", () => {
   it.each([
-    // Linear's #f1f1f1 on white, from the theme's foreground over its surface.
-    ["Paseo light", LIGHT, "#f1f1f2"],
-    ["Paseo dark", DARK, "#2a2d2c"],
-    ["sepia light", SEPIA, "#f0ebe1"],
+    // The shared 5% foreground mix follows each theme.
+    ["Paseo light", LIGHT, "#f3f3f3"],
+    ["Paseo dark", DARK, "#232625"],
+    ["sepia light", SEPIA, "#f1ece2"],
   ] as const)("follows the %s theme", (_name, colors, hover) => {
     const chrome = menuChrome(theme(colors));
     expect(chrome.background).toBe(colors.surface0);
@@ -418,7 +418,7 @@ describe("CascadeMenu", () => {
     expect(StyleSheet.flatten(submenu()[0]!.props.style).left).toBe(280 - MENU.overlap);
   });
 
-  it("draws Linear's chrome from the theme: radius 12, a hairline, a wide soft shadow, rows 32 inset 6", () => {
+  it("draws themed menu chrome with equal 10 pt top and side insets", () => {
     for (const colors of [LIGHT, DARK, SEPIA]) {
       render(sections(), colors);
       const panel = renderer!.root.find((node) => (node.type as unknown) === "View" && node.props.testID === "menu-panel");
@@ -427,10 +427,10 @@ describe("CascadeMenu", () => {
         borderWidth: StyleSheet.hairlineWidth,
         borderColor: colors.border,
         backgroundColor: colors.surface0,
-        paddingVertical: 6,
+        paddingVertical: 10,
         boxShadow: menuChrome(theme(colors)).shadow,
       });
-      expect(StyleSheet.flatten(row("Plain").props.style)).toMatchObject({ height: 32, marginHorizontal: 6, borderRadius: 6 });
+      expect(StyleSheet.flatten(row("Plain").props.style)).toMatchObject({ height: 32, marginHorizontal: 10, borderRadius: 6 });
       act(() => renderer!.unmount());
     }
     renderer = undefined;
@@ -816,7 +816,9 @@ describe("CascadeMenu", () => {
       const scroller = panel.find((node) => (node.type as unknown) === "ScrollView");
       expect(panel.findAll((node) => (node.type as unknown) === "View" && node.props.testID === "menu-search")).toHaveLength(1);
       expect(scroller.findAll((node) => (node.type as unknown) === "View" && node.props.testID === "menu-search")).toHaveLength(0);
-      expect(StyleSheet.flatten(scroller.props.style).maxHeight).toBe(MENU.maxHeight - (MENU.searchHeight + 1));
+      const search = panel.find((node) => (node.type as unknown) === "View" && node.props.testID === "menu-search");
+      expect(StyleSheet.flatten(search.props.style).paddingTop).toBe(StyleSheet.flatten(row("Row 0").props.style).marginHorizontal);
+      expect(StyleSheet.flatten(scroller.props.style).maxHeight).toBe(MENU.maxHeight - (MENU.padV + MENU.searchHeight + 1));
     });
 
     it("draws no field over a menu with nothing to filter", () => {

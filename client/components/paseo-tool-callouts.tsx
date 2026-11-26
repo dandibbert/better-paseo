@@ -2,6 +2,7 @@ import React from "react";
 import { View, Text, StyleSheet } from "react-native";
 import { Glyph } from "./glyph";
 import { usePaseo } from "@getpaseo/plugin/client";
+import { useCodexProvider } from "../state/provider-family";
 import { surfaceProps } from "./view-props";
 import { radiusV2, space } from "./theme-tokens";
 import type { ExtendedThemeTokens } from "./theme-tokens";
@@ -31,6 +32,7 @@ interface PaseoToolCalloutProps {
   compact?: boolean;
   /** The host's error for a failed call, drawn as the card's first line. */
   error?: string;
+  translationAgentId?: string;
 }
 
 /**
@@ -39,14 +41,14 @@ interface PaseoToolCalloutProps {
  * whose header already names the call and whose open state decides whether
  * this is mounted at all.
  */
-export function PaseoToolCallout({ data, tokens, raw = false, compact = false, error }: PaseoToolCalloutProps) {
+export function PaseoToolCallout({ data, tokens, raw = false, compact = false, error, translationAgentId }: PaseoToolCalloutProps) {
   return (
     <View {...surfaceProps(selectionSurface)} style={styles.body}>
       {data.tool === "create_agent" && data.createAgent && (
         <CreateAgentView data={data.createAgent} tokens={tokens} raw={raw} compact={compact} error={error} />
       )}
       {data.sendAgentPrompt ? <SendAgentPromptView data={data.sendAgentPrompt} tokens={tokens} raw={raw} compact={compact} error={error} /> : null}
-      {data.agentOperation ? <AgentOperationView data={data.agentOperation} tokens={tokens} raw={raw} compact={compact} error={error} /> : null}
+      {data.agentOperation ? <AgentOperationView data={data.agentOperation} tokens={tokens} raw={raw} compact={compact} error={error} translationAgentId={translationAgentId} /> : null}
       {data.catalog ? <CatalogView data={data.catalog} tokens={tokens} raw={raw} compact={compact} /> : null}
     </View>
   );
@@ -104,11 +106,12 @@ export function agentStatusColor(data: AgentStatusData, tokens: ExtendedThemeTok
 }
 
 /** A child agent's notification: who sent it, then its reply, error or permission request. */
-export function AgentStatusView({ data, tokens, raw = false, compact = false }: {
-  data: AgentStatusData; tokens: ExtendedThemeTokens; raw?: boolean; compact?: boolean;
+export function AgentStatusView({ data, tokens, raw = false, compact = false, translationAgentId }: {
+  data: AgentStatusData; tokens: ExtendedThemeTokens; raw?: boolean; compact?: boolean; translationAgentId?: string;
 }) {
   const mobile = useCardMobile(compact);
   const live = useLiveAgent(data.agentId);
+  const codex = useCodexProvider(data.status === "finished" ? live.provider : undefined);
   const permission = !raw && data.status === "needs permission" ? readPermissionRequest(data.body) : undefined;
   const reply = permission ? permission.rest : data.body;
   const fields: AgentField[] = live.model ? [{ key: "model", icon: "Cpu", label: live.model }] : [];
@@ -120,13 +123,13 @@ export function AgentStatusView({ data, tokens, raw = false, compact = false }: 
       agentId={data.agentId} tokens={tokens} mobile={mobile} />
     {errorLine || rest || permission ? <AgentDivider tokens={tokens} /> : null}
     {errorLine ? <AgentErrorLine text={errorLine} tokens={tokens} /> : null}
-    {permission?.questions ? <PermissionQuestions questions={permission.questions} tokens={tokens} mobile={mobile} /> : null}
+    {permission?.questions ? <PermissionQuestions questions={permission.questions} tokens={tokens} mobile={mobile} translationAgentId={translationAgentId} /> : null}
     {permission && !permission.questions ? <PermissionRequest testID="agent-status-permission" title={permission.title}
-      description={permission.description} command={permission.command} plan={permission.plan} tokens={tokens} mobile={mobile} /> : null}
+      description={permission.description} command={permission.command} plan={permission.plan} tokens={tokens} mobile={mobile} translationAgentId={translationAgentId} /> : null}
     {permission ? <PermissionAnswerNote tokens={tokens} /> : null}
     {permission?.requestId ? <PermissionRequestId requestId={permission.requestId} tokens={tokens} /> : null}
     {rest ? <AgentSection label={data.status === "finished" && !raw ? "Reply" : undefined} tokens={tokens}>
-      <AgentMarkdown testID="agent-status-body" text={rest} tokens={tokens} raw={raw} mobile={mobile} /></AgentSection> : null}
+      <AgentMarkdown testID="agent-status-body" text={rest} tokens={tokens} raw={raw} mobile={mobile} codexDirectives={codex} /></AgentSection> : null}
   </View>;
 }
 

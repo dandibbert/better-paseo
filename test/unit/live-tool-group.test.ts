@@ -1,16 +1,17 @@
+const toast = vi.hoisted(() => ({ error: () => {} }));
 import React from "react";
 import { describe, expect, it, vi } from "vitest";
 import type { PluginTimelineItemProps } from "@getpaseo/plugin/client";
 import type { LiveToolCallPayload } from "../../client/live-renderers";
 
 vi.mock("react-native", () => import("./helpers/rn-mock"));
-vi.mock("@getpaseo/plugin/client/react-native", () => ({
+vi.mock("@getpaseo/plugin/client/ui", () => ({ useToast: () => toast,
   Icon: () => null,
-  useRevealedText: (text: string) => text,
 }));
 vi.mock("@getpaseo/plugin/client", () => ({
   useAgent: () => undefined,
   useWorkspace: () => undefined,
+  usePaseo: () => null,
   useRpc: () => () => Promise.resolve(null),
 }));
 vi.mock("../../client/preferences", async (original) => ({
@@ -54,6 +55,8 @@ await import("./helpers/quiet-renderer");
 const { default: TestRenderer, act } = await import("react-test-renderer");
 const { StyleSheet } = await import("./helpers/rn-mock");
 const { LiveToolCallRenderer } = await import("../../client/live-renderers");
+const { SelectionTranslationScope } = await import("../../client/translation/ui");
+const { getHubActivity } = await import("../../client/hub-activity");
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 function tool(callId: string, at: number, status = "running", path: string | null = "src/a.ts", agentId = "group-agent", diff?: string) {
@@ -84,6 +87,38 @@ function cards(renderer: ReturnType<typeof TestRenderer.create>) {
 }
 
 describe("live tool groups", () => {
+  it("ties tool text selection to the originating conversation", async () => {
+    let renderer!: ReturnType<typeof TestRenderer.create>;
+    await act(async () => { renderer = TestRenderer.create(tool("error", 1000, "failed", "src/a.ts", "source-agent")); });
+    try {
+      expect(renderer.root.findByType(SelectionTranslationScope).props).toMatchObject({
+        agentId: "source-agent", kind: "tool_output", streaming: false,
+      });
+    } finally {
+      await act(async () => renderer.unmount());
+    }
+  });
+  it("publishes and clears background jobs from retained hub rows", async () => {
+    const hubRow = (at: number, jobs: Array<{ id: string; status: string }>) => React.createElement(LiveToolCallRenderer, {
+      agentId: "retained-hub-row", host: { id: "local", label: "Local" },
+      layout: { compact: false, platform: "web" }, theme: { colors: {} } as never,
+      timestamp: new Date(at), item: { type: "plugin", kind: "omp-tool-call", version: 1,
+        data: { name: "hub", callId: "hub-test", status: "completed", phase: "complete",
+          detail: { type: "unknown", input: { op: "jobs" }, output: { details: { jobs } } } } },
+    });
+    let renderer!: ReturnType<typeof TestRenderer.create>;
+    await act(async () => { renderer = TestRenderer.create(hubRow(1000, [{ id: "job1", status: "running" }])); });
+    try {
+      expect(getHubActivity("retained-hub-row")?.running.map((job) => job.id)).toEqual(["job1"]);
+      await act(async () => { renderer.update(hubRow(2000, [{ id: "job2", status: "running" }])); });
+      expect(getHubActivity("retained-hub-row")?.running.map((job) => job.id)).toEqual(["job2"]);
+      await act(async () => { renderer.update(hubRow(3000, [])); });
+      expect(getHubActivity("retained-hub-row")).toBeNull();
+    } finally {
+      await act(async () => renderer.unmount());
+    }
+  });
+
   it.each([1, 2])("renders each current singleton result once across %i panes", async (panes) => {
     const renders = ((globalThis as { toolRenders?: Map<string, number> }).toolRenders ??= new Map());
     const frame = (at: number, diff?: string) => React.createElement(React.Fragment, null,

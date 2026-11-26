@@ -11,24 +11,27 @@ const runtime = vi.hoisted(() => ({
   listeners: new Set<() => void>(),
   api: {} as unknown,
   copyText: vi.fn(async (_text: string) => {}),
+  translate: vi.fn(() => new Promise<never>(() => {})),
+  family: vi.fn(async ({ provider }: { provider: string }) => ({ codex: ["my-codex", "gemini", "grok"].includes(provider) })),
 }));
 
 vi.mock("react-native", () => import("./helpers/rn-mock"));
+vi.mock("../../client/state/home-directory", () => ({ useHomeDirectory: () => "/home/test" }));
 vi.mock("@getpaseo/plugin/client", () => ({
   useAgent: (_id: string, selector: (agent: typeof runtime.agent) => unknown) => React.useSyncExternalStore(
     (listener) => { runtime.listeners.add(listener); return () => { runtime.listeners.delete(listener); }; },
     () => selector(runtime.agent),
   ),
   usePaseo: () => runtime.api,
-  useRpc: () => () => Promise.resolve(null),
+  useRpc: (rpc: unknown) => rpc === translateTimelineItemRpc ? runtime.translate : rpc === providerFamilyRpc ? runtime.family : () => Promise.resolve(null),
   useWorkspace: () => null,
   useSettings: () => ({ data: undefined, status: "loading" }),
 }));
-vi.mock("@getpaseo/plugin/client/react-native", async () => {
+vi.mock("@getpaseo/plugin/client/ui", async () => {
   const rn = await import("./helpers/rn-mock");
   return { Icon: (props: Record<string, unknown>) => React.createElement("Icon", props),
     TextInput: rn.TextInput, ScrollView: rn.ScrollView, FlatList: rn.ScrollView, Modal: rn.View,
-    useRevealedText: (text: string) => text, copyText: runtime.copyText,
+    copyText: runtime.copyText,
     useToast: () => ({ show() {}, error() {} }) };
 });
 vi.mock("../../client/components/hub-live", () => ({ TimelineTailHub: () => null }));
@@ -37,13 +40,17 @@ vi.mock("../../client/components/selection-actions", () => ({ useSelectionAction
 vi.mock("../../client/components/tool-callouts", () => ({ ToolCallout: () => null }));
 vi.mock("../../client/components/markdown/markdown-view", async () => {
   const rn = await import("./helpers/rn-mock");
-  return { MarkdownView: ({ text }: { text: string }) => React.createElement(rn.Text, null, text) };
+  return { MarkdownView: ({ text, codexDirectives }: { text: string; codexDirectives?: boolean }) => React.createElement(rn.Text, { testID: "reply-markdown", codexDirectives }, text) };
 });
 
 import { LiveAssistantRenderer, LiveToolCallRenderer, type LiveAssistantPayload, type LiveToolCallPayload } from "../../client/live-renderers";
 import { AssistantFooter } from "../../client/components/turn-footer";
 import { assistantRows } from "../../client/assistant-transform";
+import { translateTimelineItemRpc } from "../../shared/timeline-translation";
+import { providerFamilyRpc } from "../../shared/provider-family-rpc";
+import { DEFAULT_TIMELINE_TRANSLATION_SETTINGS, publishTranslationSettings, resetTranslationSettingsStoreForTests } from "../../client/translation/settings-store";
 import { formatFooterStamp, formatFullStamp } from "../../client/ui/time";
+import { resetTimelineTailsForTests } from "../../client/timeline-tail";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 const theme = { colors: { surface0: "#fff", surface1: "#eee", surface2: "#ddd", border: "#ccc",
@@ -52,10 +59,28 @@ const theme = { colors: { surface0: "#fff", surface1: "#eee", surface2: "#ddd", 
 const catalog: PaseoProviderModelsResult = { provider: "codex", fetchedAt: "now", requestId: "r",
   models: [{ provider: "codex", id: "sol", label: "GPT-6.1-Sol", thinkingOptions: [{ id: "medium", label: "Medium" }] }] };
 
-beforeEach(() => { vi.clearAllMocks(); runtime.agent.status = "idle"; });
-afterEach(() => { expect(runtime.listeners.size).toBe(0); });
+beforeEach(() => { vi.clearAllMocks(); runtime.agent.status = "idle"; runtime.agent.provider = "codex"; resetTimelineTailsForTests(); });
+afterEach(() => {
+  resetTranslationSettingsStoreForTests();
+  expect(runtime.listeners.size).toBe(0);
+});
 
 describe.each(["web", "ios"] as const)("completed-turn toolbar on %s", (platform) => {
+  it.each(["codex", "claude", "my-codex", "my-claude", "gemini", "grok"].flatMap((provider) => [false, true].map((split) => ({ provider, split }))))("enables Codex directives only for $provider replies, split=$split", async ({ provider, split }) => {
+    runtime.agent.provider = provider;
+    const refetch = vi.fn<PaseoAgentTimelineHandle["refetch"]>(async () => page([]));
+    const release = Object.assign(vi.fn(), { ready: Promise.resolve(), subscriptionId: "s", release: async () => {} });
+    runtime.api = { agents: { ref: () => ({ timeline: { refetch, subscribe: () => release } }) }, providers: { listModels: async () => catalog } };
+    let renderer!: ReturnType<typeof TestRenderer.create>;
+    await act(async () => { renderer = TestRenderer.create(React.createElement(LiveAssistantRenderer, {
+      agentId: "provider-check", theme, host: { id: "local", label: "Local" }, layout: { platform, compact: platform !== "web" },
+      timestamp: new Date(2000), item: { type: "plugin", kind: "omp-assistant", version: 1,
+        data: { text: '::browser-complete{title="Done"}', phase: "complete", ...(split ? { blockIndex: 0 } : {}) } },
+    } satisfies PluginTimelineItemProps<LiveAssistantPayload>)); });
+    try {
+      expect(renderer.root.findByProps({ testID: "reply-markdown" }).props.codexDirectives).toBe(["codex", "my-codex", "gemini", "grok"].includes(provider));
+    } finally { await act(async () => renderer.unmount()); }
+  });
   it("shows the turn end time while matching the reply by its original timestamp", async () => {
     const startedAt = new Date(2026, 9, 16, 9, 1, 0).getTime();
     const replyAt = startedAt + 10000;
@@ -160,7 +185,8 @@ describe.each(["web", "ios"] as const)("completed-turn toolbar on %s", (platform
     }
   });
 
-  it("keeps one full-message copy and timing footer after a long streaming reply splits into rows", async () => {
+  it("copies and translates the full reply from one footer after a long reply splits into rows", async () => {
+    publishTranslationSettings({ ...DEFAULT_TIMELINE_TRANSLATION_SETTINGS, enabled: true, mode: "openai", endpoint: "https://api.example.test/v1", endpointModel: "sol" }, "footer");
     const text = Array.from({ length: 60 }, (_, index) => `## Part ${index}\n\n${"Paragraph. ".repeat(40)}\n\n`).join("");
     const refetch = vi.fn<PaseoAgentTimelineHandle["refetch"]>(async () => page([
       entry({ type: "user_message", text: "prompt" }, 1, 1000, "long"),
@@ -184,6 +210,23 @@ describe.each(["web", "ios"] as const)("completed-turn toolbar on %s", (platform
       expect(refetch).toHaveBeenCalledTimes(1);
       await act(async () => footers[0]!.findByProps({ accessibilityLabel: "Copy reply" }).props.onPress());
       expect(runtime.copyText).toHaveBeenCalledExactlyOnceWith(text);
+      const translate = renderer.root.findAll((node) => String(node.type) === "Pressable" && node.props.testID === "footer-translate");
+      expect(translate).toHaveLength(1);
+      // Like every other footer item, Translate names itself on hover.
+      const texts = () => renderer.root.findAll((node) => String(node.type) === "Text").map((node) => [node.props.children].flat().join(""));
+      expect(texts()).not.toContain("Translate");
+      vi.useFakeTimers();
+      try {
+        act(() => translate[0]!.props.onHoverIn());
+        act(() => { vi.advanceTimersByTime(400); });
+        expect(texts()).toContain("Translate");
+        act(() => translate[0]!.props.onHoverOut());
+      } finally { vi.useRealTimers(); }
+      expect(texts()).not.toContain("Translate");
+      expect(runtime.translate).not.toHaveBeenCalled();
+      await act(async () => translate[0]!.props.onPress({ stopPropagation() {} }));
+      expect(runtime.translate).toHaveBeenCalledOnce();
+      expect(runtime.translate.mock.calls[0]).toMatchObject([{ agentId: "long", sourceKind: "assistant_message", text }]);
     } finally { await act(async () => renderer.unmount()); }
   });
 
@@ -207,8 +250,11 @@ describe.each(["web", "ios"] as const)("completed-turn toolbar on %s", (platform
     await act(async () => { renderer = TestRenderer.create(row("a", "streaming")); });
     try {
       await act(async () => { renderer.update(row("ans", "streaming", 2500)); });
+      await act(async () => { renderer.update(row("answ", "streaming", 2500)); });
       expect(renderer.root.findAllByType(AssistantFooter)).toHaveLength(0);
-      expect(refetch).not.toHaveBeenCalled();
+      // One read for the standard level's running work card (the turn's steps so
+      // far); the chunks after it read nothing.
+      expect(refetch).toHaveBeenCalledTimes(1);
       expect(subscribe).toHaveBeenCalledTimes(1);
       await act(async () => {
         onEvent({ agentId: "a", timestamp: new Date(2000).toISOString(),
@@ -218,7 +264,8 @@ describe.each(["web", "ios"] as const)("completed-turn toolbar on %s", (platform
         renderer.update(row("answer", "complete"));
       });
       expect(renderer.root.findByType(AssistantFooter).props.usage).toEqual(usage);
-      expect(refetch).toHaveBeenCalledTimes(1);
+      // The turn's end and the agent going idle each read the ended turn once.
+      expect(refetch).toHaveBeenCalledTimes(3);
     } finally { act(() => renderer.unmount()); }
   });
 

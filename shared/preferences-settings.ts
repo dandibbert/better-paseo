@@ -1,5 +1,8 @@
 import { defineSettings } from "@getpaseo/plugin";
 import { z } from "zod";
+import { FILE_OPEN_APPS } from "./file-open-apps";
+
+export { FILE_OPEN_APPS, type FileOpenApp } from "./file-open-apps";
 
 /**
  * Presentation preferences, stored by the daemon (plan §11.6: configuration
@@ -17,10 +20,22 @@ import { z } from "zod";
  */
 
 export const ACCENT_IDS = ["host", "jade", "violet", "amber", "rose", "zinc", "midnight", "claude", "ghostty", "pureBlack"] as const;
-/** Inline code text on iOS and Android, where the span has no fill. */
-export const INLINE_CODE_COLORS = ["grey", "blue", "violet", "green", "coral", "jade", "amber", "rose", "zinc", "midnight", "claude", "ghostty", "pureBlack"] as const;
+/**
+ * Inline code text on iOS and Android, where the span has no fill. One shade
+ * per hue: `midnight` and `ghostty` were the same blue, `coral` and `rose` the
+ * same red, `grey` and `zinc` the same grey.
+ */
+export const INLINE_CODE_COLORS = ["grey", "blue", "violet", "green", "coral", "jade", "amber", "midnight", "claude", "pureBlack"] as const;
+/** Colours the setting offered before each hue kept a single shade. */
+const LEGACY_INLINE_CODE_COLORS: Readonly<Record<string, (typeof INLINE_CODE_COLORS)[number]>> = {
+  rose: "coral",
+  zinc: "grey",
+  ghostty: "midnight",
+};
+
 export const UI_FONTS = ["host", "inter", "system"] as const;
 export const MONO_FONTS = ["host", "custom"] as const;
+export const TIMELINE_LEVELS = ["simple", "standard", "detailed"] as const;
 export const TOOL_DETAILS = ["collapsed", "expand-failed"] as const;
 export const PATH_DISPLAYS = ["relative", "absolute"] as const;
 export const FOOTER_METRICS = ["off", "tps", "ttft", "apiTurns", "toolCalls", "cost", "outputTokens"] as const;
@@ -43,7 +58,7 @@ export function clampCodeFontSize(value: number): number {
 
 /** An independent size for native details; never follows the timeline's size. */
 export const DETAILS_FONT_SIZE_DEFAULT = 14;
-export const DETAILS_FONT_SIZE_MIN = 12;
+export const DETAILS_FONT_SIZE_MIN = 9;
 export const DETAILS_FONT_SIZE_MAX = 26;
 
 export function clampDetailsFontSize(value: number): number {
@@ -92,7 +107,18 @@ function migrateHoverDelay(raw: unknown): unknown {
   return seconds === undefined ? rest : { ...rest, hoverDelaySeconds: seconds };
 }
 
-export const preferencesSchema = z.preprocess((raw) => migrateHoverDelay(migrateRowLabels(raw)), z.object({
+/**
+ * The palette offered three extra shades of hues it already had; a stored one
+ * keeps its hue rather than dropping to the default grey.
+ */
+function migrateInlineCodeColor(raw: unknown): unknown {
+  if (!raw || typeof raw !== "object") return raw;
+  const { inlineCodeColor, ...rest } = raw as Record<string, unknown>;
+  const kept = typeof inlineCodeColor === "string" ? LEGACY_INLINE_CODE_COLORS[inlineCodeColor] : undefined;
+  return kept === undefined ? raw : { ...rest, inlineCodeColor: kept };
+}
+
+export const preferencesSchema = z.preprocess((raw) => migrateHoverDelay(migrateInlineCodeColor(migrateRowLabels(raw))), z.object({
   autoUpdateCheck: flag(true),
   accent: z.enum(ACCENT_IDS).catch("host"),
   uiFont: z.enum(UI_FONTS).catch("host"),
@@ -115,6 +141,7 @@ export const preferencesSchema = z.preprocess((raw) => migrateHoverDelay(migrate
     .catch(BLOCK_FONT_SIZE_DEFAULT),
   toolDetail: z.enum(TOOL_DETAILS).catch("collapsed"),
   pathDisplay: z.enum(PATH_DISPLAYS).catch("relative"),
+  fileOpenApp: z.enum(FILE_OPEN_APPS).catch("system"),
   hoverPreview: flag(true),
   hoverDelaySeconds: z
     .number()
@@ -132,9 +159,11 @@ export const preferencesSchema = z.preprocess((raw) => migrateHoverDelay(migrate
   previewLineNumbers: flag(true),
   previewStripes: flag(true),
   chatEnabled: flag(true),
+  timelineLevel: z.enum(TIMELINE_LEVELS).catch("standard"),
   enhancedUserBubble: flag(false),
   selectionActions: flag(true),
   assistantMarkdown: flag(true),
+  liveUiReplies: flag(false),
   markdownVariant: z.enum(MARKDOWN_VARIANTS_STORED).catch("document"),
   rowLabelStyle: z.enum(ROW_LABEL_STYLES).catch("icon"),
   footerMetric: z.enum(FOOTER_METRICS).catch("tps"),

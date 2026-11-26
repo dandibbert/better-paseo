@@ -13,27 +13,38 @@ vi.mock("react-native", async () => {
   const AppState = { currentState: "active", addEventListener: () => ({ remove() {} }) };
   return { ...rn, AppState, default: { ...rn.default, AppState } };
 });
-vi.mock("@getpaseo/plugin/client/react-native", async () => {
-  const rn = await import("./helpers/rn-mock");
-  const React = await import("react");
-  type Props = Record<string, unknown> & { children?: React.ReactNode };
-  function FlatList(props: Props) {
-    const data = (props.data as unknown[]) ?? [];
-    const render = props.renderItem as (info: { item: unknown; index: number }) => React.ReactNode;
-    return React.createElement("FlatList", null, data.map((item, index) => React.createElement(React.Fragment, { key: index }, render({ item, index }))));
-  }
-  function Modal(props: Props) {
-    return props.open ? React.createElement("Modal", null, props.children) : null;
-  }
-  Modal.Content = (props: Props) => React.createElement("ModalContent", null, props.children);
-  return {
-    Icon: (props: Props) => React.createElement("Icon", { name: props.name }),
-    FlatList,
-    Modal,
-    ScrollView: rn.ScrollView,
-    TextInput: rn.TextInput,
-    useToast: () => ({ show() {}, error() {} }),
-  };
+vi.mock("@getpaseo/plugin/client/ui", async () => {
+  // The plugin imports all of these from `client/ui` now; where both mocks name a key, the UI one wins.
+  const fromReactNative = await (async () => {
+    const rn = await import("./helpers/rn-mock");
+    const React = await import("react");
+    type Props = Record<string, unknown> & { children?: React.ReactNode };
+    function FlatList(props: Props) {
+      const data = (props.data as unknown[]) ?? [];
+      const render = props.renderItem as (info: { item: unknown; index: number }) => React.ReactNode;
+      return React.createElement("FlatList", null, data.map((item, index) => React.createElement(React.Fragment, { key: index }, render({ item, index }))));
+    }
+    function Modal(props: Props) {
+      return props.open ? React.createElement("Modal", null, props.children) : null;
+    }
+    Modal.Content = (props: Props) => React.createElement("ModalContent", null, props.children);
+    return {
+      Icon: (props: Props) => React.createElement("Icon", { name: props.name }),
+      FlatList,
+      Modal,
+      ScrollView: rn.ScrollView,
+      TextInput: rn.TextInput,
+      useToast: () => ({ show() {}, error() {} }),
+    };
+  })();
+  const fromUi = await (async () => {
+    const React = await import("react");
+    return {
+      SidebarRow: (props: Record<string, unknown> & { trailing?: React.ReactNode }) =>
+        React.createElement("SidebarRow", { label: props.label }, props.trailing),
+    };
+  })();
+  return { ...fromReactNative, ...fromUi };
 });
 const host = vi.hoisted(() => ({
   settings: null as Record<string, unknown> | null,
@@ -41,16 +52,9 @@ const host = vi.hoisted(() => ({
 }));
 vi.mock("@getpaseo/plugin/client", () => ({
   usePaseo: () => host.paseo,
-  useRpc: (contract: { name: string }) => (input: { agentIds?: string[] }) => Promise.resolve(contract.name === "tasks.availability" ? { entries: input.agentIds!.map((agentId) => ({ agentId, availability: { issue: null, blocked: {} } })) } : { stop: false }),
+  useRpc: (contract: { name: string }) => (input: { agentIds?: string[] }) => Promise.resolve(contract.name === "tasks.availability" ? { entries: input.agentIds!.map((agentId) => ({ agentId, availability: { issue: null, blocked: {} } })) } : contract.name === "settings.agent-updates" ? { state: "idle", entries: [], error: null } : { stop: false }),
   useSettings: () => (host.settings ? { status: "ready", values: host.settings, revision: "1", saving: false, saveError: null } : { status: "loading" }),
 }));
-vi.mock("@getpaseo/plugin/client/ui", async () => {
-  const React = await import("react");
-  return {
-    SidebarRow: (props: Record<string, unknown> & { trailing?: React.ReactNode }) =>
-      React.createElement("SidebarRow", { label: props.label }, props.trailing),
-  };
-});
 
 import { TasksBoardScreen } from "../../client/tasks/board/board-screen";
 import { TasksSidebarEntry } from "../../client/tasks/board/sidebar-entry";
@@ -231,7 +235,7 @@ describe("Tasks board prefetch", () => {
     expect(fake.openSubscriptions()).toBe(COUNTS_ONLY);
   });
 
-  it("a board opened after the hover sends nothing and draws at once", async () => {
+  it("a board opened after the hover draws at once and starts the history scan", async () => {
     await mountSidebar();
     await hover();
     const warmed = fake.calls.length;
@@ -241,12 +245,12 @@ describe("Tasks board prefetch", () => {
     // Before any answer could arrive: the board is ready on the warm data.
     expect(boardText()).toContain("2 tasks");
     await settle();
-    expect(fake.calls.length).toBe(warmed);
+    expect(fake.calls.slice(warmed).map((call) => call.method)).toEqual(["agents.list"]);
     await fire("onPointerLeave");
     // The intent's grace runs out under the open board, which keeps its data.
     await advance(INTENT_GRACE_MS);
     expect(fake.openSubscriptions()).toBe(BOARD_OPEN);
-    expect(fake.calls.length).toBe(warmed);
+    expect(fake.calls.length).toBe(warmed + 1);
   });
 
   it("keeps the board's data 30 s after it closes, then releases it", async () => {
@@ -260,14 +264,14 @@ describe("Tasks board prefetch", () => {
     expect(fake.openSubscriptions()).toBe(COUNTS_ONLY);
   });
 
-  it("a board reopened within the grace period sends nothing", async () => {
+  it("a board reopened within the grace period keeps its subscriptions and shares their history scan", async () => {
     await mountSidebar();
     await openBoard();
     await closeBoard();
     await advance(BOARD_LINGER_MS - 1000);
     const closed = fake.calls.length;
     await openBoard();
-    expect(fake.calls.length).toBe(closed);
+    expect(fake.calls.slice(closed).map((call) => call.method)).toEqual([]);
     expect(boardText()).toContain("2 tasks");
     // Its own close starts a fresh grace period.
     await closeBoard();
@@ -351,7 +355,7 @@ describe("Tasks board prefetch", () => {
     await openBoard();
     await advance(HOVER_INTENT_MS * 2);
     const requests = boardCalls(before).sort();
-    expect(requests).toEqual(["agents.list", "projects.list", "providers.listModels"]);
+    expect(requests).toEqual(["agents.list", "agents.list", "projects.list", "providers.listModels"]);
     expect(fake.openSubscriptions()).toBe(BOARD_OPEN);
   });
 
@@ -401,7 +405,7 @@ describe("Tasks board prefetch", () => {
       addSettingsScreen: () => () => {},
       addCommandCenterItem: (item: { onSelect(context: unknown): void }) => (commands.push(item), () => {}),
       openSettings: vi.fn(),
-      rpc: () => Promise.resolve({ status: "ready", revision: "1", values: { ...DEFAULT_TASKS_SETTINGS, enabled: true } }),
+      rpc: (contract: { name: string }) => Promise.resolve(contract.name === "tasks.error-dismissals" ? { entries: [] } : { status: "ready", revision: "1", values: { ...DEFAULT_TASKS_SETTINGS, enabled: true } }),
     } as never);
     try {
       await settle();
@@ -425,7 +429,7 @@ describe("Tasks board prefetch", () => {
       addSettingsScreen: () => () => {},
       addCommandCenterItem: (item: { onSelect(context: { openScreen: () => void }): void }) => (commands.push(item), () => {}),
       openSettings: vi.fn(),
-      rpc: () => Promise.resolve({ status: "ready", revision: "1", values: { ...DEFAULT_TASKS_SETTINGS, enabled: true } }),
+      rpc: (contract: { name: string }) => Promise.resolve(contract.name === "tasks.error-dismissals" ? { entries: [] } : { status: "ready", revision: "1", values: { ...DEFAULT_TASKS_SETTINGS, enabled: true } }),
     } as never);
     try {
       await settle();
@@ -439,7 +443,7 @@ describe("Tasks board prefetch", () => {
       await settle();
       const warmed = fake.calls.length;
       await openBoard();
-      expect(fake.calls.length).toBe(warmed);
+      expect(fake.calls.slice(warmed).map((call) => call.method)).toEqual(["agents.list"]);
     } finally {
       cleanup();
     }

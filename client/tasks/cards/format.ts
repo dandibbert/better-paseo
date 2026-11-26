@@ -41,6 +41,16 @@ function coarse(ms: number): string {
   return rest > 0 ? `${Math.floor(minutes / 60)}h ${rest}m` : `${Math.floor(minutes / 60)}h`;
 }
 
+/** A request's wait alone, where a clock icon already says it waits: "4m". */
+export function formatWaitLength(ms: number): string {
+  return coarse(ms);
+}
+
+/** A request's wait as a hover hint reads it: "已等待 4m" / "Waiting for 4m". */
+export function formatWaited(ms: number, language: TasksLanguage): string {
+  return language === "zh" ? `已等待 ${coarse(ms)}` : `Waiting for ${coarse(ms)}`;
+}
+
 /** How long a request has waited: "等待 4m" / "Waiting 4m". */
 export function formatWait(ms: number, language: TasksLanguage): string {
   return language === "zh" ? `等待 ${coarse(ms)}` : `Waiting ${coarse(ms)}`;
@@ -125,14 +135,7 @@ export function contextRatio(context: { usedTokens: number; maxTokens: number } 
   return Math.min(1, Math.max(0, context.usedTokens / context.maxTokens));
 }
 
-/**
- * A path with the home directory as "~": /Users/<name>/..., /home/<name>/...
- * and C:\Users\<name>\... Other paths come back unchanged.
- */
-export function tildePath(path: string): string {
-  const home = /^\/(?:Users|home)\/[^/]+(?=\/|$)/.exec(path) ?? /^[A-Za-z]:\\Users\\[^\\]+(?=\\|$)/i.exec(path);
-  return home ? `~${path.slice(home[0].length)}` : path;
-}
+export { shortenHome as tildePath } from "../../paths/format-path";
 
 /** When a limit lifts, as the error states it. */
 export interface CardErrorReset {

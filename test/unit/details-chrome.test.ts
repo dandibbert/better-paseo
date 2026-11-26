@@ -1,7 +1,7 @@
 /**
  * The preview content drawn in the block details chrome: the same content the
  * hover panel draws, its `HoverPreviewHeader` turned into the details header
- * and toolbar (docs/prototypes/block-details-sheet.md, tables 5.2, 5.8, 5.9).
+ * and toolbar (https://github.com/RoundRedDot/better-paseo/blob/f2ab453297c4ccb88a08e2129af0cb3528c4e628/docs/prototypes/block-details-sheet.md, tables 5.2, 5.8, 5.9).
  * The shell is stubbed: slice B provides `DetailsShellContext` in the app.
  */
 import React from "react";
@@ -15,10 +15,10 @@ vi.mock("react-native", async () => ({
   useWindowDimensions: () => ({ ...screen, scale: 2, fontScale: 1 }),
 }));
 const clipboard = vi.hoisted(() => ({ copyText: vi.fn(async (_text: string) => {}), show: vi.fn(), error: vi.fn() }));
-vi.mock("@getpaseo/plugin/client/react-native", async () => {
+vi.mock("@getpaseo/plugin/client/ui", async () => {
   const rn = await import("./helpers/rn-mock");
   return { Icon: rn.View, ScrollView: rn.ScrollView, TextInput: rn.TextInput,
-    copyText: clipboard.copyText, useToast: () => ({ show: clipboard.show, error: clipboard.error }), useRevealedText: (text: string) => text };
+    copyText: clipboard.copyText, useToast: () => ({ show: clipboard.show, error: clipboard.error }) };
 });
 vi.mock("@getpaseo/plugin/client", () => ({
   useAgent: () => undefined, useWorkspace: () => undefined,
@@ -39,6 +39,7 @@ import { DetailsShellContext, type BlockEntry, type DetailsShellValue } from "..
 import { copySlots, foldCopies } from "../../client/details/chrome/copy-overflow";
 import { backToLatestText } from "../../client/details/chrome/back-to-latest";
 import { DetailsHeader } from "../../client/details/chrome/details-header";
+import { StyleSheet } from "./helpers/rn-mock";
 import { seedMarkBitmaps } from "../../client/components/marks";
 import { classifyTool } from "../../client/tools/classify";
 import { resetEnhancerPreferences, updateEnhancerPreferences } from "../../client/preferences";
@@ -141,8 +142,9 @@ describe("details header", () => {
     const root = mount(details(rowPreview(callout(bash))));
     const header = byId(root, "details-header");
     expect(header.props.style).toEqual(expect.arrayContaining([expect.objectContaining({ minHeight: 52 })]));
-    expect(byId(root, "details-header-icon").props.style).toEqual(expect.arrayContaining([
-      expect.objectContaining({ width: 28, height: 28, borderRadius: 7 }), { backgroundColor: tokens.v2.surface1 }]));
+    expect(StyleSheet.flatten(header.props.style)).toMatchObject({ paddingLeft: 8, gap: 10 });
+    expect(StyleSheet.flatten(byId(root, "details-header-icon").props.style)).toMatchObject({ width: 20, height: 20, marginRight: -4 });
+    expect(StyleSheet.flatten(byId(root, "details-header-icon").props.style).backgroundColor).toBeUndefined();
     const title = byId(root, "details-header-title").findByType("Text" as never);
     expect(textOf(title)).toBe("npm run build");
     expect(title.props.numberOfLines).toBe(1);
@@ -159,14 +161,15 @@ describe("details header", () => {
     expect(hosts(root, "hover-preview-header")).toHaveLength(0);
   });
 
-  it("opens the title to four lines on a tap, and back to one on another block", () => {
-    const value = shell();
-    const content = rowPreview(callout(bash));
-    const root = mount(details(content, value));
-    act(() => byId(root, "details-header-title").props.onPress());
-    expect(byId(root, "details-header-title").findByType("Text" as never).props.numberOfLines).toBe(4);
-    act(() => renderer!.update(details(content, { ...value, entry: entry({ id: "other" }) })));
-    expect(byId(renderer!.root, "details-header-title").findByType("Text" as never).props.numberOfLines).toBe(1);
+  it("keeps the title and subtitle on one centered row before the buttons", () => {
+    const root = mount(details(rowPreview(callout(bash))));
+    const title = byId(root, "details-header-title");
+    const subtitle = byId(root, "details-header-subtitle");
+    expect(title.parent).toBe(subtitle.parent);
+    expect(StyleSheet.flatten(title.parent!.props.style)).toMatchObject({ flexDirection: "row", alignItems: "center", flex: 1 });
+    expect(StyleSheet.flatten(title.props.style)).toMatchObject({ flex: 1, minWidth: 0 });
+    expect(StyleSheet.flatten(subtitle.props.style)).toMatchObject({ flexShrink: 1 });
+    expect(title.findByType("Text" as never).props.numberOfLines).toBe(1);
   });
 
   it("steps and closes through the shell, disabled at the ends, and spreads its header handlers", () => {
@@ -217,6 +220,20 @@ describe("details header", () => {
     expect(byId(root, "details-header").props.style).toEqual(expect.arrayContaining([expect.objectContaining({ minHeight: 44 })]));
     expect(find(root, "Close details").props.style).toEqual(expect.arrayContaining([expect.objectContaining({ width: 28, height: 28 })]));
     expect(byId(root, "details-toolbar").props.style).toEqual(expect.arrayContaining([expect.objectContaining({ minHeight: 36 })]));
+  });
+
+  it.each([true, false])("fits a desktop side header with titleMono=%s into the host's 36-point header", (titleMono) => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = "web";
+    const root = mount(h(DetailsHeader, { shell: shell({ form: "side", pointer: true, entry: entry({ titleMono }) }), tokens }));
+    const header = StyleSheet.flatten(byId(root, "details-header").props.style);
+    const title = byId(root, "details-header-title").findByType("Text" as never);
+    const subtitle = byId(root, "details-header-subtitle").findAllByType("Text" as never)[0]!;
+    const titleStyle = StyleSheet.flatten(title.props.style);
+    const subtitleStyle = StyleSheet.flatten(subtitle.props.style);
+    expect(header).toMatchObject({ minHeight: 36, paddingVertical: 0, borderBottomWidth: 1 });
+    expect(titleStyle.lineHeight).toBe(18);
+    expect(subtitleStyle.lineHeight).toBe(16);
+    expect(title.props.numberOfLines).toBe(1);
   });
 
   it("leaves out ‹ › and the place for a block outside the sequence (a code block)", () => {
@@ -359,7 +376,8 @@ describe("details toolbar", () => {
     expect(labels(byId(root, "details-toolbar-start"))).toEqual(["Do not wrap lines", "Show raw text"]);
     expect(wrapButton(root)!.props.disabled).toBe(true);
     expect(copyLabels(root)).toEqual(["Copy code"]);
-    expect(labels(byId(root, "details-header"))).toEqual(["Code block · tsx", "Close details"]);
+    expect(textOf(byId(root, "details-header-title"))).toBe("Code block · tsx");
+    expect(labels(byId(root, "details-header"))).toEqual(["Close details"]);
   });
 
   it("titles an agent card in words with its status tone, falling back to the card's own label", () => {
@@ -406,9 +424,41 @@ describe("details toolbar", () => {
     act(() => renderer!.update(details(content, shell({ fullscreen: true }))));
     expect(labels(byId(renderer!.root, "details-toolbar-end")).at(-1)).toBe("Exit full screen");
   });
+
+  it("offers desktop text size steps and reset in the toolbar", () => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = "web";
+    const commit = vi.fn();
+    const value = shell({ pointer: true, zoom: { base: 14, current: () => 14, preview() {}, commit } });
+    const root = mount(details(rowPreview(callout(bash)), value));
+    const start = byId(root, "details-toolbar-start");
+    expect(labels(start).slice(0, 4)).toEqual(["Do not wrap lines", "Decrease text size", "Reset zoom", "Increase text size"]);
+    act(() => find(root, "Increase text size").props.onPress());
+    act(() => find(root, "Decrease text size").props.onPress());
+    act(() => find(root, "Reset zoom").props.onPress());
+    expect(commit.mock.calls).toEqual([[15], [13], [14]]);
+    act(() => updateEnhancerPreferences({ detailsFontSize: 9 }));
+    expect(find(root, "Decrease text size").props.disabled).toBe(true);
+    act(() => updateEnhancerPreferences({ detailsFontSize: 26 }));
+    expect(find(root, "Increase text size").props.disabled).toBe(true);
+  });
 });
 
 describe("copy overflow", () => {
+  it.each(["ios", "android", "web"])("uses symmetric drawer insets and fits three command copies at 320pt on %s", (os) => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = os;
+    screen.width = 320;
+    screen.height = 640;
+    const root = mount(details(rowPreview(callout(bash)), shell({ form: "drawer" })));
+    expect(StyleSheet.flatten(byId(root, "details-toolbar").props.style)).toMatchObject({ paddingHorizontal: 4 });
+    const body = hosts(root, "hover-preview-body")[0]!;
+    expect(StyleSheet.flatten(os === "web" ? body.props.style : body.props.contentContainerStyle))
+      .toMatchObject({ paddingHorizontal: 8 });
+    layout(root, 320, 188);
+    expect(copyLabels(root)).toEqual(["Copy command", "Copy output", "Copy command and output"]);
+    layout(root, 319, 188);
+    expect(labels(byId(root, "details-toolbar-end"))).toEqual(["Copy command", "More"]);
+  });
+
   it("folds from the last copy into ⋯ at 360 with a wide left group, and fits all three at 390", async () => {
     (globalThis as { __rnMockOS?: string }).__rnMockOS = "web";
     const root = mount(details(rowPreview(callout(bash))));
@@ -420,6 +470,10 @@ describe("copy overflow", () => {
     act(() => find(root, "More").props.onPress());
     const menu = byId(root, "details-copy-menu");
     expect(labels(menu)).toEqual(["Copy output", "Copy command and output"]);
+    const item = find(menu, "Copy output");
+    expect(StyleSheet.flatten(item.props.style)).toMatchObject({ minHeight: 36, borderRadius: 18 });
+    act(() => item.props.onHoverIn());
+    expect(StyleSheet.flatten(find(menu, "Copy output").props.style).backgroundColor).toBe(tokens.v2.surface2);
     await act(async () => find(menu, "Copy output").props.onPress());
     expect(clipboard.copyText).toHaveBeenLastCalledWith(expect.stringContaining("vite v5.4.8 building for production..."));
     expect(hosts(root, "details-copy-menu")).toHaveLength(0);
@@ -498,6 +552,32 @@ describe("details body", () => {
     act(() => byId(root, "details-back-to-latest").props.onPress());
     expect(hosts(root, "details-back-to-latest")).toHaveLength(0);
     expect(scrolls.at(-1)).toEqual({ y: 800 + 3 * lineHeight, animated: true });
+  });
+
+  it("on the web lets a work steps body scroll sideways itself, so pinned rows keep it as their scroller", () => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = "web";
+    let mounts = 0;
+    function Steps() {
+      React.useEffect(() => { mounts += 1; }, []);
+      return h("Text", null, "a long line");
+    }
+    const steps = (wrap: PreviewActions["wrap"]) => details(h(HoverPreviewBody, { stickySteps: true, children: h(Steps) }), shell(), wrap);
+    const wrapOff = { ...wrapOn, on: false };
+    const sideways = (root: ReactTestInstance) => root.findAll((node) => typeof node.type === "string" && node.props.horizontal === true);
+    const columns = (root: ReactTestInstance) => root.findAll((node) => typeof node.type === "string"
+      && (StyleSheet.flatten(node.props.style) as { width?: unknown } | undefined)?.width === "max-content");
+    act(() => { renderer = TestRenderer.create(steps(wrapOn)); });
+    expect(sideways(renderer!.root)).toHaveLength(0);
+    // Unwrapped: no sideways scroller between the steps and the body; the column is as wide as its widest line.
+    act(() => renderer!.update(steps(wrapOff)));
+    expect(sideways(renderer!.root)).toHaveLength(0);
+    expect(columns(renderer!.root)).toHaveLength(1);
+    expect(StyleSheet.flatten(columns(renderer!.root)[0]!.props.style)).toMatchObject({ minWidth: "100%" });
+    // Turning the wrap keeps the steps mounted, and an opened step open.
+    expect(mounts).toBe(1);
+    // Any other details body still scrolls sideways inside a scroller of its own.
+    act(() => renderer!.update(details(h(HoverPreviewBody, { children: h(Steps) }), shell(), wrapOff)));
+    expect(sideways(renderer!.root)).toHaveLength(1);
   });
 
   it("words the pill", () => {

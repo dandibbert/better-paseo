@@ -13,7 +13,7 @@ vi.mock("react-native", async () => {
   return import("./helpers/rn-mock");
 });
 const clipboard = vi.hoisted(() => ({ copyText: vi.fn(async (_text: string) => {}), show: vi.fn(), error: vi.fn() }));
-vi.mock("@getpaseo/plugin/client/react-native", async () => {
+vi.mock("@getpaseo/plugin/client/ui", async () => {
   const rn = await import("./helpers/rn-mock");
   return {
     Icon: rn.View,
@@ -21,7 +21,6 @@ vi.mock("@getpaseo/plugin/client/react-native", async () => {
     TextInput: rn.TextInput,
     copyText: clipboard.copyText,
     useToast: () => ({ show: clipboard.show, error: clipboard.error }),
-    useRevealedText: (text: string) => text,
   };
 });
 vi.mock("@getpaseo/plugin/client", () => ({
@@ -47,6 +46,7 @@ vi.mock("../../client/web", () => ({
   dropSelectionIn: () => {},
   bindPreviewPointer: () => () => {},
   openPreviewLayer: () => () => {},
+  pinTooltipLayer: () => () => {},
   watchNextPointerMove: () => () => {},
 }));
 import { buildThemeTokens } from "../../client/components/theme-tokens";
@@ -117,9 +117,9 @@ describe("the image viewer's file button", () => {
     const renderer = render(React.createElement(ImageViewer, {
       open: true, onClose() {}, uri: file.dataUri, width: 40, height: 30, label: PATH, path: PATH, tokens, onReveal,
     }));
-    expect(viewerButtons(renderer)).toContain("Open in default app");
+    expect(viewerButtons(renderer)).toContain("Open file");
     expect(viewerButtons(renderer)).not.toContain("Copy path");
-    const button = viewerButton(renderer, "Open in default app");
+    const button = viewerButton(renderer, "Open file");
     expect(iconsIn(button)).toEqual(["ExternalLink"]);
     await press(button);
     expect(onReveal).toHaveBeenCalledTimes(1);
@@ -134,7 +134,7 @@ describe("the image viewer's file button", () => {
       open: true, onClose() {}, uri: file.dataUri, width: 40, height: 30, label: PATH, path: PATH, tokens, onReveal,
     }));
     expect(viewerButtons(renderer)).toContain("Copy path");
-    expect(viewerButtons(renderer)).not.toContain("Open in default app");
+    expect(viewerButtons(renderer)).not.toContain("Open file");
     expect(iconsIn(viewerButton(renderer, "Copy path"))).toEqual(["Copy"]);
     await press(viewerButton(renderer, "Copy path"));
     expect(clipboard.copyText).toHaveBeenCalledWith(PATH);
@@ -170,7 +170,7 @@ describe("an image's viewer from the timeline", () => {
   // A reply's local image hands the preview a bare `file.reveal`; on touch it
   // must not open the file on the desktop.
   it.each([
-    [false, "Open in default app", "ExternalLink"],
+    [false, "Open file", "ExternalLink"],
     [true, "Copy path", "Copy"],
   ] as const)("in a reply (touch-first %s) draws %s", async (touchFirst, label, icon) => {
     device.touchFirst = touchFirst;
@@ -187,7 +187,7 @@ describe("an image's viewer from the timeline", () => {
   });
 
   it.each([
-    [false, "Open in default app", "ExternalLink"],
+    [false, "Open file", "ExternalLink"],
     [true, "Copy path", "Copy"],
   ] as const)("in an image read (touch-first %s) draws %s", async (touchFirst, label, icon) => {
     device.touchFirst = touchFirst;

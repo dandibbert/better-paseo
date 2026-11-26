@@ -5,7 +5,7 @@ import { orderBlocks } from "./navigation";
 
 export const MARKER_LINGER_MS = 1200;
 
-const CLOSED: DetailsState = { openId: null, form: "drawer", detent: "fit", fullscreen: false, lingerId: null };
+const CLOSED: DetailsState = { openId: null, independent: false, form: "drawer", detent: "fit", fullscreen: false, lingerId: null, docked: false };
 
 interface AgentDetailsStore {
   state: DetailsState;
@@ -49,7 +49,7 @@ function updateState(agentId: string, next: DetailsState, nextLingerUntil: numbe
   const previousUntil = store.lingerUntil;
   if (
     previous.openId === next.openId && previous.form === next.form && previous.detent === next.detent &&
-    previous.fullscreen === next.fullscreen && previous.lingerId === next.lingerId &&
+    previous.fullscreen === next.fullscreen && previous.lingerId === next.lingerId && previous.independent === next.independent && previous.docked === next.docked &&
     previousUntil === nextLingerUntil
   ) return;
 
@@ -80,7 +80,7 @@ function scheduleLinger(agentId: string, id: string, until: number): void {
   store.lingerTimer = setTimeout(() => {
     store.lingerTimer = null;
     if (store.state.lingerId !== id) return;
-    updateState(agentId, { ...store.state, lingerId: null }, 0);
+    updateState(agentId, { ...store.state, lingerId: null, independent: store.state.openId !== null && store.state.independent }, 0);
   }, Math.max(0, until - Date.now()));
 }
 
@@ -108,11 +108,15 @@ export const detailsApi: DetailsApi = {
     const store = storeFor(agentId);
     const previous = store.state;
     setNavigationOverride(agentId, id, options?.navigable);
+    // A docked panel stays docked while it steps to other blocks; a fresh open without a form does not dock.
+    const docked = options?.form !== undefined ? options.form === "side" : previous.openId !== null && previous.docked === true;
 
     if (previous.openId === id) {
       updateState(agentId, {
         ...previous,
+        independent: options?.independent ?? previous.independent,
         form: options?.form ?? previous.form,
+        docked,
         detent: options?.detent ?? previous.detent,
       }, store.lingerUntil);
       return;
@@ -134,7 +138,9 @@ export const detailsApi: DetailsApi = {
     updateState(agentId, {
       ...previous,
       openId: id,
+      independent: options?.independent ?? false,
       form: options?.form ?? previous.form,
+      docked,
       detent: options?.detent ?? (previous.openId === null ? "fit" : previous.detent),
       fullscreen: previous.openId === null ? false : previous.fullscreen,
       lingerId,
@@ -143,10 +149,21 @@ export const detailsApi: DetailsApi = {
     if (previous.openId !== id) getBlock(agentId, id)?.onOpen?.();
   },
 
-  close(agentId) {
+  close(agentId, options) {
     const store = storeFor(agentId);
     const previous = store.state;
     if (previous.openId === null) return;
+    if (options?.clearMarker) {
+      clearLingerTimer(store);
+      updateState(agentId, { ...previous, openId: null, lingerId: null }, 0);
+      if (previous.independent) {
+        store.lingerTimer = setTimeout(() => {
+          store.lingerTimer = null;
+          if (store.state.openId === null) updateState(agentId, { ...store.state, independent: false }, 0);
+        }, MARKER_LINGER_MS);
+      }
+      return;
+    }
     const lingerUntil = Date.now() + MARKER_LINGER_MS;
     updateState(agentId, { ...previous, openId: null, lingerId: previous.openId }, lingerUntil);
     scheduleLinger(agentId, previous.openId, lingerUntil);
@@ -169,6 +186,16 @@ export const detailsApi: DetailsApi = {
     updateState(agentId, { ...store.state, form }, store.lingerUntil);
   },
 };
+
+/** The agent's details state, read once without subscribing (a press handler's). */
+export function readDetails(agentId: string): DetailsState {
+  return stores.get(agentId)?.state ?? CLOSED;
+}
+
+/** Do not close a different block opened by the same outside click. */
+export function closeDetailsIfCurrent(agentId: string, id: string): void {
+  if (stores.get(agentId)?.state.openId === id) detailsApi.close(agentId, { clearMarker: true });
+}
 
 function subscribeDetails(agentId: string, listener: () => void): () => void {
   const listeners = storeFor(agentId).listeners;
@@ -193,6 +220,13 @@ function subscribeMarker(agentId: string, id: string, listener: () => void): () 
 export function useDetails(agentId: string): DetailsState {
   const subscribe = useCallback((listener: () => void) => subscribeDetails(agentId, listener), [agentId]);
   const snapshot = useCallback(() => stores.get(agentId)?.state ?? CLOSED, [agentId]);
+  return useSyncExternalStore(subscribe, snapshot, snapshot);
+}
+
+/** Subscribe only to whether an explicitly opened panel needs a host. */
+export function useIndependentDetails(agentId: string): boolean {
+  const subscribe = useCallback((listener: () => void) => subscribeDetails(agentId, listener), [agentId]);
+  const snapshot = useCallback(() => stores.get(agentId)?.state.independent ?? false, [agentId]);
   return useSyncExternalStore(subscribe, snapshot, snapshot);
 }
 

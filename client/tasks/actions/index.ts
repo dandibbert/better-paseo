@@ -1,29 +1,84 @@
 import type { PaseoApi } from "@getpaseo/client";
 import { usePaseo, useRpc } from "@getpaseo/plugin/client";
-import { useToast } from "@getpaseo/plugin/client/react-native";
+import { useToast } from "@getpaseo/plugin/client/ui";
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { Alert, Platform } from "react-native";
-import { tasksCapabilitiesRpc, tasksReadRpc, tasksStopRpc, tasksStoppedRpc, tasksUnarchiveRpc } from "../../../shared/tasks-rpc";
+import { tasksCapabilitiesRpc, tasksReadRpc, tasksStopRpc, tasksStoppedRpc, tasksUnarchiveRpc, tasksUnreadRpc } from "../../../shared/tasks-rpc";
 import type { TaskCard, TaskPermission, TaskPermissionAction } from "../model";
 import { useTasksLanguage, type TasksLanguage } from "../i18n";
 import { confirmDialog } from "../../components/confirm-dialog";
 import { activeStopChildren, stopTargets } from "./stop-targets";
+import { archiveScope, type ArchiveScope } from "./archive-scope";
 
 /** One permission button the card draws. `open` jumps to the tab instead of answering. */
 export interface PermissionButton {
   key: string;
   label: string;
   variant: "primary" | "secondary" | "danger";
-  kind: "respond" | "open";
+  kind: "respond" | "open" | "question";
   /** The action to send for `respond`; the deny placeholder is ignored for `open`. */
   action: TaskPermissionAction | { behavior: "allow" | "deny"; id: null };
+  /**
+   * A question option answered as written: the host form's submission, keyed by
+   * the request's own header. Its label is the option's text, never a meaning.
+   */
+  answers?: Record<string, string>;
 }
 
 /** Paseo sends a plan's buttons in English; these are the labels it uses. */
 const ACTION_ZH: Record<string, string> = { Reject: "拒绝", Dismiss: "拒绝", Implement: "实施" };
 
-/** Buttons for the first pending request. Questions and other requests open the agent tab. */
-export function permissionButtons(permission: TaskPermission, language: TasksLanguage = "en"): PermissionButton[] {
+/**
+ * The widest option a card answers inline, in columns: a CJK, full-width or
+ * astral character counts two. Options never fold or cut: Stop and Open fold
+ * first, then a label wraps, so this only keeps a short answer short; longer
+ * options read better in the agent tab (test/unit/tasks-card-action-layout).
+ */
+export const QUICK_ANSWER_COLUMNS = 24;
+
+function columns(label: string): number {
+  let width = 0;
+  for (const char of label) {
+    width += char.length > 1 || /[\u1100-\u115F\u2E80-\uA4CF\uAC00-\uD7A3\uF900-\uFAFF\uFE30-\uFE4F\uFF00-\uFF60\uFFE0-\uFFE6]/.test(char) ? 2 : 1;
+  }
+  return width;
+}
+
+/**
+ * A question the card can answer with its options as they are written, by its
+ * shape alone: one single-choice question with a header to key the answer, two
+ * distinct short one-line options and nothing the card cannot show (an
+ * option's description or preview). Wording is never read, so any language
+ * or phrasing qualifies, and so does an ordinary two-way choice; free text
+ * still goes through the agent tab.
+ */
+function quickAnswers(permission: TaskPermission): PermissionButton[] | null {
+  if (permission.kind !== "question" || permission.questions?.length !== 1) return null;
+  const question = permission.questions[0]!;
+  const header = question.header;
+  const labels = question.options.map((option) => option.label);
+  if (!header || question.multiSelect || labels.length !== 2 || labels[0] === labels[1]) return null;
+  if (question.options.some((option) => option.description || option.preview)) return null;
+  if (labels.some((label) => /[\r\n]/.test(label) || columns(label) > QUICK_ANSWER_COLUMNS)) return null;
+  return labels.map((label, index) => ({
+    key: `answer-${index}`,
+    label,
+    variant: "secondary",
+    kind: "respond",
+    action: { behavior: "allow", id: null },
+    answers: { [header]: label },
+  }));
+}
+
+/** Buttons for the first pending request. Only a simple single-choice question is answered inline. */
+export function permissionButtons(permission: TaskPermission, language: TasksLanguage = "en", dialog = false): PermissionButton[] {
+  const answers = quickAnswers(permission);
+  if (dialog && permission.kind === "question") return [...(answers ?? []), {
+    key: "question", label: language === "zh" ? "查看问题" : "View questions", variant: "secondary", kind: "question",
+    action: { behavior: "allow", id: null },
+  }];
+  if (answers) return answers;
+
   if (permission.kind === "question" || permission.kind === "other") {
     return [{
       key: "open",
@@ -62,6 +117,13 @@ export function permissionButtons(permission: TaskPermission, language: TasksLan
   ];
 }
 
+// The same request may be pressed from its card and details before the daemon answers.
+const pendingQuestionAnswers = new WeakMap<PaseoApi, Set<string>>();
+
+export function questionAnswerPending(paseo: PaseoApi, agentId: string, requestId: string): boolean {
+  return pendingQuestionAnswers.get(paseo)?.has(JSON.stringify([agentId, requestId])) === true;
+}
+
 /** Answer the card's first request. Resolves when the daemon accepted it. */
 export async function respondToPermission(
   paseo: PaseoApi,
@@ -71,6 +133,19 @@ export async function respondToPermission(
 ): Promise<void> {
   if (button.kind !== "respond") {
     throw new Error("This permission request must be answered in the agent tab.");
+  }
+
+  if (button.answers) {
+    let pending = pendingQuestionAnswers.get(paseo);
+    if (!pending) pendingQuestionAnswers.set(paseo, pending = new Set());
+    const key = JSON.stringify([agentId, requestId]);
+    if (pending.has(key)) return;
+    pending.add(key);
+    // Both options submit an answer. behavior: "deny" would dismiss the question instead.
+    await paseo.agents.ref(agentId).respondToPermission({
+      requestId, response: { behavior: "allow", updatedInput: { answers: button.answers } },
+    }).finally(() => pending.delete(key));
+    return;
   }
 
   const { action } = button;
@@ -611,6 +686,83 @@ export function useReadControl(options: {
   return useMemo(() => ({ available, pending, press, reconcile }), [available, pending, press, reconcile]);
 }
 
+/** Mark unread for a done card, to the left of Archive. */
+export interface UnreadControl {
+  /** The request is out; the button waits and takes no second press. */
+  pending(agentId: string): boolean;
+  press(card: TaskCard): void;
+}
+
+/**
+ * One mark-unread controller for the whole board. The mark is a file the
+ * plugin keeps, so the button does not wait on the daemon: the RPC records
+ * it and the card leaves done. A failure is an error toast. There is no
+ * second check of the card.
+ */
+export function useUnreadControl(options: {
+  /** The server took the unread mark: the board reads its marks again. */
+  onUnread?: (agentId: string) => void;
+  toast?: Pick<ReturnType<typeof useToast>, "error">;
+}): UnreadControl {
+  const unreadRpc = useRpc(tasksUnreadRpc);
+  const hostToast = useToast();
+  const toast = options.toast ?? hostToast;
+  const language = useTasksLanguage();
+  const [pendingIds, setPendingIds] = useState<ReadonlySet<string>>(() => new Set());
+  const pendingRef = useRef<ReadonlySet<string>>(pendingIds);
+  const mountedRef = useRef(false);
+  const latest = useRef({ unreadRpc, toast, language, onUnread: options.onUnread });
+  latest.current = { unreadRpc, toast, language, onUnread: options.onUnread };
+
+  const setPending = useCallback((agentId: string, pending: boolean) => {
+    if (pendingRef.current.has(agentId) === pending) return;
+    const next = new Set(pendingRef.current);
+    if (pending) next.add(agentId);
+    else next.delete(agentId);
+    pendingRef.current = next;
+    setPendingIds(next);
+  }, []);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  const failed = useCallback((detail: string) => {
+    const zh = latest.current.language === "zh";
+    latest.current.toast.error(zh ? `保持未读失败：${detail}` : `Could not keep unread: ${detail}`);
+  }, []);
+
+  const press = useCallback((card: TaskCard) => {
+    if (card.lane !== "done" || card.archived || card.subagent || pendingRef.current.has(card.id)) return;
+    const agentId = card.id;
+    setPending(agentId, true);
+    const timeoutMessage = latest.current.language === "zh" ? "请求没有响应。" : "The request did not answer.";
+    void withTimeout(Promise.resolve().then(() => latest.current.unreadRpc({ agentIds: [agentId] })), READ_RPC_TIMEOUT_MS, timeoutMessage)
+      .then((result) => {
+        if (!mountedRef.current) return;
+        if (!result.ok) {
+          failed(result.error ?? (latest.current.language === "zh" ? "未知错误。" : "Unknown error."));
+          setPending(agentId, false);
+          return;
+        }
+        latest.current.onUnread?.(agentId);
+        setPending(agentId, false);
+      })
+      .catch((error: unknown) => {
+        if (!mountedRef.current) return;
+        failed(shortError(error));
+        setPending(agentId, false);
+      });
+  }, [failed, setPending]);
+
+  const pending = useCallback((agentId: string) => pendingIds.has(agentId), [pendingIds]);
+
+  return useMemo(() => ({ pending, press }), [pending, press]);
+}
+
 /** Unarchive for an archived parent, shown in the details' parent row. */
 export interface UnarchiveControl {
   /** False without the Paseo CLI on the daemon's machine, as for Stop. */
@@ -689,7 +841,7 @@ export function useUnarchiveControl(options: {
 export interface ArchiveControl {
   /** The request is out; the button spins and takes no second press. */
   pending(agentId: string): boolean;
-  press(agentId: string): void;
+  press(agentId: string, scope?: ArchiveScope): void;
 }
 
 /** The daemon archives at once; past this the request has failed. */
@@ -727,20 +879,45 @@ export function useArchiveControl(options: {
     setPendingIds(next);
   }, []);
 
-  const press = useCallback((agentId: string) => {
+  const press = useCallback((agentId: string, scope?: ArchiveScope) => {
     if (pendingRef.current.has(agentId)) return;
-    setPending(agentId, true);
     const zh = latest.current.language === "zh";
-    const timeoutMessage = zh ? "归档请求没有响应。" : "The archive request did not answer.";
-    void withTimeout(Promise.resolve().then(() => latest.current.paseo.agents.ref(agentId).archive()), ARCHIVE_TIMEOUT_MS, timeoutMessage)
-      .catch((error: unknown) => {
-        if (!mountedRef.current) return;
-        const detail = shortError(error);
-        latest.current.toast.error(zh ? `归档失败：${detail}` : `Could not archive: ${detail}`);
-      })
-      .finally(() => {
-        if (mountedRef.current) setPending(agentId, false);
+    const run = () => {
+      if (pendingRef.current.has(agentId)) return;
+      setPending(agentId, true);
+      const timeoutMessage = zh ? "归档请求没有响应。" : "The archive request did not answer.";
+      const progress = { detached: 0, archived: 0 };
+      const request = scope
+        ? archiveScope(latest.current.paseo, agentId, scope, progress)
+        : withTimeout(Promise.resolve().then(() => latest.current.paseo.agents.ref(agentId).archive()), ARCHIVE_TIMEOUT_MS, timeoutMessage);
+      void request
+        .catch((error: unknown) => {
+          if (!mountedRef.current) return;
+          const detail = shortError(error);
+          const partial = progress.detached || progress.archived
+            ? zh ? `已解除 ${progress.detached} 个关联，已归档 ${progress.archived} 个任务；请检查其余任务。` : `Detached ${progress.detached} and archived ${progress.archived}; check the remaining tasks.`
+            : "";
+          latest.current.toast.error(zh ? `归档失败：${detail}${partial}` : `Could not archive: ${detail}${partial ? ` ${partial}` : ""}`);
+        })
+        .finally(() => {
+          if (mountedRef.current) setPending(agentId, false);
+        });
+    };
+    if (scope !== "tree") {
+      run();
+      return;
+    }
+    const title = zh ? "归档所有子任务？" : "Archive all subtasks?";
+    const message = zh ? "当前卡片和所有子任务都会归档。运行中的子任务将被中断。" : "This task and all subtasks will be archived. Running subtasks will be interrupted.";
+    const confirmLabel = zh ? "归档全部" : "Archive all";
+    const cancelLabel = zh ? "取消" : "Cancel";
+    if (Platform.OS === "web") {
+      void confirmDialog({ title, message, confirmLabel, cancelLabel, destructive: true }).then((yes) => {
+        if (yes && mountedRef.current) run();
       });
+      return;
+    }
+    Alert.alert(title, message, [{ text: cancelLabel, style: "cancel" }, { text: confirmLabel, style: "destructive", onPress: run }]);
   }, [setPending]);
 
   const pending = useCallback((agentId: string) => pendingIds.has(agentId), [pendingIds]);

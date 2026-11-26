@@ -1,10 +1,11 @@
 import React, { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode, type RefObject } from "react";
 import { Platform, Pressable, StyleSheet, View, useWindowDimensions, type TextInput as NativeTextInput, type ViewStyle } from "react-native";
-import { Icon, ScrollView, TextInput } from "@getpaseo/plugin/client/react-native";
+import { Icon, ScrollView, TextInput } from "@getpaseo/plugin/client/ui";
 import type { PluginTheme } from "@getpaseo/plugin";
 import { TaskText as Text, HOST_FONT as F, HOST_LINE, TASK_MONO, useTasksFontScale, taskControlHeight } from "../typography";
 import { HAIRLINE, devicePixel } from "./board-style";
 import { taskTokens } from "../cards/tokens";
+import { hoverFill } from "../hover-fill";
 import { useReducedMotion } from "../../ui/use-reduced-motion";
 import { DROPDOWN_REVEAL } from "../../ui/tokens/motion";
 import {
@@ -292,8 +293,8 @@ function MenuSearch(props: {
   const colors = props.theme.colors;
   const [clearHovered, setClearHovered] = useState(false);
   return (
-    <View testID="menu-search">
-      <View style={{ height: menuSearchHeight(scale) - 1, flexDirection: "row", alignItems: "center", gap: MENU.gap, paddingHorizontal: MENU.inset + 8 }}>
+    <View testID="menu-search" style={{ paddingTop: MENU.padV }}>
+      <View style={{ height: menuSearchHeight(scale) - MENU.padV - 1, flexDirection: "row", alignItems: "center", gap: MENU.gap, paddingHorizontal: MENU.inset + 8 }}>
         <Icon name="Search" size={14} color={colors.foregroundMuted} />
         <TextInput
           ref={props.inputRef}
@@ -532,7 +533,8 @@ function MenuRow(props: { item: MenuItem; fitContent?: boolean; theme: PluginThe
   const scale = useTasksFontScale();
   const colors = props.theme.colors;
   const danger = item.danger && !item.disabled ? taskTokens(props.theme).danger : null;
-  const fill = props.active ? chrome.hover : chrome.background;
+  const [pressed, setPressed] = useState(false);
+  const fill = hoverFill(chrome.background, colors.foreground, props.active && !item.disabled, pressed && !item.disabled);
   const leading: ReactNode =
     typeof item.leading === "function" ? item.leading(fill) : item.leading ?? (item.icon ? <Icon name={item.icon} size={MENU.icon} color={danger ?? colors.foregroundMuted} /> : null);
   return (
@@ -542,6 +544,8 @@ function MenuRow(props: { item: MenuItem; fitContent?: boolean; theme: PluginThe
       accessibilityState={{ disabled: item.disabled, checked: item.checked, expanded: item.submenu ? props.active : undefined }}
       disabled={item.disabled}
       onHoverIn={props.onHover}
+      onPressIn={() => setPressed(true)}
+      onPressOut={() => setPressed(false)}
       onPress={props.onPress}
       style={{
         height: menuRowHeight(item, scale),
@@ -551,7 +555,7 @@ function MenuRow(props: { item: MenuItem; fitContent?: boolean; theme: PluginThe
         flexDirection: "row",
         alignItems: "center",
         gap: MENU.gap,
-        backgroundColor: props.active ? chrome.hover : "transparent",
+        backgroundColor: props.active || pressed ? fill : "transparent",
       }}
     >
       {leading}
@@ -564,12 +568,17 @@ function MenuRow(props: { item: MenuItem; fitContent?: boolean; theme: PluginThe
             {item.detail}
           </Text>
         </View>
+      ) : item.trailing ? (
+        <View style={{ flex: 1, flexBasis: props.fitContent ? "auto" : undefined, marginEnd: props.fitContent ? Math.round(32 * Math.max(1, scale)) : undefined, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 4 }}>
+          <Text numberOfLines={1} style={{ flexShrink: 1, fontSize: MENU.fontSize, color: item.disabled ? colors.foregroundMuted : danger ?? colors.foreground }}>{item.label}</Text>
+          {item.trailing}
+        </View>
       ) : (
         <Text numberOfLines={1} style={{ flex: 1, flexBasis: props.fitContent ? "auto" : undefined, marginEnd: props.fitContent ? Math.round(32 * Math.max(1, scale)) : undefined, minWidth: 0, fontSize: MENU.fontSize, color: item.disabled ? colors.foregroundMuted : danger ?? colors.foreground }}>
           {item.label}
         </Text>
       )}
-      {item.trailing}
+      {item.detail ? item.trailing : null}
       {item.hint ? <Text style={{ fontSize: F.sm, color: colors.foregroundMuted, fontVariant: ["tabular-nums"] }}>{item.hint}</Text> : null}
       {Platform.OS === "web" && item.shortcut ? <Text style={{ fontFamily: TASK_MONO, fontSize: F.sm, letterSpacing: 2, color: colors.foregroundMuted }}>{item.shortcut === "Enter" ? "↵" : item.shortcut.toUpperCase()}</Text> : null}
       {item.checked ? <Icon name="Check" size={14} color={colors.accent} /> : item.checked === false ? <View style={{ width: 14 }} /> : null}

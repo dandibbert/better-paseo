@@ -1,10 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import React from "react";
 
-const { copyText, toastShow, motionSetting } = vi.hoisted(() => ({
+const { copyText, toastShow, motionSetting, translate, paseo } = vi.hoisted(() => ({
   copyText: vi.fn(async (_text: string) => {}),
   toastShow: vi.fn(),
   motionSetting: { reduced: false },
+  translate: vi.fn(async (_input: unknown) => ({ state: "error", error: "Test translation error" })),
+  paseo: {},
 }));
 vi.mock("../../client/ui/use-reduced-motion", () => ({ useReducedMotion: () => motionSetting.reduced }));
 function listContext() {
@@ -12,30 +14,33 @@ function listContext() {
   return store.__tableListContext ??= React.createContext<{ getScrollMetrics(): { offset: number } } | null>(null);
 }
 vi.mock("react-native", async () => ({ ...await import("./helpers/rn-mock"), VirtualizedList: { contextType: listContext() } }));
-vi.mock("@getpaseo/plugin/client/react-native", async () => {
+vi.mock("@getpaseo/plugin/client/ui", async () => {
   const rn = await import("./helpers/rn-mock");
   return {
     Icon: (props: Record<string, unknown>) => React.createElement("Icon", props),
     TextInput: rn.TextInput,
     ScrollView: rn.ScrollView,
-    Modal: rn.View,
+    Modal: Object.assign((props: React.ComponentProps<typeof rn.View>) => React.createElement(rn.View, props), { Content: rn.View }),
     copyText,
     useToast: () => ({ show: toastShow, error() {}, success() {} }),
-    useRevealedText: (text: string) => text,
   };
 });
 vi.mock("@getpaseo/plugin/client", () => ({
   useAgent: () => undefined,
   useWorkspace: () => undefined,
-  useRpc: () => () => Promise.resolve(null),
-  usePaseo: () => ({}),
+  useRpc: () => translate,
+  usePaseo: () => paseo,
   useSettings: () => ({ data: undefined, status: "loading" }),
 }));
 
 await import("./helpers/quiet-renderer");
 const { default: TestRenderer, act } = await import("react-test-renderer");
 const { buildThemeTokens } = await import("../../client/components/theme-tokens");
+const { ACCENT_PRESETS, DEFAULT_PREFERENCES } = await import("../../client/preferences");
+const PRESET: keyof typeof ACCENT_PRESETS = "rose";
 const { MarkdownView } = await import("../../client/components/markdown/markdown-view");
+const { SelectionTranslationContext } = await import("../../client/translation/selection");
+const { DEFAULT_TIMELINE_TRANSLATION_SETTINGS, translationSettingsSync } = await import("../../client/translation/settings-store");
 const { ChatComposerContext, quoteCell } = await import("../../client/ui/chat-composer");
 const { StyleSheet, Animated, TurboModuleRegistry } = await import("./helpers/rn-mock");
 const { columnWidths } = await import("../../client/components/markdown/render/table");
@@ -67,10 +72,12 @@ const createNodeMock = () => ({
   measureLayout: (_node: unknown, done: (left: number, top: number) => void) => done(1, measuredRow++ * 30),
 });
 
-function render(text: string, streaming = false, variant: "document" | "compact" | "terminal" = "document", offset?: { current: number }) {
+function render(text: string, streaming = false, variant: "document" | "compact" | "terminal" = "document", offset?: { current: number }, scoped = false) {
   act(() => {
-    const markdown = React.createElement(ChatComposerContext.Provider, { value: { appendText } },
-      React.createElement(MarkdownView, { text, tokens, variant, streaming }));
+    const markdown = React.createElement(SelectionTranslationContext.Provider, {
+      value: scoped ? { agentId: "native-table-agent", kind: "assistant_message", streaming: false } : null,
+    }, React.createElement(ChatComposerContext.Provider, { value: { appendText } },
+      React.createElement(MarkdownView, { text, tokens, variant, streaming })));
     const view = offset ? React.createElement(listContext().Provider,
       { value: { getScrollMetrics: () => ({ offset: offset.current }) } }, markdown) : markdown;
     if (renderer) renderer.update(view);
@@ -89,6 +96,8 @@ afterEach(() => {
   renderer = undefined;
   copyText.mockClear();
   toastShow.mockClear();
+  translate.mockClear();
+  translationSettingsSync.report({ status: "loading" });
   vi.useRealTimers();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
@@ -125,6 +134,30 @@ describe("Markdown table copy", () => {
     act(() => touchFrame().props.onTouchStart(touchAt(index, timestamp)));
     act(() => touchFrame().props.onTouchEnd(touchAt(index, timestamp + 30)));
   };
+
+  it.each(["ios", "android"])("on %s translates a cell range in the translation sheet", async (os) => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = os;
+    vi.useFakeTimers();
+    translationSettingsSync.report({
+      status: "ready", revision: "enabled",
+      values: { ...DEFAULT_TIMELINE_TRANSLATION_SETTINGS, enabled: true, mode: "openai", endpoint: "https://example.com/v1", endpointModel: "test" },
+    });
+    render("| A | B |\n| --- | --- |\n| one | two |\n| three | four |", false, "document", undefined, true);
+    act(() => touchFrame().props.onTouchStart(touchAt(2, 0)));
+    act(() => { vi.advanceTimersByTime(350); });
+    act(() => touchFrame().props.onTouchMove(touchAt(5, 400)));
+    act(() => touchFrame().props.onTouchEnd(touchAt(5, 500)));
+    const button = renderer!.root.findAll((node) => String(node.type) === "Pressable"
+      && node.props.accessibilityLabel === "Translate selected cells")[0]!;
+    expect(translate).not.toHaveBeenCalled();
+    await act(async () => button.props.onPress());
+    expect(translate).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      action: "start", agentId: "native-table-agent", text: "| A | B |\n| --- | --- |\n| one | two |\n| three | four |",
+    }));
+    expect(renderer!.root.findAll((node) => String(node.type) === "View"
+      && node.props.testID === "selection-translation-panel")).toHaveLength(1);
+    expect(selectedCopy()).toHaveLength(0);
+  });
 
   it.each(["ios", "android"])("on %s adds the complete selected cell as a quote and dismisses", (os) => {
     (globalThis as { __rnMockOS?: string }).__rnMockOS = os;
@@ -165,9 +198,9 @@ describe("Markdown table copy", () => {
     expect(selectedCopy()).toHaveLength(0);
     tap(index, 230);
     expect(selectedCopy()).toHaveLength(1);
-    expect(tokens.selectionFill).toBe("rgba(27, 27, 31, 0.06)");
-    expect(tokens.selectionFill).not.toBe(tokens.accentBg);
-    expect(StyleSheet.flatten(cell(index).props.style).backgroundColor).toBe(tokens.selectionFill);
+    expect(tokens.textSelection).toBe("rgba(28, 118, 242, 0.2)");
+    expect(tokens.textSelection).not.toBe(tokens.accentBg);
+    expect(StyleSheet.flatten(cell(index).props.style).backgroundColor).toBe(tokens.textSelection);
     const menu = selectedCopy()[0]!;
     let corner = menu.parent!;
     while (StyleSheet.flatten(corner.props.style).position !== "absolute") corner = corner.parent!;
@@ -178,17 +211,18 @@ describe("Markdown table copy", () => {
     expect(selectedCopy()).toHaveLength(0);
     finishExit(runs);
     expect(buttons()).toHaveLength(1);
-    expect(StyleSheet.flatten(cell(index).props.style).backgroundColor).not.toBe(tokens.selectionFill);
+    expect(StyleSheet.flatten(cell(index).props.style).backgroundColor).not.toBe(tokens.textSelection);
   });
 
   it.each([
-    ["light header", "#ffffff", "#ececee", "#1b1b1f", "#3b6fe0", "rgba(27, 27, 31, 0.06)", "#e4e4e6", 0],
-    ["light body", "#ffffff", "#ececee", "#1b1b1f", "#3b6fe0", "rgba(27, 27, 31, 0.06)", "#e4e4e6", 2],
-    ["dark header", "#18181b", "#2e2e32", "#f2f3f5", "#82aaff", "rgba(242, 243, 245, 0.08)", "#36363a", 0],
-    ["dark body", "#18181b", "#2e2e32", "#f2f3f5", "#82aaff", "rgba(242, 243, 245, 0.08)", "#36363a", 2],
-  ] as const)("distinguishes grey selection from the stronger %s", (_theme, surface0, surface2, foreground, accent, fill, headerFill, index) => {
+    ["light header", "#ffffff", "#ececee", "#1b1b1f", "#3b6fe0", "rgba(28, 118, 242, 0.2)", "#e4e4e6", 0],
+    ["light body", "#ffffff", "#ececee", "#1b1b1f", "#3b6fe0", "rgba(28, 118, 242, 0.2)", "#e4e4e6", 2],
+    ["dark header", "#18181b", "#2e2e32", "#f2f3f5", "#82aaff", "rgba(28, 118, 242, 0.3)", "#36363a", 0],
+    ["dark body", "#18181b", "#2e2e32", "#f2f3f5", "#82aaff", "rgba(28, 118, 242, 0.3)", "#36363a", 2],
+  ] as const)("distinguishes blue selection from the stronger %s", (_theme, surface0, surface2, foreground, accent, fill, headerFill, index) => {
     const themed = buildThemeTokens({ ...colors, surface0, surface2, foreground, accent });
-    expect(buildThemeTokens({ ...colors, surface0, foreground, accent: "#e05030" }).selectionFill).toBe(fill);
+    // Neither the host accent nor the chat's accent preset moves it.
+    expect(buildThemeTokens({ ...colors, surface0, foreground, accent: "#e05030" }, { ...DEFAULT_PREFERENCES, accent: PRESET } as never).textSelection).toBe(fill);
     act(() => {
       renderer = TestRenderer.create(React.createElement(MarkdownView, {
         text: "| A | B |\n| --- | --- |\n| one | two |", tokens: themed,
@@ -201,7 +235,7 @@ describe("Markdown table copy", () => {
     while (String(header.type) !== "View") header = header.parent!;
     expect(StyleSheet.flatten(header.props.style).backgroundColor).toBe(headerFill);
     tap(index, 100); tap(index, 230);
-    expect(themed.selectionFill).toBe(fill);
+    expect(themed.textSelection).toBe(fill);
     expect(StyleSheet.flatten(cell(index).props.style)).toEqual({ ...original, backgroundColor: fill });
     expect(StyleSheet.flatten(cell(index + 1).props.style)).toEqual(unselected);
     expect(StyleSheet.flatten(header.props.style).backgroundColor).toBe(headerFill);
@@ -212,8 +246,8 @@ describe("Markdown table copy", () => {
       variant: "document", streaming: false,
     })));
     expect(switched.isDark).toBe(!themed.isDark);
-    expect(StyleSheet.flatten(cell(index).props.style).backgroundColor).toBe(switched.selectionFill);
-    expect(switched.selectionFill).not.toBe(fill);
+    expect(StyleSheet.flatten(cell(index).props.style).backgroundColor).toBe(switched.textSelection);
+    expect(switched.textSelection).not.toBe(fill);
   });
 
   it("expands the corner into Copy selected without adding any content below the table", () => {
@@ -441,7 +475,7 @@ describe("Markdown table copy", () => {
     });
     const highlighted = () => renderer!.root.findAll((node) => String(node.type) === "Text"
       && node.props.testID === "markdown-table-cell"
-      && StyleSheet.flatten(node.props.style).backgroundColor === tokens.selectionFill).map((node) => node.children.join(""));
+      && StyleSheet.flatten(node.props.style).backgroundColor === tokens.textSelection).map((node) => node.children.join(""));
     const scroller = () => renderer!.root.findAll((node) => node.props.horizontal === true)[0]!;
     expect(touchFrame().props.onMoveShouldSetResponder()).toBe(false);
     act(() => touchFrame().props.onTouchStart(touch(0, 5, 140)));
@@ -511,11 +545,12 @@ describe("Markdown table copy", () => {
         && (node.children[0] === label || node.children[0] === copied));
       expect(labels()).toHaveLength(0);
       expect(StyleSheet.flatten(buttons()[0]!.props.style)).toMatchObject({
-        width: 30, height: 30, borderWidth: 1, borderRadius: 12, borderColor: tokens.v2.border,
+        width: 30, height: 30, borderWidth: 1, borderRadius: 15, borderColor: tokens.v2.border,
       });
       act(() => { buttons()[0]!.props.onHoverIn(); });
       // The frame's edge stays light on hover: only the fill marks it.
-      expect(StyleSheet.flatten(buttons()[0]!.props.style)).toMatchObject({ borderColor: tokens.v2.border, backgroundColor: tokens.v2.surface2 });
+      expect(StyleSheet.flatten(buttons()[0]!.props.style)).toMatchObject({ borderColor: tokens.v2.border });
+      expect(StyleSheet.flatten(buttons()[0]!.findByProps({ testID: "toolbar-icon-fill" }).props.style)).toMatchObject({ width: 24, height: 24, borderRadius: 12, backgroundColor: tokens.v2.surface2 });
       act(() => { vi.advanceTimersByTime(TOOLBAR_TOOLTIP_MS - 1); });
       expect(labels()).toHaveLength(0);
       act(() => { vi.advanceTimersByTime(1); });

@@ -9,7 +9,7 @@ import TestRenderer, { act } from "react-test-renderer";
 import "./helpers/quiet-renderer";
 
 vi.mock("react-native", () => import("./helpers/rn-mock"));
-vi.mock("@getpaseo/plugin/client/react-native", () => ({ Icon: "Icon" }));
+vi.mock("@getpaseo/plugin/client/ui", () => ({ Icon: "Icon" }));
 vi.mock("../../client/ui/use-input-capabilities", () => ({ useInputCapabilities: () => ({ hover: true, native: false }), noteHover: vi.fn() }));
 vi.mock("../../client/web", () => ({
   bindRowHover: () => () => {},
@@ -19,6 +19,7 @@ vi.mock("../../client/web", () => ({
   watchNextPointerMove: () => () => {},
   watchPointerOutside: () => () => {},
   openPreviewLayer: () => () => {},
+  pinTooltipLayer: () => () => {},
 }));
 import { HoverPreview, HoverPreviewHeader, useHoverPreview } from "../../client/ui/hover-preview";
 import { BlockPlacementContext } from "../../client/details/contracts";

@@ -1,18 +1,20 @@
 import { createContext, useCallback, useContext, useEffect, useId, useLayoutEffect, useRef, useState, type ReactNode, type RefObject } from "react";
-import { Animated, Modal, Platform, Pressable, StyleSheet, Text, View, useWindowDimensions, type ViewStyle, type StyleProp, type ViewProps } from "react-native";
-import { Icon } from "@getpaseo/plugin/client/react-native";
+import { Animated, Modal, Platform, Pressable, StyleSheet, Text, View, useWindowDimensions, type ViewStyle, type StyleProp, type ViewProps, type GestureResponderEvent } from "react-native";
+import { Icon } from "@getpaseo/plugin/client/ui";
 import type { ExtendedThemeTokens } from "../components/theme-tokens";
 import { radiusV2, space } from "../components/theme-tokens";
 import { unselectable } from "../components/selection";
 import { useCopy } from "./use-copy";
 import { useHover } from "./use-hover";
+import { iconHoverSize } from "./icon-hover-size";
 import { UI_SCALE } from "./tokens/typography";
 import { cssShadow } from "./tokens/css-shadow";
 import { FLOAT, floatShadow } from "./tokens/float";
 import { useEnhancerPreferences } from "../preferences";
 import { toolbarLabel } from "../i18n/toolbar-strings";
 import { anchoredTooltipOrigin, liftStackingRow, placeTooltipNear, type DomBox, type TooltipPlacement, type WindowBox } from "./tooltip-placement";
-import { bindDetailsEscape, bindRowHover, bindTouchDismiss, openToolbarDetailsLayer, suppressTouchCallout } from "../web";
+import { bindDetailsEscape, bindPreviewFrame, bindRowHover, bindTouchDismiss, openToolbarDetailsLayer, pinTooltipLayer, suppressTouchCallout } from "../web";
+import type { PreviewBox } from "./preview-frame";
 import { useInputCapabilities } from "./use-input-capabilities";
 import { SafeInset } from "./safe-inset";
 import { usePreviewEntrance } from "./use-preview-entrance";
@@ -39,12 +41,13 @@ export const TooltipAlignContext = createContext<TooltipAlign>("center");
  * that paints over the one before it, so a name below would vanish under the
  * next row; `auto` opens it above unless the list's top edge leaves no room.
  */
-export const TooltipSideContext = createContext<"below" | "auto">("below");
+export const TooltipSideContext = createContext<"below" | "above" | "auto">("below");
+export const ToolbarHoverColorContext = createContext<string | null>(null);
 
 /**
  * The size of a toolbar's buttons and their icons. The hover panel's are 24
  * with a 14 icon; the details panel's header and toolbar set 36 on touch and
- * 28 with a pointer (docs/prototypes/block-details-sheet.md, table 5.2).
+ * 28 with a pointer (https://github.com/RoundRedDot/better-paseo/blob/f2ab453297c4ccb88a08e2129af0cb3528c4e628/docs/prototypes/block-details-sheet.md, table 5.2).
  */
 export interface ToolbarMetrics {
   button: number;
@@ -109,7 +112,7 @@ interface ToolbarButtonProps {
  */
 export function ToolbarButton({ icon, color, tokens, ...props }: ToolbarButtonProps) {
   const metrics = useContext(ToolbarMetricsContext);
-  return <ToolbarItem {...props} tokens={tokens}>
+  return <ToolbarItem {...props} tokens={tokens} iconSize={metrics.icon}>
     <Icon name={icon} size={metrics.icon} color={color ?? tokens.foregroundMuted} />
   </ToolbarItem>;
 }
@@ -142,14 +145,20 @@ export function ToolbarItem({
   onLongPress,
   onLayout,
   pressedStyle,
+  iconSize,
+  iconBackground,
+  testID,
 }: Omit<ToolbarButtonProps, "icon" | "color" | "onPress"> & {
   /** Or drawn from the hover state, for an icon that brightens under the pointer. */
   children: ReactNode | ((state: { hovered: boolean }) => ReactNode);
-  onPress?: () => void;
+  onPress?: (event: GestureResponderEvent) => void;
+  testID?: string;
+  iconSize?: number;
+  iconBackground?: string;
   buttonStyle?: StyleProp<ViewStyle>;
   /**
-   * Applied last, over the toolbar's own disabled and hover looks: a button
-   * with a look of its own (the image viewer's filled squares) keeps it.
+   * Applied last, over the toolbar's own disabled and hover looks, for a
+   * button with its own pressed appearance.
    */
   pressedStyle?: (state: { pressed: boolean }) => StyleProp<ViewStyle>;
   hitSlop?: number;
@@ -165,8 +174,10 @@ export function ToolbarItem({
   const sideMode = useContext(TooltipSideContext);
   const metrics = useContext(ToolbarMetricsContext);
   const sized = metrics.button !== TOOLBAR_METRICS.button;
+  const hoverColor = useContext(ToolbarHoverColorContext) ?? tokens.v2.surface2;
   const anchorRef = useRef<View>(null);
   const detailsRef = useRef<View>(null);
+  const tooltipRef = useRef<View>(null);
   const [side, setSide] = useState<TooltipPlacement>("below");
   const preferences = useEnhancerPreferences();
   const spoken = useContext(SpokenLabelsContext);
@@ -193,6 +204,10 @@ export function ToolbarItem({
     const releaseHover = bindRowHover(detailsRef.current, () => setInsideDetails(true), () => setInsideDetails(false));
     return () => { releaseHover(); releaseLayer(); };
   }, [Boolean(details), open, side]);
+  useLayoutEffect(() => {
+    if (details || !open || Platform.OS !== "web") return;
+    return pinTooltipLayer?.(tooltipRef.current, anchorRef.current);
+  }, [Boolean(details), open]);
   useEffect(() => {
     if (details) suppressTouchCallout(anchorRef.current);
   }, [details]);
@@ -215,7 +230,7 @@ export function ToolbarItem({
       return;
     }
     const timer = setTimeout(() => {
-      setSide(sideMode === "auto" ? placeTooltipNear(anchorRef.current, Platform.OS, details ? 320 : undefined) : "below");
+      setSide(sideMode === "above" ? "above" : sideMode === "auto" ? placeTooltipNear(anchorRef.current, Platform.OS, details ? 320 : undefined) : "below");
       setNamed(true);
     }, TOOLBAR_TOOLTIP_MS);
     return () => clearTimeout(timer);
@@ -238,6 +253,7 @@ export function ToolbarItem({
     <View ref={anchorRef} collapsable={details || onLongPress ? false : undefined} onLayout={onLayout}
       style={[styles.anchor, open && styles.raised]}>
       <Pressable
+        testID={testID}
         accessibilityRole={onPress ? "button" : "image"}
         accessibilityLabel={spoken ? toolbarLabel(accessibilityLabel, preferences.language) : accessibilityLabel}
         accessibilityState={onPress ? checked === undefined ? { disabled } : { disabled, checked } : undefined}
@@ -255,23 +271,33 @@ export function ToolbarItem({
         {...hoverProps}
         style={({ pressed }) => [
           styles.button,
-          sized && { width: metrics.button, height: metrics.button, borderRadius: radiusV2.block },
+          sized && { width: metrics.button, height: metrics.button, borderRadius: metrics.button / 2 },
           Platform.OS === "web" && onPress && styles.pointer,
           outlined && styles.outlined,
           outlined && { borderColor: tokens.v2.border },
           buttonStyle,
           disabled && styles.disabled,
-          onPress && !disabled && hovered && { backgroundColor: tokens.v2.surface2 },
-          onPress && !disabled && pressed && { backgroundColor: tokens.v2.surface2 },
+          iconSize === undefined && onPress && !disabled && hovered && { backgroundColor: hoverColor },
+          iconSize === undefined && onPress && !disabled && pressed && { backgroundColor: hoverColor },
           pressedStyle?.({ pressed }),
         ]}
       >
-        {typeof children === "function" ? children({ hovered }) : children}
+        {({ pressed }) => {
+          const content = typeof children === "function" ? children({ hovered }) : children;
+          return iconSize !== undefined && onPress && (!disabled && (hovered || pressed) || iconBackground !== undefined) ? (
+            <View pointerEvents="none" testID="toolbar-icon-fill"
+              style={{ width: iconHoverSize(iconSize), height: iconHoverSize(iconSize), borderRadius: iconHoverSize(iconSize) / 2,
+                alignItems: "center", justifyContent: "center",
+                backgroundColor: !disabled && (hovered || pressed) ? hoverColor : iconBackground ?? "transparent" }}>
+              {content}
+            </View>
+          ) : content;
+        }}
       </Pressable>
       {pressedOpen && Platform.OS !== "web" ? (
         <AnchoredToolbarDetails anchor={anchorRef} close={closeDetails} width={detailsWidth} tokens={tokens}>{details}</AnchoredToolbarDetails>
       ) : open ? (
-        <View pointerEvents={details ? "box-none" : "none"}
+        <View ref={tooltipRef} collapsable={false} pointerEvents={details ? "box-none" : "none"}
           style={[styles.tooltipSlot, side === "above" ? styles.above : styles.below, ALIGN[align],
             sized && align === "center" && { left: metrics.button / 2 - TOOLTIP_SLOT / 2 },
             details ? { width: detailsWidth, marginTop: 0, marginBottom: 0 } : null]}>
@@ -324,14 +350,19 @@ export function CenteredToolbarDetails({ close, children, tokens, width = TOOLTI
 }
 
 /** The modal avoids clipping by native timeline rows; its panel stays by the pressed control. */
-export function AnchoredToolbarDetails({ anchor, close, children, tokens, width = TOOLTIP_SLOT }: {
+export const ResizedToolbarDetailsContext = createContext(false);
+
+export function AnchoredToolbarDetails({ anchor, close, children, tokens, width = TOOLTIP_SLOT, movable = false }: {
   anchor: RefObject<View | null>;
   close(): void;
   children: ReactNode;
   width?: number;
   tokens: ExtendedThemeTokens;
+  movable?: boolean;
 }) {
   const stageRef = useRef<View>(null);
+  const panelRef = useRef<View>(null);
+  const [box, setBox] = useState<PreviewBox | null>(null);
   const [bounds, setBounds] = useState<{ anchor: WindowBox; stage: WindowBox } | null>(null);
   const [panel, setPanel] = useState<{ width: number; height: number } | null>(null);
   const [shown, setShown] = useState(false);
@@ -345,6 +376,21 @@ export function AnchoredToolbarDetails({ anchor, close, children, tokens, width 
     });
   }, [anchor]);
   const origin = bounds && panel ? anchoredTooltipOrigin(bounds.anchor, bounds.stage, panel) : null;
+  useLayoutEffect(() => {
+    if (!movable || !bounds || !origin) return;
+    const node = panelRef.current as unknown as HTMLElement | null;
+    if (!node) return;
+    return bindPreviewFrame(node, {
+      toolbar: () => node.querySelector('[data-testid="translation-header"]'),
+      readBox: () => {
+        const rect = node.getBoundingClientRect();
+        return { x: rect.left - bounds.stage.x, y: rect.top - bounds.stage.y, width: rect.width, height: rect.height };
+      },
+      writeBox: setBox,
+      hold: () => {}, place: () => {}, leave: () => {},
+      bounds: () => ({ width: bounds.stage.width, height: bounds.stage.height }),
+    });
+  }, [movable, bounds, Boolean(origin)]);
   return (
     <Modal visible transparent animationType="none" onRequestClose={close} onShow={() => { setShown(true); measure(); }} statusBarTranslucent>
       <Pressable accessibilityRole="button" accessibilityLabel="Close preview"
@@ -352,16 +398,16 @@ export function AnchoredToolbarDetails({ anchor, close, children, tokens, width 
       <SafeInset pointerEvents="box-none" style={StyleSheet.absoluteFill}>
         <View ref={stageRef} collapsable={false} testID="toolbar-details-stage" pointerEvents="box-none"
           onLayout={measure} style={{ flex: 1 }}>
-          <View testID="toolbar-details-panel" accessibilityViewIsModal
+          <View ref={panelRef} testID="toolbar-details-panel" accessibilityViewIsModal
             pointerEvents={origin ? "auto" : "none"} accessibilityElementsHidden={!origin}
             onLayout={(event) => {
               const { width, height } = event.nativeEvent.layout;
               setPanel((previous) => previous?.width === width && previous.height === height ? previous : { width, height });
             }}
-            style={{ position: "absolute", width: bounds ? Math.min(width, bounds.stage.width - 16) : width,
-              maxWidth: "100%", opacity: origin ? 1 : 0, left: origin?.left ?? 0, top: origin?.top ?? 0 }}>
-            <ToolbarDetailsFrame tokens={tokens} ready={shown && origin !== null}>
-              {children}
+            style={{ position: "absolute", width: box?.width ?? (bounds ? Math.min(width, bounds.stage.width - 16) : width),
+              height: box?.height, maxWidth: "100%", opacity: origin ? 1 : 0, left: box?.x ?? origin?.left ?? 0, top: box?.y ?? origin?.top ?? 0 }}>
+            <ToolbarDetailsFrame tokens={tokens} ready={shown && origin !== null} stretch={box !== null}>
+              <ResizedToolbarDetailsContext.Provider value={box !== null}>{children}</ResizedToolbarDetailsContext.Provider>
             </ToolbarDetailsFrame>
           </View>
         </View>
@@ -371,15 +417,15 @@ export function AnchoredToolbarDetails({ anchor, close, children, tokens, width 
 }
 
 /** Shared popup frame; desktop dropdown motion does not change its measured bounds. */
-export function ToolbarDetailsFrame({ tokens, children, side = "above", ready = true }: {
-  tokens: ExtendedThemeTokens; children: ReactNode; side?: TooltipPlacement; ready?: boolean;
+export function ToolbarDetailsFrame({ tokens, children, side = "above", ready = true, stretch = false }: {
+  tokens: ExtendedThemeTokens; children: ReactNode; side?: TooltipPlacement; ready?: boolean; stretch?: boolean;
 }) {
   const shift = Platform.OS === "web" ? DROPDOWN_REVEAL.shift : PREVIEW_REVEAL.shift;
   const entrance = usePreviewEntrance({ ready, from: side === "below" ? -shift : shift, dropdown: true });
-  return <Animated.View style={[entrance, Platform.OS === "web" && { transformOrigin: side === "below" ? "center top" : "center bottom" }]}>
+  return <Animated.View style={[entrance, stretch && { flex: 1 }, Platform.OS === "web" && { transformOrigin: side === "below" ? "center top" : "center bottom" }]}>
     <View testID="toolbar-details-frame" style={{ backgroundColor: tokens.surface0, borderColor: tokens.v2.border,
-      borderWidth: 1, borderRadius: FLOAT.radius, boxShadow: floatShadow(tokens) }}>
-      <View style={{ borderRadius: FLOAT.radius - 1, overflow: "hidden" }}>{children}</View>
+      borderWidth: 1, borderRadius: FLOAT.radius, boxShadow: floatShadow(tokens), flex: stretch ? 1 : undefined }}>
+      <View style={{ borderRadius: FLOAT.radius - 1, overflow: "hidden", flex: stretch ? 1 : undefined }}>{children}</View>
     </View>
   </Animated.View>;
 }
@@ -459,14 +505,14 @@ const styles = StyleSheet.create({
   button: {
     width: 24,
     height: 24,
-    borderRadius: radiusV2.chip,
+    borderRadius: 12,
     alignItems: "center",
     justifyContent: "center",
   },
   pointer: { cursor: "pointer" } as ViewStyle,
   // A standalone button takes the floating controls' frame (float.ts), so the
   // table's touch button matches the menu a pointer opens.
-  outlined: { width: FLOAT.control, height: FLOAT.control, borderWidth: 1, borderRadius: FLOAT.radius },
+  outlined: { width: FLOAT.control, height: FLOAT.control, borderWidth: 1, borderRadius: FLOAT.control / 2 },
   disabled: { opacity: 0.35 },
   tooltipSlot: {
     position: "absolute",

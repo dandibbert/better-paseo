@@ -1,62 +1,84 @@
+import { sidebarSurface } from "../../client/ui/tokens/sidebar-shadow";
+import { resetUpdateIndicatorsForTests } from "../../client/tasks/board/update-indicator";
+import { resetAgentUpdatesForTests } from "../../client/agent-updates";
 import React from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import TestRenderer, { act, type ReactTestInstance } from "react-test-renderer";
 import "./helpers/quiet-renderer";
-import { measureHostTree } from "./helpers/yoga-host-layout";
+import { hostChildren, measureHostTree } from "./helpers/yoga-host-layout";
+import * as todoSummary from "../../client/tasks/data/todo-summary";
 
 vi.mock("react-native", async () => {
   const rn = await import("./helpers/rn-mock");
   const AppState = { currentState: "active", addEventListener: () => ({ remove() {} }) };
-  return { ...rn, AppState, default: { ...rn.default, AppState } };
+  return { ...rn, AppState, findNodeHandle: (node: { nativeTag?: number } | null) => node?.nativeTag ?? null, default: { ...rn.default, AppState } };
 });
-vi.mock("@getpaseo/plugin/client/react-native", async () => {
-  const rn = await import("./helpers/rn-mock");
-  const React = await import("react");
-  type Props = Record<string, unknown> & { children?: React.ReactNode };
-  // Renders every item, header and footer in place: enough to count what a lane shows.
-  function FlatList(props: Props) {
-    const data = (props.data as unknown[]) ?? [];
-    const render = props.renderItem as (info: { item: unknown; index: number }) => React.ReactNode;
-    const key = props.keyExtractor as (item: unknown, index: number) => string;
-    const empty = props.ListEmptyComponent as React.ReactNode;
-    return React.createElement(
-      "FlatList",
-      { ref: props.ref, testID: props.testID, refreshing: props.refreshing, onRefresh: props.onRefresh, alwaysBounceVertical: props.alwaysBounceVertical, onContentSizeChange: props.onContentSizeChange, onScroll: props.onScroll, contentContainerStyle: props.contentContainerStyle, onScrollToIndexFailed: props.onScrollToIndexFailed, onEndReached: props.onEndReached, data: props.data, viewabilityConfigCallbackPairs: props.viewabilityConfigCallbackPairs },
-      data.length
-        ? data.map((item, index) => {
-            host.rowRenders += 1;
-            const lane = (item as TaskCard).lane;
-            host.laneRowRenders[lane] = (host.laneRowRenders[lane] ?? 0) + 1;
-            return React.createElement(React.Fragment, { key: key(item, index) }, render({ item, index }));
-          })
-        : empty,
-      props.ListFooterComponent as React.ReactNode,
-    );
-  }
-  function Modal(props: Props) {
-    return props.open ? React.createElement("Modal", { title: props.title }, props.children) : null;
-  }
-  Modal.Content = (props: Props) => React.createElement("ModalContent", null, props.children);
-  return {
-    Icon: (props: Props) => React.createElement("Icon", { name: props.name, size: props.size }),
-    FlatList,
-    Modal,
-    ScrollView: rn.ScrollView,
-    TextInput: rn.TextInput,
-    useToast: () => ({ show: host.toast, error: host.toast }),
-    copyText: async () => {},
-  };
+// Board layout tests do not provide a DOM; the selection controller has its own DOM tests.
+vi.mock("../../client/components/selection-actions", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../../client/components/selection-actions")>(),
+  useSelectionActions() {},
+}));
+vi.mock("@getpaseo/plugin/client/ui", async () => {
+  // The plugin imports all of these from `client/ui` now; where both mocks name a key, the UI one wins.
+  const fromReactNative = await (async () => {
+    const rn = await import("./helpers/rn-mock");
+    const React = await import("react");
+    type Props = Record<string, unknown> & { children?: React.ReactNode };
+    // Renders every item, header and footer in place: enough to count what a lane shows.
+    function FlatList(props: Props) {
+      const data = (props.data as unknown[]) ?? [];
+      const render = props.renderItem as (info: { item: unknown; index: number }) => React.ReactNode;
+      const key = props.keyExtractor as (item: unknown, index: number) => string;
+      const empty = props.ListEmptyComponent as React.ReactNode;
+      return React.createElement(
+        "FlatList",
+        { ref: props.ref, testID: props.testID, refreshing: props.refreshing, onRefresh: props.onRefresh, refreshControl: props.refreshControl, alwaysBounceVertical: props.alwaysBounceVertical, onContentSizeChange: props.onContentSizeChange, onScroll: props.onScroll, contentOffset: props.contentOffset, contentContainerStyle: props.contentContainerStyle, onScrollToIndexFailed: props.onScrollToIndexFailed, onEndReached: props.onEndReached, data: props.data, viewabilityConfigCallbackPairs: props.viewabilityConfigCallbackPairs },
+        data.length
+          ? data.map((item, index) => {
+              host.rowRenders += 1;
+              const lane = (item as TaskCard).lane;
+              host.laneRowRenders[lane] = (host.laneRowRenders[lane] ?? 0) + 1;
+              return React.createElement(React.Fragment, { key: key(item, index) }, render({ item, index }));
+            })
+          : empty,
+        props.ListFooterComponent as React.ReactNode,
+      );
+    }
+    function Modal(props: Props) {
+      return props.open ? React.createElement("Modal", { title: props.title }, props.children) : null;
+    }
+    Modal.Content = (props: Props) => React.createElement("ModalContent", { contentContainerStyle: props.contentContainerStyle }, props.children, props.footer as React.ReactNode);
+    Modal.supportsFooter = false;
+    return {
+      Icon: (props: Props) => React.createElement("Icon", { name: props.name, icon: props.icon, size: props.size, color: props.color }),
+      FlatList,
+      Modal,
+      ScrollView: rn.ScrollView,
+      TextInput: rn.TextInput,
+      useToast: () => ({ show: host.toast, error: host.toast }),
+      copyText: async () => {},
+    };
+  })();
+  const fromUi = await (async () => {
+    const React = await import("react");
+    return {
+      SidebarRow: (props: Record<string, unknown> & { trailing?: React.ReactNode }) =>
+        React.createElement("SidebarRow", { label: props.label, active: props.active, onPress: props.onPress }, props.trailing),
+    };
+  })();
+  return { ...fromReactNative, ...fromUi };
 });
 const host = vi.hoisted(() => ({
   toast: vi.fn(),
   settings: null as Record<string, unknown> | null,
   /** The automatic title settings; loading while null. */
   titleSettings: null as Record<string, unknown> | null,
-  counts: null as { running: number; needsInput: number; review: number; done: number; hidden?: import("../../client/tasks/model").TaskCard[] } | null,
+  counts: null as { running: number; needsInput: number; review: number; done: number; hidden?: import("../../client/tasks/model").TaskCard[]; questions?: import("../../client/tasks/model").TaskCard[] } | null,
   /** The filters the sidebar row last counted with. */
   countScope: null as unknown,
   canStop: false,
   updateState: { state: "idle" } as unknown,
+  agentUpdates: { state: "idle", entries: [], error: null } as unknown,
   save: vi.fn(async (_values: unknown, _revision: string) => true),
   reload: vi.fn(async () => {}),
   /** Rows a lane's list drew, counted by the FlatList mock. */
@@ -74,19 +96,13 @@ const paseo = vi.hoisted(() => ({
 }));
 vi.mock("@getpaseo/plugin/client", () => ({
   usePaseo: () => paseo,
-  useRpc: (contract: { name: string }) => (input: { agentIds?: string[] }) => Promise.resolve(contract.name === "tasks.availability" ? { entries: input.agentIds!.map((agentId) => ({ agentId, availability: { issue: null, blocked: {} } })) } : contract.name === "settings.update-check" ? host.updateState : { stop: host.canStop }),
+  useRpc: (contract: { name: string }) => (input: { agentIds?: string[] }) => Promise.resolve(contract.name === "tasks.availability" ? { entries: input.agentIds!.map((agentId) => ({ agentId, availability: { issue: null, blocked: {} } })) } : contract.name === "settings.agent-updates" ? host.agentUpdates : contract.name === "settings.update-check" ? host.updateState : { stop: host.canStop }),
   useSettings: (definition: { id: string }) => {
+    if (definition.id === "presentation" || definition.id === "timeline-translation") return { status: "loading" };
     const values = definition.id === "title-generation" ? host.titleSettings : host.settings;
     return values ? { status: "ready", values, revision: "1", saving: false, saveError: null, save: host.save, reload: host.reload } : { status: "loading" };
   },
 }));
-vi.mock("@getpaseo/plugin/client/ui", async () => {
-  const React = await import("react");
-  return {
-    SidebarRow: (props: Record<string, unknown> & { trailing?: React.ReactNode }) =>
-      React.createElement("SidebarRow", { label: props.label, active: props.active, onPress: props.onPress }, props.trailing),
-  };
-});
 // The data layer's real body needs a daemon; the board is tested against the samples.
 vi.mock("../../client/tasks/data", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../client/tasks/data")>();
@@ -124,17 +140,25 @@ vi.mock("../../client/tasks/data", async (importOriginal) => {
   };
 });
 
+// Counts the filter options built from outside the module (the sidebar, the
+// board's open filter panel); `readFilterOptions`' own call is not counted.
+vi.mock("../../client/tasks/board/filter-options", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../client/tasks/board/filter-options")>();
+  return { ...actual, buildFilterOptions: vi.fn(actual.buildFilterOptions) };
+});
+
 import { AccessibilityInfo, Animated, StyleSheet, View } from "react-native";
-import { Modal } from "@getpaseo/plugin/client/react-native";
+import { buildFilterOptions } from "../../client/tasks/board/filter-options";
+import { Modal } from "@getpaseo/plugin/client/ui";
 import { ProviderLogo } from "../../client/components/provider-logo";
 import * as data from "../../client/tasks/data";
 import { firstPromptStoreFor } from "../../client/tasks/data/first-prompt";
 import { TasksBoardScreen } from "../../client/tasks/board/board-screen";
-import { CardCell, RollingCount, RollingTotal, WindowSegments } from "../../client/tasks/board/board-parts";
+import { CardCell, RollingCount, RollingTotal, SlashMark, WindowSegments } from "../../client/tasks/board/board-parts";
 import { createLaneMotionStore, LaneMotionLayer, LaneMotionProvider } from "../../client/tasks/board/lane-motion";
 import { TasksSidebarEntry } from "../../client/tasks/board/sidebar-entry";
 import { contributeTasks } from "../../client/tasks/contribute";
-import { lastBoardParams, rememberBoardParams, rememberCollapsed, rememberedCollapsed, resetBoardSessions, EMPTY_PARAMS, type BoardParams } from "../../client/tasks/board/params";
+import { boardClearCount, consumeBoardOpen, encodeBoardParams, lastBoardParams, rememberBoardParams, rememberBoardRoute, rememberCollapsed, rememberLane, rememberedCollapsed, requestBoardClear, requestBoardOpen, resetBoardSessions, EMPTY_PARAMS, type BoardParams } from "../../client/tasks/board/params";
 import { TabletToolbar } from "../../client/tasks/board/tablet-toolbar";
 import { DesktopFilterBar as DesktopFilterBarMemo, DesktopToolbar as DesktopToolbarMemo } from "../../client/tasks/board/filter-bar";
 import { LaneWidthMark } from "../../client/tasks/board/lane-width-mark";
@@ -145,10 +169,12 @@ import { readSidebarPreference, resetSidebarPreference, writeSidebarPreference }
 import { MOTION } from "../../client/tasks/board/board-style";
 import { ACTIVE_LANE_ORDER as LANE_ORDER, type TaskCard } from "../../client/tasks/model";
 import { BrandMark, DetailActionBar, PiMark, TagMark, TaskCardView, TaskDetailCards, taskTokens } from "../../client/tasks/cards";
+import { hoverFill } from "../../client/tasks/hover-fill";
 import { deviceTasksStore } from "../../client/tasks/device-preferences";
 import { DEFAULT_TASKS_SETTINGS as STOCK_SETTINGS } from "../../shared/tasks-settings";
 import { resetTasksEnabled, setTasksSettingsOpener } from "../../client/tasks/board/enabled";
 import { createFakePaseo, makeAgent } from "./helpers/fake-paseo";
+import { asExitPlan } from "./helpers/plan-request";
 import { TitleLoading } from "../../client/tasks/cards/title-loading";
 import { titleGenerationSettingsSchema, type TitleUpdateState } from "../../shared/title-generation";
 import { APP_SETTINGS_KEY, resetHostAppearanceForTests, setNativeSettingsReaderForTests, triggerHostAppearanceCheck } from "../../client/ui/tokens/host-appearance-shim";
@@ -157,12 +183,18 @@ import { APP_SETTINGS_KEY, resetHostAppearanceForTests, setNativeSettingsReaderF
 // (tasks-board-enabled.test.ts covers the board off).
 const DEFAULT_TASKS_SETTINGS = { ...STOCK_SETTINGS, enabled: true, board: { ...STOCK_SETTINGS.board, showArchived: false } };
 import { resetEnhancerPreferences, updateEnhancerPreferences } from "../../client/preferences";
+import { questionDialogStore } from "../../client/tasks/actions/question-dialog";
 
 // The bars are memoized: a rendered instance's type is the component inside the memo.
 const DesktopFilterBar = (DesktopFilterBarMemo as unknown as { type: React.ComponentType }).type;
 const DesktopToolbar = (DesktopToolbarMemo as unknown as { type: React.ComponentType }).type;
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+// React Native's runtime has frame callbacks and Node does not: here a frame is a 16 ms timer, so fake timers drive it.
+Object.assign(globalThis, {
+  requestAnimationFrame: (callback: (time: number) => void) => setTimeout(() => callback(Date.now()), 16),
+  cancelAnimationFrame: (handle: ReturnType<typeof setTimeout>) => clearTimeout(handle),
+});
 
 const theme = {
   colors: {
@@ -230,11 +262,24 @@ function layOut(width: number) {
   }
 }
 
+/** A lane list's room past its last card: its padding and the bottom sheet's spacer in its footer. */
+function laneEnd(list: ReactTestInstance): number {
+  const spacer = list.findAll((node) => typeof node.type === "string" && typeof node.props.testID === "string" && node.props.testID.startsWith("lane-room-"))[0];
+  return StyleSheet.flatten(list.props.contentContainerStyle).paddingBottom + (spacer ? StyleSheet.flatten(spacer.props.style).height as number : 0);
+}
+
 function finishSidebarCloseImmediately() {
   const timing = Animated.timing;
-  vi.spyOn(Animated, "timing").mockImplementation((value, config) => config.toValue === 0 && config.duration === 180
-    ? { start: (done) => { (value as Animated.Value).setValue(0); done?.({ finished: true }); }, stop: () => {}, reset: () => {} }
+  vi.spyOn(Animated, "timing").mockImplementation((value, config) => (config.toValue === 0 || value === sheetSlide()) && (config.duration === 180 || config.duration === 200)
+    ? { start: (done) => { (value as Animated.Value).setValue(config.toValue as number); done?.({ finished: true }); }, stop: () => {}, reset: () => {} }
     : timing(value, config));
+}
+
+/** What moves the bottom sheet in and out (`BoardSheet`'s translateY), if it is up. */
+function sheetSlide(): unknown {
+  const sheet = renderer?.root.findAll((node) => typeof node.type === "string" && node.props.testID === "board-sheet")[0];
+  const transform = sheet ? (StyleSheet.flatten(sheet.props.style).transform as { translateY?: unknown }[] | undefined) : undefined;
+  return transform?.[0]?.translateY;
 }
 
 /** Host nodes with a test id (composites carry the same props). */
@@ -263,17 +308,17 @@ function cards(): ReactTestInstance[] {
   return renderer!.root.findAllByType(TaskCardView);
 }
 
-interface HeldRun { value: Animated.Value; to: number; duration: number; done?: (result: { finished: boolean }) => void; over: boolean }
+interface HeldRun { value: Animated.Value; to: number; duration: number; native?: boolean; done?: (result: { finished: boolean }) => void; over: boolean }
 
 /**
  * `Animated.timing` runs that end only when the test finishes them; a stop
  * ends one unfinished, as React Native does. `sheet` lists the bottom
- * sheet's height runs.
+ * sheet's shift runs (how far down from its full height it stands).
  */
 function holdTimings() {
   const runs: HeldRun[] = [];
   const spy = vi.spyOn(Animated, "timing").mockImplementation((value, config) => {
-    const run: HeldRun = { value: value as Animated.Value, to: config.toValue as number, duration: config.duration as number, over: false };
+    const run: HeldRun = { value: value as Animated.Value, to: config.toValue as number, duration: config.duration as number, native: config.useNativeDriver, over: false };
     runs.push(run);
     return {
       start: (done) => { run.done = done; },
@@ -285,14 +330,21 @@ function holdTimings() {
       reset: () => {},
     };
   });
-  const sheetValue = () => StyleSheet.flatten(hostsById("board-sheet")[0]!.props.style).height as unknown as Animated.Value;
+  // How far down from its full height the sheet stands (`BoardSheet`'s shift): 0 at full, 792 - 464 at half.
+  const sheetValue = () => (StyleSheet.flatten(hostsById("board-sheet-body")[0]!.props.style).transform as { translateY: unknown }[])[0]!.translateY as Animated.Value;
   const sheet = () => runs.filter((run) => run.value === sheetValue());
+  const slide = () => runs.filter((run) => run.value === sheetSlide());
   const finish = (run: HeldRun) => act(() => {
     run.over = true;
     run.value.setValue(run.to);
     run.done?.({ finished: true });
   });
-  return { sheet, sheetValue, finish, restore: () => spy.mockRestore() };
+  return { runs: () => runs, sheet, sheetValue, slide, finish, restore: () => spy.mockRestore() };
+}
+
+/** The two frames a first slide in waits for the details to mount (`BoardSheet`). */
+function mountFrames() {
+  act(() => { vi.advanceTimersByTime(32); });
 }
 
 /** The card ids a phone pager page draws. */
@@ -386,12 +438,16 @@ function renderFocusBoard() {
 }
 
 beforeEach(() => {
+  (Modal as typeof Modal & { supportsFooter?: boolean }).supportsFooter = false;
+  resetUpdateIndicatorsForTests();
+  resetAgentUpdatesForTests();
   resetHostAppearanceForTests();
   host.settings = { ...DEFAULT_TASKS_SETTINGS };
   host.titleSettings = null;
   host.counts = null;
   host.canStop = false;
   host.updateState = { state: "idle" };
+  host.agentUpdates = { state: "idle", entries: [], error: null };
   host.rowRenders = 0;
   host.laneRowRenders = {};
   host.liveTasks = null;
@@ -410,6 +466,228 @@ afterEach(() => {
   resetEnhancerPreferences();
   delete (globalThis as { __rnMockOS?: string }).__rnMockOS;
   resetTasksEnabled();
+});
+
+describe("plan subscription", () => {
+  it("enables the todo subscription from plan independently of subtasks", () => {
+    const todo = vi.spyOn(todoSummary, "useTodoSummary").mockReturnValue(null);
+    host.settings = { ...DEFAULT_TASKS_SETTINGS, card: { ...DEFAULT_TASKS_SETTINGS.card, plan: false, subtasks: true } };
+    act(() => { renderer = TestRenderer.create(screen(false)); });
+    layOut(1600);
+    expect(todo.mock.calls.length).toBeGreaterThan(0);
+    expect(todo.mock.calls.every((call) => call[2] === false)).toBe(true);
+    todo.mockClear();
+    host.settings = { ...DEFAULT_TASKS_SETTINGS, card: { ...DEFAULT_TASKS_SETTINGS.card, plan: true, subtasks: false } };
+    act(() => renderer!.update(screen(false)));
+    expect(todo.mock.calls.some((call) => call[2] === true)).toBe(true);
+  });
+});
+
+// A real Claude ExitPlanMode request (`helpers/plan-request`), on every surface
+// the board answers a request from: its section, divider and controls as a
+// tool permission's, and Implement and Reject sending the plan's own actions.
+describe("a real ExitPlanMode request on the board", () => {
+  type Surface = "desktop card" | "desktop sidebar" | "tablet sheet" | "phone card" | "phone sheet";
+  const SURFACES: Surface[] = ["desktop card", "desktop sidebar", "tablet sheet", "phone card", "phone sheet"];
+
+  async function mount(surface: Surface, respond: (options: unknown) => Promise<void>) {
+    const handle = (data as unknown as { __handle: data.TasksHandle }).__handle;
+    const saved = { lanes: handle.lanes, byId: handle.byId };
+    const plan = asExitPlan(handle.byId.get("sample-input")!);
+    handle.lanes = { ...handle.lanes, needs_input: { ...handle.lanes.needs_input, cards: handle.lanes.needs_input.cards.map((card) => card.id === plan.id ? plan : card) } };
+    handle.byId = new Map(handle.byId).set(plan.id, plan);
+    const ref = vi.spyOn(paseo.agents, "ref").mockReturnValue({ respondToPermission: respond, timeline: { refetch: async () => ({ entries: [] }), subscribe: () => Object.assign(() => {}, { ready: Promise.resolve() }) } } as never);
+    const timings = holdTimings();
+    const restore = () => { timings.restore(); ref.mockRestore(); handle.lanes = saved.lanes; handle.byId = saved.byId; };
+    try {
+      const phone = surface.startsWith("phone");
+      (globalThis as { __rnMockOS?: string }).__rnMockOS = surface.startsWith("desktop") ? "web" : "ios";
+      await act(async () => { renderer = TestRenderer.create(screen(phone)); });
+      if (!phone) layOut(surface === "tablet sheet" ? 600 : 1600);
+      const card = () => cards().find((node) => node.props.card.id === plan.id)!;
+      if (surface === "desktop card" || surface === "phone card") {
+        const view = hostsById(`task-card-${plan.id}`)[0]!;
+        return { plan, restore, root: view, answers: view.find((node) => typeof node.type === "string" && node.props.testID === (phone ? "task-card-question-actions" : "task-card-answer-actions")) };
+      }
+      await act(async () => card().props.onSelect(card().props.card));
+      if (surface === "tablet sheet") {
+        mountFrames();
+        timings.finish(timings.slide().at(-1)!);
+      }
+      const section = hostsById("detail-question-section")[0]!;
+      return { plan, restore, root: section, answers: section.find((node) => typeof node.type === "string" && node.props.testID === "detail-permission-actions") };
+    } catch (error) {
+      restore();
+      throw error;
+    }
+  }
+  const labels = (node: ReactTestInstance) => node.findAll((child) => typeof child.type === "string" && child.props.accessibilityRole === "button").map((child) => child.props.accessibilityLabel);
+
+  it.each(SURFACES)("lays it out as a tool permission's section on the %s and implements it in place", async (surface) => {
+    const respond = vi.fn(async () => {});
+    const mounted = await mount(surface, respond);
+    try {
+      expect(labels(mounted.answers)).toEqual(["Reject", "Implement"]);
+      expect(textOf(mounted.root)).toContain("Plan");
+      expect(textOf(mounted.root)).not.toContain("ExitPlanMode");
+      if (surface.endsWith("card")) {
+        // The divider says the plan waits for review; the task's Open sits above it (no Stop: this host has no CLI).
+        expect(textOf(mounted.root.find((node) => typeof node.type === "string" && node.props.testID === "task-card-question-divider"))).toContain("Awaiting review");
+        const controls = mounted.root.find((node) => typeof node.type === "string" && node.props.testID === (surface === "phone card" ? "task-card-actions" : "task-card-control-row"));
+        const nodes = mounted.root.findAll((node) => typeof node.type === "string");
+        expect(nodes.indexOf(controls)).toBeLessThan(nodes.indexOf(mounted.answers));
+        expect(labels(controls)).toEqual(["Open"]);
+      } else {
+        // No bottom bar: the task's controls on the row above the section, the plan's answers inside it.
+        expect(hostsById("detail-action-bar")).toHaveLength(0);
+        expect(StyleSheet.flatten(mounted.root.props.style).borderTopWidth).toBe(0.5);
+        const controls = hostsById("detail-question-controls")[0]!;
+        // Only the tablet sheet adds Close: the sidebar's corner and the phone sheet's header close those.
+        expect(controls.findAll((node) => typeof node.type === "string" && node.props.accessibilityRole === "button").map((node) => node.props.testID)).toEqual(
+          surface === "tablet sheet" ? ["detail-bar-open", "detail-bar-close"] : ["detail-bar-open"],
+        );
+      }
+      const implement = mounted.answers.find((node) => (node.type as unknown) === "Pressable" && node.props.accessibilityLabel === "Implement");
+      await act(async () => { implement.props.onPress(); await Promise.resolve(); });
+      expect(respond).toHaveBeenCalledExactlyOnceWith({ requestId: mounted.plan.permission!.requestId, response: { behavior: "allow", selectedActionId: "implement" } });
+      expect(openAgent).not.toHaveBeenCalled();
+    } finally {
+      mounted.restore();
+    }
+  });
+
+  it.each(SURFACES)("rejects it from the %s and reports a failed answer", async (surface) => {
+    const respond = vi.fn(async () => { throw new Error("daemon offline"); });
+    const mounted = await mount(surface, respond);
+    try {
+      const reject = mounted.answers.find((node) => (node.type as unknown) === "Pressable" && node.props.accessibilityLabel === "Reject");
+      await act(async () => { reject.props.onPress(); await Promise.resolve(); await Promise.resolve(); });
+      expect(respond).toHaveBeenCalledExactlyOnceWith({ requestId: mounted.plan.permission!.requestId, response: { behavior: "deny", selectedActionId: "reject", message: "Denied by user" } });
+      // A phone says it in the board's own notice, not the host toast over its header.
+      if (surface.startsWith("phone")) expect(textOf(hostsById("phone-board-notice")[0]!)).toBe(BOARD_STRINGS.en.answerFailed("daemon offline"));
+      else expect(host.toast).toHaveBeenLastCalledWith(BOARD_STRINGS.en.answerFailed("daemon offline"));
+    } finally {
+      mounted.restore();
+    }
+  });
+});
+
+describe("card question dialog integration", () => {
+  it.each([
+    ["phone", "ios", true, 390],
+    ["small tablet", "android", false, 600],
+    ["tablet sidebar", "ios", false, 900],
+    ["desktop", "web", false, 1600],
+  ] as const)("answers a question from %s details", async (_surface, os, phone, width) => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = os;
+    const handle = (data as unknown as { __handle: data.TasksHandle }).__handle;
+    const saved = { lanes: handle.lanes, byId: handle.byId };
+    const card: TaskCard = { ...handle.lanes.needs_input.cards[0]!, id: `detail-dialog-${os}-${width}`, permission: {
+      requestId: `detail-request-${os}-${width}`, kind: "question", name: "request_user_input_async", title: "Question", summary: "Confirm?", actions: [], remaining: 0,
+      questions: [{ header: "Question 1", question: "Confirm?", multiSelect: false, options: [{ label: "Keep" }, { label: "Reject" }], allowOther: true }],
+    } };
+    handle.lanes = { ...handle.lanes, needs_input: { ...handle.lanes.needs_input, cards: [card] } };
+    handle.byId = new Map(handle.byId).set(card.id, card);
+    const respond = vi.fn(async () => {});
+    const ref = vi.spyOn(paseo.agents, "ref").mockReturnValue({ respondToPermission: respond, timeline: { refetch: async () => ({ entries: [] }), subscribe: () => Object.assign(() => {}, { ready: Promise.resolve() }) } } as never);
+    try {
+      await act(async () => { renderer = TestRenderer.create(screen(phone)); });
+      layOut(width);
+      const view = cards().find((node) => node.props.card.id === card.id)!;
+      await act(async () => view.props.onSelect(card));
+      if (!phone && width < 760) {
+        await act(async () => { vi.advanceTimersByTime(350); });
+      }
+      const section = hostsById("detail-permission")[0]!;
+      const buttons = section.findAll((node) => typeof node.type === "string" && node.props.accessibilityRole === "button");
+      expect(buttons.map((button) => button.props.accessibilityLabel)).toEqual(os === "web" ? ["Keep", "Reject", "View questions"] : ["View questions"]);
+      expect(hostsById("detail-pending-questions").length).toBe(os === "web" ? 1 : 0);
+      await act(async () => buttons.at(-1)!.props.onPress());
+      const dialog = () => hostsById("task-question-dialog").at(-1)!;
+      expect(hostsById("task-question-dialog")).toHaveLength(os === "web" ? 2 : 1);
+      await act(async () => dialog().findByProps({ testID: "task-question-option-0-1" }).props.onPress());
+      await act(async () => dialog().findByProps({ testID: "task-question-close" }).props.onPress());
+      await act(async () => buttons.at(-1)!.props.onPress());
+      expect(dialog().findByProps({ testID: "task-question-submit" }).props.disabled).toBe(false);
+      await act(async () => dialog().findByProps({ testID: "task-question-submit" }).props.onPress());
+      expect(respond).toHaveBeenCalledExactlyOnceWith({ requestId: card.permission!.requestId, response: { behavior: "allow", updatedInput: { answers: { "Question 1": "Reject" } } } });
+      expect(openAgent).not.toHaveBeenCalled();
+    } finally {
+      act(() => questionDialogStore(paseo as never).close());
+      ref.mockRestore();
+      handle.lanes = saved.lanes;
+      handle.byId = saved.byId;
+    }
+  });
+
+  it("opens one dialog when multiple board instances share a client", async () => {
+    const handle = (data as unknown as { __handle: data.TasksHandle }).__handle;
+    const saved = { lanes: handle.lanes, byId: handle.byId };
+    const card: TaskCard = { ...handle.lanes.needs_input.cards[0]!, id: "multi-board-dialog", permission: {
+      requestId: "multi-board-request", kind: "question", name: "request_user_input_async", title: "Question", summary: "Confirm?", actions: [], remaining: 0,
+      questions: [{ header: "Question 1", question: "Confirm?", multiSelect: false, options: [{ label: "Keep" }, { label: "Reject" }], allowOther: true }],
+    } };
+    handle.lanes = { ...handle.lanes, needs_input: { ...handle.lanes.needs_input, cards: [card] } };
+    handle.byId = new Map(handle.byId).set(card.id, card);
+    try {
+      await act(async () => { renderer = TestRenderer.create(React.createElement(React.Fragment, null, screen(false), screen(false), screen(false))); });
+      layOut(1600);
+      const views = renderer!.root.findAllByType(TaskCardView).filter((node) => node.props.card.id === card.id);
+      expect(views).toHaveLength(3);
+      const button = views[0]!.props.permissionButtons.find((entry: { kind: string }) => entry.kind === "question");
+      await act(async () => views[0]!.props.onPermission(card, button));
+      expect(hostsById("task-question-dialog")).toHaveLength(1);
+      await act(async () => hostsById("task-question-option-0-1")[0]!.props.onPress());
+      await act(async () => hostsById("task-question-close")[0]!.props.onPress());
+      await act(async () => views[1]!.props.onPermission(card, button));
+      expect(hostsById("task-question-dialog")).toHaveLength(1);
+      expect(hostsById("task-question-submit")[0]!.props.disabled).toBe(false);
+    } finally {
+      handle.lanes = saved.lanes;
+      handle.byId = saved.byId;
+    }
+  });
+
+  it.each([false, true].flatMap((phone) => [false, true].map((stale) => [phone, stale] as const)))("opens from the board card without navigation and rejects stale submissions (phone=%s, stale=%s)", async (phone, stale) => {
+    const handle = (data as unknown as { __handle: data.TasksHandle }).__handle;
+    const saved = { lanes: handle.lanes, byId: handle.byId };
+    const original = handle.lanes.needs_input.cards[0]!;
+    const card: TaskCard = { ...original, id: `dialog-integration-${phone}-${stale}`, permission: {
+      requestId: `request-${phone}`, kind: "question", name: "request_user_input_async", title: "Question", summary: "Confirm?", actions: [], remaining: 0,
+      questions: [{ header: "Question 1", question: "Confirm?", multiSelect: false, options: [{ label: "Keep" }, { label: "Reject" }], allowOther: true }],
+    } };
+    handle.lanes = { ...handle.lanes, needs_input: { ...handle.lanes.needs_input, cards: [card] } };
+    handle.byId = new Map(handle.byId).set(card.id, card);
+    const respond = vi.fn(async () => {});
+    const ref = vi.spyOn(paseo.agents, "ref").mockReturnValue({ respondToPermission: respond, timeline: { refetch: async () => ({ entries: [] }), subscribe: () => Object.assign(() => {}, { ready: Promise.resolve() }) } } as never);
+    try {
+      await act(async () => { renderer = TestRenderer.create(screen(phone)); });
+      layOut(phone ? 390 : 1600);
+      const view = renderer!.root.findAllByType(TaskCardView).find((node) => node.props.card.id === card.id)!;
+      const button = view.props.permissionButtons.find((button: { kind: string }) => button.kind === "question");
+      expect(button.label).toBe("View questions");
+      expect(view.props.permissionButtons.filter((button: { kind: string }) => button.kind === "respond")).toHaveLength(2);
+      await act(async () => view.props.onPermission(card, button));
+      expect(hostsById("task-question-dialog")).toHaveLength(1);
+      await act(async () => hostsById("task-question-option-0-1")[0]!.props.onPress());
+      if (stale) {
+        const replacement = { ...card, permission: { ...card.permission!, requestId: "replacement" } };
+        handle.byId = new Map(handle.byId).set(card.id, replacement);
+        handle.lanes = { ...handle.lanes, needs_input: { ...handle.lanes.needs_input, cards: [replacement] } };
+        await act(async () => renderer!.update(screen(phone)));
+        expect(hostsById("task-question-submit")[0]!.props.disabled).toBe(true);
+      }
+      await act(async () => hostsById("task-question-submit")[0]!.props.onPress());
+      if (stale) expect(respond).not.toHaveBeenCalled();
+      else expect(respond).toHaveBeenCalledExactlyOnceWith({ requestId: `request-${phone}`, response: { behavior: "allow", updatedInput: { answers: { "Question 1": "Reject" } } } });
+      expect(openAgent).not.toHaveBeenCalled();
+    } finally {
+      act(() => questionDialogStore(paseo as never).close());
+      ref.mockRestore();
+      handle.lanes = saved.lanes;
+      handle.byId = saved.byId;
+    }
+  });
 });
 
 describe("search coverage render isolation", () => {
@@ -431,13 +709,17 @@ describe("search coverage render isolation", () => {
       let request!: Promise<void>;
       act(() => { request = firstPromptStoreFor(paseo as never).request(task.id); });
       expect(host.rowRenders).toBe(before);
+      expect(textOf(hostsById("search-coverage-loaded")[0]!)).toBe(phone ? BOARD_STRINGS.en.searchCoverage.loaded(0) : "0");
       await act(async () => { finish(); await request; });
-      expect(textOf(hostsById("search-coverage-failure")[0]!)).toContain("1 failed");
+      // A failed read is neither counted nor offered a retry; the notice keeps its loaded-count wording.
+      expect(textOf(hostsById("search-coverage-loaded")[0]!)).toBe(phone ? BOARD_STRINGS.en.searchCoverage.loaded(0) : "0");
+      expect(hostsById("search-coverage-failure")).toHaveLength(0);
+      expect(hostsById("search-coverage-retry")).toHaveLength(0);
       if (phone) {
         const summary = hostsById("phone-search-summary")[0]!;
         expect(summary.props.horizontal).toBe(true);
-        expect(summary.findAll((node) => node.props.testID === "search-coverage-failure").length).toBeGreaterThan(0);
-        expect(textOf(summary)).toContain("coverage probe");
+        expect(hostsById("search-query-chip").map(textOf)).toEqual(["「coverage」", "「probe」"]);
+        expect(hostsById("search-query-chips")[0]!.type).toBe("View");
       }
       expect(host.rowRenders).toBe(before);
       expect(hostsById("tasks-search-coverage")).toHaveLength(0);
@@ -515,6 +797,64 @@ describe("Tasks search coverage and centred toolbar", () => {
       expect(hostsById("desktop-search-row")).toHaveLength(width <= 400 ? 1 : 0);
       expect(hostsById("desktop-toolbar-search")).toHaveLength(1);
       expect(hostsById("desktop-toolbar-search")[0]!.find((node) => (node.type as unknown) === "TextInput").props.value).toBe("needle");
+    }
+  });
+
+  it("moves the query from the chip into the field only while the field is on screen", () => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = "web";
+    act(() => { renderer = TestRenderer.create(screen(false, { q: "status" })); });
+    layOut(800);
+    expect(textOf(hostsById("desktop-toolbar-search-summary")[0]!)).toContain("「status」");
+    act(() => hostsById("desktop-search-toggle")[0]!.props.onPress());
+    expect(hostsById("desktop-toolbar-search")).toHaveLength(1);
+    const summary = hostsById("desktop-toolbar-search-summary")[0]!;
+    expect(textOf(summary)).not.toContain("Contains");
+    expect(textOf(summary)).not.toContain("status");
+    expect(textOf(summary)).toContain("Clear filters");
+    act(() => hostsById("desktop-search-toggle")[0]!.props.onPress());
+    expect(textOf(hostsById("desktop-toolbar-search-summary")[0]!)).toContain("「status」");
+  });
+
+  it("puts the loaded count inside the desktop search field instead of a query chip", async () => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = "web";
+    const handle = (data as unknown as { __handle: { lanes: Record<string, { cards: TaskCard[] }>; byId: Map<string, TaskCard> } }).__handle;
+    const saved = { lanes: handle.lanes, byId: handle.byId };
+    const task = { ...handle.lanes.needs_input!.cards[0]!, id: "coverage-in-field", title: "badge probe", closed: false };
+    handle.lanes = { ...handle.lanes, needs_input: { ...handle.lanes.needs_input!, cards: [task] } };
+    handle.byId = new Map(handle.byId).set(task.id, task);
+    let finish!: () => void;
+    const ref = vi.spyOn(paseo.agents, "ref").mockImplementation(() => ({ timeline: {
+      // The repo's tsconfig predates Promise.withResolvers; match the neighbouring test.
+      refetch: () => new Promise((resolve) => { finish = () => resolve({ error: "offline", entries: [] } as never); }),
+      subscribe: () => Object.assign(() => {}, { ready: Promise.resolve() }),
+    } }));
+    let request!: Promise<void>;
+    try {
+      await act(async () => { renderer = TestRenderer.create(screen(false, { q: "badge probe" })); });
+      layOut(1200);
+      act(() => { request = firstPromptStoreFor(paseo as never).request(task.id); });
+      const field = hostsById("desktop-toolbar-search")[0]!;
+      const badge = hostsById("search-coverage-items")[0]!;
+      expect(field.findAll((node) => node === badge)).toHaveLength(1);
+      expect(textOf(badge)).toBe("0");
+      // The inline field keeps its magnifier; the count badge carries the loading state.
+      expect(field.findAll((node) => (node.type as unknown) === "Icon" && node.props.name === "Search")).toHaveLength(1);
+      expect(hostsById("search-icon-slot")[0]!.findAll((node) => node.props.testID === "search-spinner")).toHaveLength(0);
+      const summary = hostsById("desktop-toolbar-search-summary")[0]!;
+      expect(textOf(summary)).not.toContain("Contains");
+      expect(textOf(summary)).toContain("Clear filters");
+      const frames = measureHostTree(hostsById("desktop-toolbar")[0]!, { width: 1200 });
+      const fieldFrame = frames.get(field)!;
+      const badgeFrame = frames.get(badge)!;
+      expect(badgeFrame.left).toBeGreaterThanOrEqual(fieldFrame.left);
+      expect(badgeFrame.left + badgeFrame.width).toBeLessThanOrEqual(fieldFrame.left + fieldFrame.width);
+      // The count precedes the stop toggle that used to sit before it.
+      const cancelFrame = frames.get(hostsById("search-cancel-toggle")[0]!)!;
+      expect(badgeFrame.left + badgeFrame.width).toBeLessThanOrEqual(cancelFrame.left);
+      await act(async () => { finish(); await request; });
+    } finally {
+      act(() => renderer?.unmount()); renderer = undefined;
+      handle.lanes = saved.lanes; handle.byId = saved.byId; ref.mockRestore();
     }
   });
 
@@ -614,25 +954,25 @@ describe("Tasks search coverage and centred toolbar", () => {
 
   it.each(["web", "ios", "android"])("keeps %s separate-row search independent of lane width", async (os) => {
     (globalThis as { __rnMockOS?: string }).__rnMockOS = os;
-    act(() => { renderer = TestRenderer.create(screen(false, {}, { ...(theme as object), typography: { fontSize: { ui: 21 } } })); });
+    act(() => { renderer = TestRenderer.create(screen(false, { q: "needle" }, { ...(theme as object), typography: { fontSize: { ui: 21 } } })); });
     layOut(600);
     const prefix = os === "web" ? "desktop" : "tablet";
     const controller = () => renderer!.root.findByType(os === "web" ? DesktopToolbar : TabletToolbar).props.board;
-    act(() => hostsById(`${prefix}-search-toggle`)[0]!.props.onPress());
+    act(() => (hostsById(`${prefix}-search-toggle`)[0] ?? hostsById("search-query-edit")[0])!.props.onPress());
     for (const [size, expected] of [["narrow", 244], ["default", 284], ["wide", 300]] as const) {
       await act(async () => { controller().setLaneWidth(size); });
       expect(StyleSheet.flatten(hostsById("lane-surface-running")[0]!.props.style).width).toBe(expected);
       const row = hostsById(`${prefix}-search-row`)[0]!;
       const field = hostsById(`${prefix}-toolbar-search`)[0]!;
-      expect(StyleSheet.flatten(field.props.style).width).toBe(320);
+      expect(StyleSheet.flatten(field.props.style)).toMatchObject(os === "web" ? { width: 320 } : { flex: 1, flexBasis: 0 });
       const frame = measureHostTree(row, { width: 600 }).get(field)!;
-      expect(frame.width).toBe(320);
+      expect(frame.width).toBe(os === "web" ? 320 : 480);
       expect(frame.left).toBe(lanesScroll().props.contentContainerStyle.paddingLeft);
     }
     layOut(480);
     const field = hostsById(`${prefix}-toolbar-search`)[0]!;
-    expect(StyleSheet.flatten(field.props.style).width).toBe(320);
-    expect(measureHostTree(hostsById(`${prefix}-search-row`)[0]!, { width: 480 }).get(field)!.width).toBe(320);
+    expect(StyleSheet.flatten(field.props.style)).toMatchObject(os === "web" ? { width: 320 } : { flex: 1, flexBasis: 0 });
+    expect(measureHostTree(hostsById(`${prefix}-search-row`)[0]!, { width: 480 }).get(field)!.width).toBe(os === "web" ? 320 : 360);
   });
 
   it.each(["web", "ios", "android"].flatMap((os) => (["en", "zh"] as const).map((language) => ({ os, language }))))("sizes $os/$language search with the lanes across layouts and filter measurements", ({ os, language }) => {
@@ -648,7 +988,8 @@ describe("Tasks search coverage and centred toolbar", () => {
       const frames = measureHostTree(bar, { width });
       expect(frames.get(field)!.width).toBeCloseTo(expected, 0);
       const group = frames.get(hostsById(`${prefix}-toolbar-search-group`)[0]!)!;
-      expect(group.left + group.width).toBeLessThanOrEqual(frames.get(hostsById(`${prefix}-toolbar-total`)[0]!)!.left);
+      expect(group.left + group.width).toBeLessThanOrEqual(frames.get(hostsById(`${prefix}-toolbar-${os === "web" ? "total" : "end"}`)[0]!)!.left);
+      expect(hostsById(`${prefix}-toolbar-total`)).toHaveLength(os === "web" ? 1 : 0);
       expect(hostsById(`${prefix}-search-toggle`)).toHaveLength(0);
       expect(hostsById(`${prefix}-search-row`)).toHaveLength(0);
     }
@@ -667,15 +1008,16 @@ describe("Tasks search coverage and centred toolbar", () => {
     expect(hostsById(`${prefix}-toolbar-search`)).toHaveLength(0);
     const actions = hostsById(`${prefix}-toolbar-end`)[0]!.findAll((node) => (node.type as unknown) === "Pressable").map((node) => node.props.testID);
     act(() => hostsById(`${prefix}-search-toggle`)[0]!.props.onPress());
-    const row = hostsById(`${prefix}-search-row`)[0]!;
+    const row = hostsById(`${prefix}-search-row`)[0];
+    const container = row ?? hostsById(`${prefix}-toolbar`)[0]!;
     const field = hostsById(`${prefix}-toolbar-search`)[0]!;
-    expect(hostParentOf(hostsById(`${prefix}-toolbar-search-group`)[0]!)).toBe(row);
+    expect(hostParentOf(hostsById(`${prefix}-toolbar-search-group`)[0]!)).toBe(row ?? hostsById(`${prefix}-toolbar-start`)[0]);
     const input = field.find((node) => (node.type as unknown) === "TextInput");
     expect(input.props.autoFocus).toBe(true);
-    expect(hostsById(`${prefix}-toolbar-total`)).toHaveLength(1);
+    expect(hostsById(`${prefix}-toolbar-total`)).toHaveLength(os === "web" ? 1 : 0);
     expect(hostsById(`${prefix}-toolbar-end`)[0]!.findAll((node) => (node.type as unknown) === "Pressable").map((node) => node.props.testID)).toEqual(actions);
-    const frames = measureHostTree(row, { width });
-    expect(frames.get(field)!.width).toBeLessThanOrEqual(320);
+    const frames = measureHostTree(container, { width });
+    expect(frames.get(field)!.width).toBeLessThanOrEqual(os === "web" ? 320 : width - 48);
     expect(frames.get(field)!.width).toBeGreaterThan(100);
     for (const node of [field, hostsById("search-full-conversation-toggle")[0]!, hostsById(`${prefix}-search-close`)[0]!]) {
       const frame = frames.get(node)!;
@@ -686,7 +1028,7 @@ describe("Tasks search coverage and centred toolbar", () => {
     act(() => hostsById(`${prefix}-search-close`)[0]!.props.onPress());
     expect(hostsById(`${prefix}-toolbar-search`)).toHaveLength(0);
     expect(lastBoardParams("host-1").query).toBe("needle");
-    act(() => hostsById(`${prefix}-search-toggle`)[0]!.props.onPress());
+    act(() => (hostsById(`${prefix}-search-toggle`)[0] ?? hostsById("search-query-edit")[0])!.props.onPress());
     expect(hostsById(`${prefix}-toolbar-search`)[0]!.find((node) => (node.type as unknown) === "TextInput").props.value).toBe("needle");
   });
 
@@ -703,7 +1045,7 @@ describe("Tasks search coverage and centred toolbar", () => {
     expect(hostsById(`${prefix}-search-toggle`)).toHaveLength(0);
     expect(hostsById(`${prefix}-toolbar-search`)[0]!.find((node) => (node.type as unknown) === "TextInput").props.value).toBe("needle");
     act(() => renderer!.update(screen(false, {}, boardTheme(21))));
-    expect(hostsById(`${prefix}-search-row`)).toHaveLength(os === "web" ? 0 : 1);
+    expect(hostsById(`${prefix}-search-row`)).toHaveLength(0);
     expect(hostsById(`${prefix}-toolbar-search`)[0]!.find((node) => (node.type as unknown) === "TextInput").props.value).toBe("needle");
     act(() => hostsById(`${prefix}-search-${os === "web" ? "toggle" : "close"}`)[0]!.props.onPress());
     layOut(1600);
@@ -757,7 +1099,7 @@ describe("Tasks search coverage and centred toolbar", () => {
     }
   });
 
-  it("shows desktop toolbar outlines only on hover and enlarges their icons", () => {
+  it("shows the shared desktop toolbar hover fill and keeps icon sizes", () => {
     (globalThis as { __rnMockOS?: string }).__rnMockOS = "web";
     act(() => { renderer = TestRenderer.create(screen(false)); });
     layOut(2400);
@@ -769,11 +1111,11 @@ describe("Tasks search coverage and centred toolbar", () => {
           : button();
         return StyleSheet.flatten(node.props.style);
       };
-      expect(outline(), id).toMatchObject({ borderColor: "transparent", borderRadius: 7, width: 30, height: 30 });
+      expect(outline(), id).toMatchObject({ borderColor: "transparent", borderRadius: 15, width: 30, height: 30 });
       act(() => button().props.onHoverIn());
-      expect(outline(), id).toMatchObject({ borderColor: id === "empty-lanes-toggle" ? "#e2e2e6" : taskTokens(theme).borderStrong, borderRadius: 7, width: 30, height: 30 });
+      expect(outline(), id).toMatchObject({ borderColor: "transparent", borderRadius: 15, width: 30, height: 30, backgroundColor: id === "empty-lanes-toggle" ? "transparent" : hoverFill(taskTokens(theme).surface0, taskTokens(theme).foreground, true, false) });
       act(() => button().props.onHoverOut());
-      expect(outline(), id).toMatchObject({ borderColor: "transparent", borderRadius: 7 });
+      expect(outline(), id).toMatchObject({ borderColor: "transparent", borderRadius: 15 });
       if (id !== "sidebar-switch") expect(button().find((node) => (node.type as unknown) === "Icon").props.size, id).toBe(17);
     }
     expect(StyleSheet.flatten(hostsById("panel-mark")[0]!.props.style)).toMatchObject({ width: 16, height: 13 });
@@ -786,11 +1128,11 @@ describe("Tasks search coverage and centred toolbar", () => {
     expect(field.findAll((node) => node.props.testID === "search-full-conversation-toggle")).toHaveLength(0);
     const toggle = hostsById("search-full-conversation-toggle")[0]!;
     // The fixture uses a 15/14 font scale, so the 28-point button rounds to 30.
-    expect(StyleSheet.flatten(toggle.props.style)).toMatchObject({ width: 30, height: 30, borderRadius: 7 });
+    expect(StyleSheet.flatten(toggle.props.style)).toMatchObject({ width: 30, height: 30, borderRadius: 15 });
     expect(toggle.props.dataSet?.bctip).toBe(BOARD_STRINGS.en.fullConversationHint(false));
     expect(toggle.props.accessibilityState.selected).toBe(false);
     act(() => toggle.props.onHoverIn());
-    expect(StyleSheet.flatten(hostsById("search-full-conversation-toggle")[0]!.props.style).boxShadow).toBe(taskTokens(theme).card.buttonShadowHover);
+    expect(StyleSheet.flatten(hostsById("search-full-conversation-toggle")[0]!.props.style).backgroundColor).toBe(hoverFill(taskTokens(theme).surface0, taskTokens(theme).foreground, true, false));
     act(() => toggle.props.onHoverOut());
     expect(StyleSheet.flatten(hostsById("search-full-conversation-toggle")[0]!.props.style).boxShadow).toBeUndefined();
     act(() => toggle.props.onPress());
@@ -826,14 +1168,26 @@ describe("Tasks search coverage and centred toolbar", () => {
     const start = hostsById("desktop-toolbar-start")[0]!;
     const summary = hostsById("desktop-toolbar-search-summary")[0]!;
     expect(hostParentOf(summary)).toBe(start);
-    expect(textOf(summary)).toContain("Contains「status」");
+    // The field is on screen: the query and its clear live there, not in a chip.
+    expect(hostsById("desktop-toolbar-search")[0]!.find((node) => (node.type as unknown) === "TextInput").props.value).toBe("status");
+    expect(textOf(summary)).not.toContain("Contains");
+    expect(textOf(summary)).not.toContain("status");
     expect(textOf(summary)).toContain("api");
     expect(summary.find((node) => (node.type as unknown) === "View" && node.props.accessibilityLabel === "Labels")).toBeDefined();
-    expect(textOf(summary)).toContain("Clear all");
+    expect(textOf(summary)).toContain("Clear filters");
     const filterBar = hostsById("filter-bar")[0]!;
     expect(textOf(filterBar)).not.toContain("Contains");
     expect(textOf(filterBar)).not.toContain("api");
-    expect(textOf(filterBar)).not.toContain("Clear all");
+    expect(textOf(filterBar)).not.toContain("Clear filters");
+  });
+  it("drops its search and filters when the hidden-task dialog asks it to clear", () => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = "web";
+    act(() => { renderer = TestRenderer.create(screen(false, { q: "status", label: "api" })); });
+    layOut(1600);
+    expect(textOf(hostsById("desktop-toolbar-search-summary")[0]!)).toContain("api");
+    act(() => requestBoardClear("host-1"));
+    expect(lastBoardParams("host-1")).toMatchObject({ query: "", workspaceIds: [], providers: [], labels: [] });
+    expect(hostsById("desktop-toolbar-search-summary")).toHaveLength(0);
   });
   it.each(["en", "zh"] as const)("shows all six toolbar shortcuts in %s hover tips without a sidebar key hint", (language) => {
     (globalThis as { __rnMockOS?: string }).__rnMockOS = "web";
@@ -968,12 +1322,62 @@ describe("Tasks search coverage and centred toolbar", () => {
     }
   });
 
+  it("aggregates agent-only updates into corner and inline desktop indicators", async () => {
+    setTasksSettingsOpener(vi.fn());
+    host.agentUpdates = { state: "done", entries: [{ provider: "codex", status: "available", updateAvailable: true }], error: null };
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = "web";
+    await act(async () => { renderer = TestRenderer.create(screen(false)); });
+    layOut(1600);
+    const dot = hostsById("desktop-more-update-dot")[0]!;
+    expect(dot.props.style).toMatchObject({ width: 4, height: 4, bottom: 2, right: 2, backgroundColor: "#da4738" });
+    act(() => hostsById("desktop-toolbar-more")[0]!.props.onPress());
+    const settingsDot = hostsById("desktop-settings-update-dot")[0]!;
+    expect(settingsDot.props.style).toMatchObject({ width: 4, height: 4, alignSelf: "center" });
+    const settingsItem = menuOption(BOARD_STRINGS.en.openSettings);
+    const settingsLabel = settingsItem.find((node) => typeof node.type === "string" && node.props.children === BOARD_STRINGS.en.openSettings);
+    const layout = measureHostTree(settingsItem, { width: 200 });
+    const labelFrame = layout.get(settingsLabel)!; const dotFrame = layout.get(settingsDot)!;
+    expect(Math.abs(dotFrame.left - (labelFrame.left + labelFrame.width) - 4)).toBeLessThanOrEqual(0.5);
+    expect(Math.abs(dotFrame.top + dotFrame.height / 2 - (labelFrame.top + labelFrame.height / 2))).toBeLessThanOrEqual(0.5);
+    host.agentUpdates = { state: "done", entries: [{ provider: "codex", status: "current", updateAvailable: false }], error: null };
+    await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+    expect(hostsById("desktop-more-update-dot")).toHaveLength(0);
+  });
+
   it("does not show desktop update indicators on mobile", async () => {
     host.updateState = { state: "done", versions: { status: "available", current: "1.0.0", latest: "1.1.0", currentBuild: 202610311637, latestBuild: 202610311700 } };
     (globalThis as { __rnMockOS?: string }).__rnMockOS = "ios";
     await act(async () => { renderer = TestRenderer.create(screen(true)); });
     expect(hostsById("desktop-more-update-dot")).toHaveLength(0);
     expect(hostsById("desktop-settings-update-dot")).toHaveLength(0);
+  });
+
+  it.each(["ios", "android"].flatMap((os) => [14, 21].map((base) => ({ os, base }))))("shows tablet update indicators and opens settings on $os at UI $base", async ({ os, base }) => {
+    const openSettings = vi.fn();
+    setTasksSettingsOpener(openSettings);
+    host.agentUpdates = { state: "done", entries: [{ provider: "codex", status: "available", updateAvailable: true }], error: null };
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = os;
+    await act(async () => { renderer = TestRenderer.create(screen(false, { agent: "codex" }, { ...(theme as object), typography: { fontSize: { ui: base } } })); });
+    layOut(1600);
+    act(() => hostsById("tablet-toolbar-end")[0]!.props.onLayout({ nativeEvent: { layout: { x: 0, y: 0, width: 20, height: 40 } } }));
+    expect(hostsById("tablet-view-update-dot")).toHaveLength(1);
+    const anchor = hostsById("tablet-view-container")[0]!;
+    const dot = hostsById("tablet-view-update-dot")[0]!;
+    const frames = measureHostTree(anchor, { width: base === 14 ? 32 : 48 });
+    const buttonFrame = frames.get(hostsById("tablet-view")[0]!)!;
+    const dotFrame = frames.get(dot)!;
+    expect(dotFrame.left - (buttonFrame.left + buttonFrame.width / 2)).toBe(7);
+    expect(dotFrame.top - (buttonFrame.top + buttonFrame.height / 2)).toBe(8);
+    const badge = hostParentOf(hostsById("tablet-filter-count")[0]!)!;
+    const badgeFrame = frames.get(badge)!;
+    expect(badgeFrame.top + badgeFrame.height).toBeLessThanOrEqual(dotFrame.top);
+    act(() => hostsById("tablet-view")[0]!.props.onPress());
+    expect(hostsById("tablet-settings-update-dot")).toHaveLength(1);
+    act(() => menuOption(BOARD_STRINGS.en.openSettings).props.onPress());
+    expect(openSettings).toHaveBeenCalledOnce();
+    host.agentUpdates = { state: "done", entries: [{ provider: "codex", status: "current", updateAvailable: false }], error: null };
+    await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+    expect(hostsById("tablet-view-update-dot")).toHaveLength(0);
   });
 
   it.each(["web", "ios"] as const)("%s keeps every action available when a narrow side slot needs the View menu", (os) => {
@@ -1030,6 +1434,52 @@ describe("Tasks search coverage and centred toolbar", () => {
 
 });
 
+describe("Two-state toolbar icons", () => {
+  it.each([
+    ["web", 1600, false], ["web", 600, false],
+    ["ios", 1200, false], ["android", 1200, false],
+    ["web", 390, true], ["ios", 390, true], ["android", 390, true],
+  ] as const)("keeps %s icons unfilled at %i pt (phone=%s)", async (os, width, phone) => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = os;
+    await act(async () => { renderer = TestRenderer.create(screen(phone)); });
+    if (!phone) layOut(width);
+    const ids = phone ? ["phone-subtasks", "phone-archived"]
+      : os === "web" ? width === 600 ? ["toolbar-archived", "sidebar-switch"]
+        : ["subtasks-toggle", "archived-lane-toggle", "sidebar-switch", "search-full-conversation-toggle"]
+        : ["subtasks-toggle", "sidebar-switch", "search-full-conversation-toggle"];
+    for (const id of ids) {
+      const button = () => hostsById(id)[0]!;
+      const state = () => button().props.accessibilityState;
+      const glyph = () => button().findAll((node) => (node.type as unknown) === "Icon")
+        .map((node) => node.props.icon ?? node.props.name);
+      const unfilled = () => {
+        for (const node of [button(), ...button().findAll((node) => typeof node.type === "string")]) {
+          expect(StyleSheet.flatten(node.props.style)?.backgroundColor, id).not.toBe("#e4e4e7");
+        }
+      };
+      const initial = state();
+      const initialGlyph = glyph();
+      const initialSlash = button().findAllByType(SlashMark).length;
+      const initialPanel = hostsById("panel-mark-fill")[0]?.props.style;
+      unfilled();
+      await act(async () => button().props.onPress());
+      expect(state(), id).not.toEqual(initial);
+      unfilled();
+      if (id.includes("archived")) expect(button().findAllByType(SlashMark).length).not.toBe(initialSlash);
+      else if (id === "sidebar-switch") expect(hostsById("panel-mark-fill")[0]!.props.style).not.toEqual(initialPanel);
+      else expect(glyph(), id).not.toEqual(initialGlyph);
+      if (id.includes("subtasks")) {
+        const badge = hostsById(`${id}-count`)[0]!;
+        expect(textOf(badge)).toBe("1");
+        expect(StyleSheet.flatten(hostParentOf(badge)!.props.style).borderColor).toBe("#ffffff");
+      }
+      await act(async () => button().props.onPress());
+      expect(state(), id).toEqual(initial);
+      unfilled();
+    }
+  });
+});
+
 describe("F1: Web switch Space activation", () => {
   const key = (extra: Record<string, unknown> = {}) => {
     const target = {};
@@ -1078,6 +1528,7 @@ describe("F1: Web switch Space activation", () => {
     act(() => hostsById("subtasks-toggle")[0]!.props.onPress());
     // The running child shows on its running parent's card, so the sidebar counts one card more than the lane.
     expect(textOf(hostsById("subtasks-toggle-count")[0]!)).toBe("1");
+    expect(StyleSheet.flatten(hostParentOf(hostsById("subtasks-toggle-count")[0]!)!.props.style).borderColor).toBe("#ffffff");
     act(() => hostsById("subtasks-toggle")[0]!.props.onPress());
     expect(hostsById("subtasks-toggle-count")).toHaveLength(0);
   });
@@ -1304,6 +1755,8 @@ describe("Tasks board, desktop", () => {
   });
 
   it("uses host UI typography directly without reading persisted appearance", () => {
+    // Language can read the same key; select it explicitly to isolate appearance.
+    updateEnhancerPreferences({ language: "en" });
     const getItem = vi.fn(() => JSON.stringify({ uiBaseFontSize: 10 }));
     vi.stubGlobal("localStorage", { getItem });
     try {
@@ -1356,7 +1809,7 @@ describe("Tasks board, desktop", () => {
     expect(cards().map((card) => card.props.card.id)).toEqual(["sample-running"]);
     expect(lastBoardParams("host-1")).toMatchObject({ query: "ring", hideSubtasks: null });
     expect(deviceTasksStore().snapshot().values?.hideSubtasks).toBe(true);
-    expect(textOf(renderer!.root)).toContain("Clear all");
+    expect(textOf(renderer!.root)).toContain("Clear filters");
   });
 
   it("falls back to the session's last filters when opened without params", () => {
@@ -1678,6 +2131,33 @@ describe("Tasks board, desktop", () => {
     }
   });
 
+  it("draws again only the cells whose own card or state changed when the board updates", () => {
+    act(() => {
+      renderer = TestRenderer.create(screen(false));
+    });
+    layOut(2400);
+    const handle = (data as unknown as { __handle: { lanes: Record<string, { cards: TaskCard[] }> } }).__handle;
+    const original = handle.lanes;
+    // A cell's own hooks run once per drawn cell: count them.
+    const cells = vi.spyOn(todoSummary, "useTodoSummary");
+    try {
+      // A page lands in one lane: the list draws its rows, but the cards already shown stay as they were.
+      const running = original.running!;
+      handle.lanes = { ...original, running: { ...running, cards: running.cards.slice(1) } };
+      act(() => renderer!.update(screen(false)));
+      expect(running.cards.length).toBeGreaterThan(1);
+      expect(cells).not.toHaveBeenCalled();
+      // One card renamed: only its cell draws.
+      const [first, ...rest] = handle.lanes.running!.cards;
+      handle.lanes = { ...handle.lanes, running: { ...handle.lanes.running!, cards: [{ ...first!, title: "Renamed" }, ...rest] } };
+      act(() => renderer!.update(screen(false)));
+      expect(cells.mock.calls.map((call) => call[1])).toEqual([first!.id]);
+    } finally {
+      cells.mockRestore();
+      handle.lanes = original;
+    }
+  });
+
   it("keeps the cards' fields across a settings read-back that leaves them as they were", () => {
     act(() => {
       renderer = TestRenderer.create(screen(false));
@@ -1726,9 +2206,11 @@ describe("Tasks board, desktop", () => {
     layOut(2000);
     const sidebar = StyleSheet.flatten(hostsById("sidebar-inline")[0]!.props.style);
     const filters = StyleSheet.flatten(hostsById("filter-bar")[0]!.props.style);
-    expect(sidebar.paddingLeft).toBe(10);
+    expect(sidebar).toMatchObject(sidebarSurface("#ffffff", false));
+    expect(sidebar.borderLeftWidth ?? 0).toBe(0);
+    expect(sidebar.paddingLeft).toBe(6);
     expect(sidebar.paddingRight + sidebar.right).toBe(filters.paddingRight);
-    expect(sidebar.width - sidebar.paddingLeft - sidebar.paddingRight).toBe(366);
+    expect(sidebar.width - sidebar.paddingLeft - sidebar.paddingRight).toBe(370);
     expect(lanesScroll().props.contentContainerStyle.width).toBe(2000 - 380 - 12);
   });
 
@@ -1868,6 +2350,20 @@ describe("Tasks board, desktop", () => {
     }
   });
 
+  it.each(["button", "Escape"] as const)("restores the parent page after a child with %s", async (back) => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = "web";
+    const browser = renderFocusBoard();
+    const parent = cards().find((node) => node.props.card.id === "sample-running")!;
+    await act(async () => parent.props.onSelect(parent.props.card));
+    await act(async () => hostsById("detail-tab-info")[0]!.props.onPress());
+    await act(async () => hostsById("detail-subtask-sample-child-1")[0]!.props.onPress());
+    expect(hostsById("detail-tab-messages")[0]!.props.accessibilityState.selected).toBe(true);
+    if (back === "button") await act(async () => hostsById("detail-back")[0]!.props.onPress());
+    else await act(async () => { browser.key("Escape"); });
+    expect(hostsById("detail-tab-info")[0]!.props.accessibilityState.selected).toBe(true);
+    expect(hostsById("detail-subtask-sample-child-1")).toHaveLength(1);
+  });
+
   it.each([560, 900])("mounts desktop Info once and retains local state and scroll bookkeeping at %i pt height", async (height) => {
     (globalThis as { __rnMockOS?: string }).__rnMockOS = "web";
     const scrollTo = vi.fn();
@@ -1926,12 +2422,17 @@ describe("Tasks board, desktop", () => {
     expect(hostsById("detail-location")[0]).not.toBe(info);
   });
 
-  it.each([["ios", false], ["android", false], ["ios", true], ["android", true], ["web", true]] as const)("keeps both Info and Messages mounted on %s touch layouts (phone=%s)", async (os, phone) => {
+  it.each([["ios", false], ["android", false], ["ios", true], ["android", true], ["web", true]] as const)("mounts Info on its first visit and keeps it on %s touch layouts (phone=%s)", async (os, phone) => {
     (globalThis as { __rnMockOS?: string }).__rnMockOS = os;
     await act(async () => { renderer = TestRenderer.create(screen(phone)); });
     if (!phone) layOut(1400);
     await act(async () => cards()[0]!.props.onSelect(cards()[0]!.props.card));
     expect(hostsById("detail-tab-messages")[0]!.props.accessibilityState.selected).toBe(true);
+    expect(hostsById("detail-location")).toHaveLength(0);
+    expect(hostsById("detail-prompt")).toHaveLength(1);
+    await act(async () => hostsById("detail-tab-info")[0]!.props.onPress());
+    expect(hostsById("detail-location")).toHaveLength(1);
+    await act(async () => hostsById("detail-tab-messages")[0]!.props.onPress());
     expect(hostsById("detail-location")).toHaveLength(1);
     expect(hostsById("detail-prompt")).toHaveLength(1);
     const hidden = hostsById("detail-tab-info-content")[0];
@@ -1939,8 +2440,8 @@ describe("Tasks board, desktop", () => {
     else expect(StyleSheet.flatten(hostsById("detail-tab-info-scroll")[0]!.parent!.parent!.props.style).display).toBe("none");
   });
 
-  it("animates the desktop sidebar closed and can reverse during entry or exit", () => {
-    (globalThis as { __rnMockOS?: string }).__rnMockOS = "web";
+  it.each(["web", "ios", "android"])("animates the %s sidebar closed and can reverse during entry or exit", (os) => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = os;
     const timing = vi.spyOn(Animated, "timing").mockImplementation((value, config) => {
       let timer: ReturnType<typeof setTimeout>;
       return {
@@ -2045,20 +2546,9 @@ describe("Tasks board, desktop", () => {
       const handleStyle = StyleSheet.flatten(handle.props.style);
       expect(handleStyle.left).toBe(0);
       expect(handleStyle.width).toBeLessThanOrEqual(panel.paddingLeft);
-      expect(handle.findAll((node) => typeof node.type === "string" && node.props.testID === "sidebar-resize-grabber")).toHaveLength(1);
-      const grabberOpacity = () => StyleSheet.flatten(hostsById("sidebar-resize-grabber")[0]!.props.style).opacity;
-      expect(StyleSheet.flatten(hostsById("sidebar-resize-grabber")[0]!.props.style)).toMatchObject({
-        transitionProperty: "opacity", transitionDuration: "150ms", transitionTimingFunction: "ease-out",
-      });
-      expect(grabberOpacity()).toBe(0);
-      act(() => hostsById("sidebar-inline")[0]!.props.onPointerEnter());
-      expect(grabberOpacity()).toBe(0.5);
-      act(() => hostsById("sidebar-inline")[0]!.props.onPointerLeave());
-      expect(grabberOpacity()).toBe(0);
-      act(() => hostsById("sidebar-inline")[0]!.props.onPointerEnter());
+      expect(handle.findAll((node) => typeof node.type === "string" && node.props.testID === "sidebar-resize-grabber")).toHaveLength(0);
+      expect(handle.findAll((node) => node.props.dataSet?.bcresizetrack === "").length).toBeGreaterThan(0);
       act(() => handle.props.onPointerDown({ nativeEvent: { pageX: 1000, clientY: 200 } }));
-      act(() => hostsById("sidebar-inline")[0]!.props.onPointerLeave());
-      expect(grabberOpacity()).toBe(0.5);
       const sidebar = () => hostsById("details-sidebar")[0]!;
       const layoutSidebar = (width: number) => sidebar().props.onLayout({ nativeEvent: { layout: { width, height: 800 } } });
       act(() => layoutSidebar(380));
@@ -2074,7 +2564,6 @@ describe("Tasks board, desktop", () => {
       expect(StyleSheet.flatten(hostsById("sidebar-inline")[0]!.props.style).width).toBe(430);
       expect(laneWidths()).toEqual(originalWidths);
       act(() => listeners.get("pointerup")!({ pageX: 950, clientY: 200 }));
-      expect(grabberOpacity()).toBe(0);
       expect(readSidebarPreference().width).toBe(430);
       expect(laneWidths()).toEqual(originalWidths);
       act(() => hostsById("sidebar-switch")[0]!.props.onPress());
@@ -2104,10 +2593,12 @@ describe("Tasks board, desktop", () => {
     vi.stubGlobal("cancelAnimationFrame", clearTimeout);
     // Page nodes for the column, the handle and the indicator: what a drag frame writes to.
     const nodes = new Map<string, { style: Record<string, string> }>();
+    const setAttribute = vi.fn();
+    const removeAttribute = vi.fn();
     const createNodeMock = (element: React.ReactElement) => {
       const id = (element.props as { testID?: string }).testID;
       if (id !== "sidebar-slot" && id !== "sidebar-inline" && id !== "sidebar-resize") return null;
-      const node = { style: {} as Record<string, string>, setAttribute() {}, removeAttribute() {}, getBoundingClientRect: () => ({ top: 0, height: 800 }) };
+      const node = { style: {} as Record<string, string>, setAttribute, removeAttribute, getBoundingClientRect: () => ({ top: 0, height: 800 }) };
       nodes.set(id, node);
       return node;
     };
@@ -2119,6 +2610,7 @@ describe("Tasks board, desktop", () => {
       expect(drawnWidth()).toBe(380);
       expect(row().props.scrollEnabled).toBe(false);
       act(() => hostsById("sidebar-resize")[0]!.props.onPointerDown({ nativeEvent: { pageX: 1000, clientY: 200 } }));
+      expect(setAttribute).not.toHaveBeenCalled();
       const drawn = new Set<number>();
       let pageX = 1000;
       const frame = (to: number) => {
@@ -2128,6 +2620,7 @@ describe("Tasks board, desktop", () => {
         drawn.add(drawnWidth());
       };
       for (let delta = 1; delta <= 40; delta++) frame(1000 - delta);
+      expect(setAttribute).toHaveBeenCalledWith("data-bcresizing", "");
       // Every frame reached the page; the board drew the first one only, the lanes' view holding.
       expect(nodes.get("sidebar-inline")!.style.width).toBe("420px");
       expect(nodes.get("sidebar-slot")!.style.width).toBe("432px");
@@ -2143,6 +2636,7 @@ describe("Tasks board, desktop", () => {
       expect(drawn.size).toBe(before);
       expect(nodes.get("sidebar-inline")!.style.width).toBe(`${380 + 1000 - pageX}px`);
       act(() => listeners.get("pointerup")!({ pageX, clientY: 200 }));
+      expect(removeAttribute).toHaveBeenCalledWith("data-bcresizing");
       expect(drawnWidth()).toBe(380 + 1000 - pageX);
       expect(readSidebarPreference().width).toBe(380 + 1000 - pageX);
       expect(listeners.has("pointermove")).toBe(false);
@@ -2161,6 +2655,7 @@ describe("Tasks board, desktop", () => {
     const sidebar = () => hostsById("details-sidebar")[0]!;
     const layoutSidebar = (height: number) => sidebar().props.onLayout({ nativeEvent: { layout: { width: 380, height } } });
     act(() => layoutSidebar(800));
+    expect(sidebar().props.dataSet).toMatchObject({ bcnocomposer: "" });
     const content = sidebar().props.children;
     for (let delta = 1; delta <= 50; delta++) {
       act(() => hostsById("tasks-board-area")[0]!.props.onLayout({ nativeEvent: { layout: { width: 1300 + delta, height: 800 - delta } } }));
@@ -2170,12 +2665,13 @@ describe("Tasks board, desktop", () => {
     // Window resizing still changes lane widths and switches the short-column layout.
     expect(StyleSheet.flatten(hostsById("lane-surface-running")[0]!.props.style).width).toBe((1350 - 48) / 4);
     act(() => layoutSidebar(639));
+    expect(sidebar().props.dataSet).toMatchObject({ bcnocomposer: "" });
     expect(hostsById(selected ? "detail-tab-short-scroll" : "details-sidebar-scroll")).toHaveLength(1);
     act(() => layoutSidebar(640));
     expect(hostsById("details-sidebar-scroll")).toHaveLength(0);
   });
 
-  it.each([2000, 600])("preserves the panel silhouette and selected styling at %i pt", (width) => {
+  it.each([2000, 600])("preserves the panel silhouette without a selected fill at %i pt", (width) => {
     (globalThis as { __rnMockOS?: string }).__rnMockOS = "web";
     act(() => { renderer = TestRenderer.create(screen(false)); });
     layOut(width);
@@ -2186,7 +2682,7 @@ describe("Tasks board, desktop", () => {
     const check = (open: boolean) => {
       expect(frame()).toMatchObject({ width: 16, height: 13, borderWidth: 1.5, borderRadius: 2.5, flexDirection: bottom ? "column" : "row", ...(bottom ? { paddingBottom: 1.5 } : { paddingRight: 1.5 }) });
       expect(fill()).toMatchObject({ width: bottom ? 10 : open ? 3.5 : 1.5, height: bottom ? open ? 3 : 1.5 : 7, borderRadius: 0.75, backgroundColor: open ? "#1b1b1f" : "#6b6b75" });
-      expect(StyleSheet.flatten(button().props.style).backgroundColor).toBe(open ? "#e4e4e7" : "#ffffff");
+      expect(StyleSheet.flatten(button().props.style).backgroundColor).toBe("#ffffff");
       expect(button().findAll((node) => (node.type as unknown) === "Icon")).toHaveLength(0);
     };
     const initial = button().props.accessibilityState.selected;
@@ -2264,6 +2760,7 @@ describe("Tasks board, desktop", () => {
     if (os === "ios") toggleSidebarControl();
     const layout = (node: ReactTestInstance, width: number) => act(() => node.props.onLayout({ nativeEvent: { layout: { x: 0, y: 0, width, height: 36 } } }));
     const tabs = () => renderer!.root.findAll((node) => (node.type as unknown) === "Pressable" && node.props.accessibilityRole === "tab");
+    expect(tabs().map((tab) => tab.props.accessibilityLabel)).toEqual((["agent", "label", "project", "workspace"] as const).map((kind) => BOARD_STRINGS[language].sidebar.groups[kind]));
     const labels = () => hostsById("sidebar-group-tab-label");
     const measureTab = (tab: ReactTestInstance, width: number) => layout(tab.find((node) => (node.type as unknown) === "Text" && node.props.testID === "sidebar-group-tab-measure"), width);
     // The tabs share their row equally, so it alone is laid out: four tabs `width` wide.
@@ -2528,6 +3025,8 @@ describe("Tasks board, desktop", () => {
     for (const height of [900, 560, 1100]) {
       await act(async () => column.props.onLayout({ nativeEvent: { layout: { width: 380, height } } }));
       const scroll = hostsById("detail-tab-short-scroll")[0]!;
+      expect(StyleSheet.flatten(scroll.props.style).marginRight).toBe(0);
+      expect(scroll.props.contentContainerStyle).toBeUndefined();
       expect(scroll.props.stickyHeaderIndices).toEqual([1]);
       expect(scroll.findAll((node) => typeof node.type === "string" && node.props.testID === "detail-header")).toHaveLength(1);
       expect(scroll.findAll((node) => typeof node.type === "string" && node.props.testID === "detail-action-bar")).toHaveLength(0);
@@ -2542,11 +3041,118 @@ describe("Tasks board, desktop", () => {
     const card = cards().find((node) => node.props.card.id === "sample-running")!;
     await act(async () => card.props.onSelect(card.props.card));
     expect(hostsById("board-sheet")).toHaveLength(1);
-    expect(hostsById("detail-tab-short-scroll")).toHaveLength(1);
+    expect(StyleSheet.flatten(hostsById("board-sheet-content")[0]!.props.style).paddingHorizontal).toBe(8);
+    const scroll = hostsById("detail-tab-short-scroll")[0]!;
+    expect(StyleSheet.flatten(scroll.props.style).marginRight).toBe(-8);
+    expect(scroll.props.contentContainerStyle).toEqual({ paddingRight: 8 });
+    expect(scroll.props.showsVerticalScrollIndicator).toBe(true);
     expect(hostsById("detail-tab-messages")[0]!.props.accessibilityState.selected).toBe(true);
     await act(async () => hostsById("detail-tab-info")[0]!.props.onPress());
+    expect(hostsById("detail-tab-short-scroll")[0]).toBe(scroll);
     expect(hostsById("detail-location")).toHaveLength(1);
     expect(hostsById("detail-action-bar")).toHaveLength(1);
+    expect(hostsById("detail-close")).toHaveLength(0);
+    expect(hostsById("detail-bar-close")).toHaveLength(1);
+    const controls = hostsById("detail-header-controls")[0]!;
+    const buttons = controls.findAll((node) => typeof node.type === "string" && node.props.accessibilityRole === "button");
+    expect(buttons.map((node) => node.props.testID)).toEqual(["detail-menu", "detail-sheet-toggle"]);
+    const bar = hostsById("detail-action-bar")[0]!;
+    const actions = bar.findAll((node) => typeof node.type === "string" && node.props.accessibilityRole === "button");
+    expect(actions.at(-1)!.props.testID).toBe("detail-bar-close");
+  });
+
+  it.each(["ios", "android"])("does not draw a %s touch card's details again for the column's first layout", async (os) => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = os;
+    await act(async () => { renderer = TestRenderer.create(screen(false)); });
+    layOut(600);
+    const card = cards().find((node) => node.props.card.id === "sample-running")!;
+    await act(async () => card.props.onSelect(card.props.card));
+    const drawn = hostsById("detail-cards")[0]!.props;
+    // A foldable's sheet: short and narrow, and a tablet's: tall and wide. Neither changes a card in tabs.
+    for (const layout of [{ width: 560, height: 420 }, { width: 900, height: 700 }]) {
+      await act(async () => hostsById("details-sidebar")[0]!.props.onLayout({ nativeEvent: { layout } }));
+      expect(hostsById("detail-cards")[0]!.props).toBe(drawn);
+    }
+  });
+
+  it.each(["ios", "android"])("takes the %s column's height once a closed card leaves the floating panel to the groups", async (os) => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = os;
+    await act(async () => { renderer = TestRenderer.create(screen(false)); });
+    layOut(900);
+    act(() => hostsById("sidebar-switch")[0]!.props.onPress());
+    const card = cards().find((node) => node.props.card.id === "sample-running")!;
+    await act(async () => card.props.onSelect(card.props.card));
+    await act(async () => hostsById("details-sidebar")[0]!.props.onLayout({ nativeEvent: { layout: { width: 380, height: 560 } } }));
+    expect(hostsById("details-sidebar-scroll")).toHaveLength(0);
+    // The groups scroll as one in a short column: the height measured under the card holds for them.
+    await act(async () => hostsById("detail-close")[0]!.props.onPress());
+    expect(hostsById("detail-cards")).toHaveLength(0);
+    expect(hostsById("details-sidebar-scroll")).toHaveLength(1);
+  });
+
+  it.each([["android", 600, "sheet"], ["android", 900, "floating panel"], ["web", 900, "floating panel"], ["web", 2000, "inline sidebar"]] as const)("leaves the %s %s-wide board's details alone while another agent updates, and draws them for their own (%s)", async (os, width, _kind) => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = os;
+    const running = (id: string, title: string, updatedAt: string) => makeAgent({ id, title, status: "running", workspaceId: "ws", updatedAt, lastUserMessageAt: updatedAt });
+    const start = new Date(Date.now() - 60_000).toISOString();
+    const fake = createFakePaseo({ agents: [running("open-card", "Open card", start), running("other-card", "Other card", start)] });
+    host.liveTasks = fake.paseo;
+    await act(async () => { renderer = TestRenderer.create(screen(false)); });
+    layOut(width);
+    await act(async () => { await vi.advanceTimersByTimeAsync(800); });
+    const open = cards().find((node) => node.props.card.id === "open-card")!;
+    await act(async () => open.props.onSelect(open.props.card));
+    const drawn = hostsById("detail-cards")[0]!.props;
+    const push = async (agent: ReturnType<typeof makeAgent>) => {
+      await act(async () => { fake.pushAgentSnapshot(agent); });
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    };
+    await push(running("other-card", "Other card, renamed", new Date().toISOString()));
+    expect(textOf(cards().find((node) => node.props.card.id === "other-card")!.findByProps({ testID: "task-card-title" }))).toContain("Other card, renamed");
+    expect(hostsById("detail-cards")[0]!.props).toBe(drawn);
+    // The side panels' counts above the details still follow the lanes.
+    const stats = hostsById("sidebar-stats")[0];
+    const before = stats ? textOf(stats) : null;
+    await push(makeAgent({ id: "other-card", title: "Other card, renamed", status: "idle", workspaceId: "ws", updatedAt: new Date(Date.now() + 500).toISOString(), lastUserMessageAt: start, requiresAttention: true, attentionReason: "finished" }));
+    expect(hostsById("detail-cards")[0]!.props).toBe(drawn);
+    if (before !== null) expect(textOf(hostsById("sidebar-stats")[0]!)).not.toBe(before);
+    else expect(hostsById("sidebar-stats")).toHaveLength(0);
+    await push(running("open-card", "Open card, renamed", new Date(Date.now() + 1000).toISOString()));
+    expect(hostsById("detail-cards")[0]!.props).not.toBe(drawn);
+    expect(textOf(hostsById("detail-title")[0]!)).toBe("Open card, renamed");
+  });
+
+  it.each(["ios", "android"])("lays out a %s sheet card's scroller without drawing the card again", async (os) => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = os;
+    await act(async () => { renderer = TestRenderer.create(screen(false)); });
+    layOut(600);
+    const card = cards().find((node) => node.props.card.id === "sample-running")!;
+    await act(async () => card.props.onSelect(card.props.card));
+    const drawn = hostsById("detail-cards")[0]!.props;
+    const page = () => StyleSheet.flatten(hostsById("detail-tab-messages-content")[0]!.props.style);
+    const bar = () => StyleSheet.flatten(hostsById("detail-action-bar")[0]!.props.style);
+    const scroll = hostsById("detail-tab-short-scroll")[0]!;
+    // The tabs' place, the scroller's height and its content's: the page fills what the tabs leave, the bar casts its edge.
+    await act(async () => hostsById("detail-tab-anchor")[0]!.props.onLayout({ nativeEvent: { layout: { x: 0, y: 150, width: 560, height: 46 } } }));
+    await act(async () => scroll.props.onLayout({ nativeEvent: { layout: { x: 0, y: 0, width: 560, height: 300 } } }));
+    await act(async () => scroll.props.onContentSizeChange(560, 900));
+    expect(page().minHeight).toBe(254);
+    expect(bar().boxShadow).toBeTruthy();
+    // Scrolled past the tabs: they pin and cast their shadow.
+    await act(async () => scroll.props.onScroll({ nativeEvent: { contentOffset: { y: 200 }, layoutMeasurement: { height: 300 }, contentSize: { height: 900 } } }));
+    expect(StyleSheet.flatten(hostsById("detail-tabs")[0]!.props.style).boxShadow).toBeTruthy();
+    expect(hostsById("detail-cards")[0]!.props).toBe(drawn);
+  });
+
+  it.each(["ios", "android"])("places the %s sheet column's scroll indicator outside the unchanged card width", async (os) => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = os;
+    await act(async () => { renderer = TestRenderer.create(screen(false)); });
+    layOut(600);
+    act(() => hostsById("sidebar-switch")[0]!.props.onPress());
+    const scroll = hostsById("details-sidebar-scroll")[0]!;
+    expect(scroll.props.showsVerticalScrollIndicator).toBe(true);
+    expect(StyleSheet.flatten(scroll.props.style).marginRight).toBe(-8);
+    expect(StyleSheet.flatten(scroll.props.contentContainerStyle).paddingRight).toBe(8);
+    expect(hostsById("sidebar-stats")).toHaveLength(1);
   });
 
   it("raises the details from the bottom of a board too narrow to float them, and the lanes make room", () => {
@@ -2563,14 +3169,20 @@ describe("Tasks board, desktop", () => {
     const card = cards().find((node) => node.props.card.id === "sample-running")!;
     act(() => card.props.onSelect(card.props.card));
     expect(hostsById("board-sheet")).toHaveLength(1);
+    // Laid out at full height, the sheet's own box spans nearly the whole board: only what it draws takes a touch, so the lanes above it still scroll.
+    expect(hostsById("board-sheet")[0]!.props.pointerEvents).toBe("box-none");
+    expect(hostsById("board-sheet-body")[0]!.props.pointerEvents ?? "auto").toBe("auto");
     expect(hostsById("sidebar-floating")).toHaveLength(0);
+    mountFrames();
+    timings.finish(timings.slide().at(-1)!);
     const toggle = () => hostsById("detail-sheet-toggle")[0]!;
     expect(toggle().props.accessibilityLabel).toBe("Expand details");
     expect(toggle().find((node) => (node.type as unknown) === "Icon").props.name).toBe("Maximize2");
     act(() => toggle().props.onPress());
     // The sheet moves first; the board hears of the new height once it is there.
     expect(toggle().props.accessibilityLabel).toBe("Expand details");
-    expect(timings.sheet().at(-1)).toMatchObject({ to: 792, duration: 240 });
+    mountFrames();
+    expect(timings.sheet().at(-1)).toMatchObject({ to: 0, duration: 240 });
     timings.finish(timings.sheet().at(-1)!);
     expect(toggle().props.accessibilityLabel).toBe("Collapse details");
     expect(toggle().find((node) => (node.type as unknown) === "Icon").props.name).toBe("Minimize2");
@@ -2591,16 +3203,20 @@ describe("Tasks board, desktop", () => {
     expect(hostsById("detail-column-head")).toHaveLength(0);
     expect(hostsById("details-sidebar-scroll")).toHaveLength(1);
     const list = renderer!.root.findAll((node) => typeof node.props.renderItem === "function" && node.props.contentContainerStyle !== undefined)[0]!;
-    expect(StyleSheet.flatten(list.props.contentContainerStyle).paddingBottom).toBe(8 + 464);
+    expect(laneEnd(list)).toBe(8 + 464);
     // The handle switches to full height and back.
     const handle = () => renderer!.root.find((node) => (node.type as unknown) === "Pressable" && node.props.testID === "board-sheet-handle");
     expect(handle().props.accessibilityLabel).toBe("Expand details");
+    // The lanes take the new room without drawing again: only the spacer at each list's end follows it.
+    const drawnList = list.props;
     act(() => handle().props.onPress());
-    expect(StyleSheet.flatten(list.props.contentContainerStyle).paddingBottom).toBe(8 + 464);
+    expect(laneEnd(list)).toBe(8 + 464);
+    mountFrames();
     timings.finish(timings.sheet().at(-1)!);
     expect(handle().props.accessibilityLabel).toBe("Collapse details");
     expect(toggle().find((node) => (node.type as unknown) === "Icon").props.name).toBe("Minimize2");
-    expect(StyleSheet.flatten(list.props.contentContainerStyle).paddingBottom).toBe(8 + 792);
+    expect(laneEnd(list)).toBe(8 + 792);
+    expect(list.props).toBe(drawnList);
     // A drag down on the handle takes it back to half, and the click the drag ends with does not switch it again.
     const strip = handle().parent!.parent!;
     // The drag counts from where the finger went down (pageY), not from the late grant.
@@ -2610,9 +3226,9 @@ describe("Tasks board, desktop", () => {
       strip.props.onPanResponderRelease({ nativeEvent: { pageY: 420 } }, { dy: 80, vy: 0 });
     });
     act(() => handle().props.onPress());
-    expect(timings.sheet().at(-1)).toMatchObject({ to: 464, duration: 240 });
+    expect(timings.sheet().at(-1)).toMatchObject({ to: 328, duration: 240 });
     timings.finish(timings.sheet().at(-1)!);
-    expect(StyleSheet.flatten(list.props.contentContainerStyle).paddingBottom).toBe(8 + 464);
+    expect(laneEnd(list)).toBe(8 + 464);
     // A tap on the lanes' blank space puts it away.
     let blank = lanesScroll().parent!;
     while (!blank.props.onResponderGrant) blank = blank.parent!;
@@ -2620,6 +3236,9 @@ describe("Tasks board, desktop", () => {
       blank.props.onResponderGrant({ nativeEvent: { pageX: 10, pageY: 10 } });
       blank.props.onResponderRelease({ nativeEvent: { pageX: 10, pageY: 10 } });
     });
+    expect(timings.slide().at(-1)).toMatchObject({ to: 464, duration: 200 });
+    expect(hostsById("board-sheet")).toHaveLength(1);
+    timings.finish(timings.slide().at(-1)!);
     expect(hostsById("board-sheet")).toHaveLength(0);
     } finally {
       timings.restore();
@@ -2640,29 +3259,49 @@ describe("Tasks board, desktop", () => {
       const toggle = () => hostsById("detail-sheet-toggle")[0]!;
       const handle = () => renderer!.root.find((node) => (node.type as unknown) === "Pressable" && node.props.testID === "board-sheet-handle");
       const label = () => toggle().props.accessibilityLabel;
-      const room = () => StyleSheet.flatten(renderer!.root.findAll((node) => typeof node.props.renderItem === "function" && node.props.contentContainerStyle !== undefined)[0]!.props.contentContainerStyle).paddingBottom;
+      const room = () => laneEnd(renderer!.root.findAll((node) => typeof node.props.renderItem === "function" && node.props.contentContainerStyle !== undefined)[0]!);
       const last = () => timings.sheet().at(-1)!;
-      const height = () => (timings.sheetValue() as unknown as { __value: number }).__value;
-      timings.finish(last());
+      // The height it shows: laid out at its full 792, it stands this far down.
+      const height = () => 792 - (timings.sheetValue() as unknown as { __value: number }).__value;
+      // The sheet stands at its height from the start and slides in; the lanes make room once it is in.
+      expect(timings.sheet()).toHaveLength(0);
       expect(height()).toBe(464);
+      // The slide starts two frames on, once the details are mounted: a native run started beside that mount lost its start behind it.
+      expect(timings.slide()).toHaveLength(0);
+      act(() => { vi.advanceTimersByTime(16); });
+      expect(timings.slide()).toHaveLength(0);
+      act(() => { vi.advanceTimersByTime(16); });
+      // Off the JS thread where there is a native driver: the board's render for the selection cannot hold it.
+      expect(timings.slide().at(-1)).toMatchObject({ to: 0, duration: 240, native: os !== "web" });
+      expect(room()).toBe(8);
+      timings.finish(timings.slide().at(-1)!);
+      expect(room()).toBe(8 + 464);
 
-      // A second tap before the sheet is there turns it back; the stopped run tells the board nothing.
+      // Growing, the scrollers take the room below the board first; the sheet moves (on the native driver) two frames on.
+      const sheetRoom = () => StyleSheet.flatten(hostsById("sheet-scroll-room")[0]!.props.style).marginBottom;
+      expect(sheetRoom()).toBe(328);
       act(() => toggle().props.onPress());
+      expect(timings.sheet()).toHaveLength(0);
+      expect(sheetRoom()).toBe(0);
+      mountFrames();
+      // A second tap before the sheet is there turns it back; the stopped run tells the board nothing.
       const up = last();
-      expect(up).toMatchObject({ to: 792, duration: 240 });
+      expect(up).toMatchObject({ to: 0, duration: 240, native: os !== "web" });
       expect([label(), room()]).toEqual(["Expand details", 8 + 464]);
       act(() => toggle().props.onPress());
       expect(up.over).toBe(true);
-      expect(last()).toMatchObject({ to: 464, duration: 240 });
-      expect([label(), room()]).toEqual(["Expand details", 8 + 464]);
+      expect(last()).toMatchObject({ to: 328, duration: 240 });
+      expect([label(), room(), sheetRoom()]).toEqual(["Expand details", 8 + 464, 0]);
       timings.finish(last());
-      expect([label(), room()]).toEqual(["Expand details", 8 + 464]);
+      // Shrunk, they give the room up again once it is there.
+      expect([label(), room(), sheetRoom()]).toEqual(["Expand details", 8 + 464, 328]);
 
-      // Three taps, the handle's among them, count from where each switch is heading.
+      // Three taps, the handle's among them, count from where each switch is heading; a turn before the frames starts no run.
       act(() => toggle().props.onPress());
       act(() => handle().props.onPress());
       act(() => toggle().props.onPress());
-      expect(timings.sheet().slice(-3).map((run) => [run.to, run.over])).toEqual([[792, true], [464, true], [792, false]]);
+      mountFrames();
+      expect(timings.sheet().slice(-2).map((run) => [run.to, run.over])).toEqual([[328, true], [0, false]]);
       expect(label()).toBe("Expand details");
       const runs = timings.sheet().length;
       timings.finish(last());
@@ -2673,7 +3312,8 @@ describe("Tasks board, desktop", () => {
       // A drag catches a switch where it is, and a short one leaves the height the board knows.
       act(() => toggle().props.onPress());
       const down = last();
-      act(() => timings.sheetValue().setValue(600));
+      expect(down).toMatchObject({ to: 328, duration: 240 });
+      act(() => timings.sheetValue().setValue(792 - 600));
       const strip = handle().parent!.parent!;
       act(() => {
         strip.props.onStartShouldSetPanResponderCapture({ nativeEvent: { pageY: 300 } });
@@ -2683,7 +3323,7 @@ describe("Tasks board, desktop", () => {
       act(() => strip.props.onPanResponderMove({ nativeEvent: { pageY: 310 } }, { dy: 10, vy: 0 }));
       expect(height()).toBe(590);
       act(() => strip.props.onPanResponderRelease({ nativeEvent: { pageY: 310 } }, { dy: 10, vy: 0 }));
-      expect(last()).toMatchObject({ to: 792, duration: 200 });
+      expect(last()).toMatchObject({ to: 0, duration: 200 });
       timings.finish(last());
       expect([label(), room()]).toEqual(["Collapse details", 8 + 792]);
 
@@ -2693,7 +3333,7 @@ describe("Tasks board, desktop", () => {
         strip.props.onPanResponderGrant({ nativeEvent: { pageY: 300 } }, { dy: 0, vy: 0 });
         strip.props.onPanResponderRelease({ nativeEvent: { pageY: 400 } }, { dy: 100, vy: 0 });
       });
-      expect(last()).toMatchObject({ to: 464, duration: 240 });
+      expect(last()).toMatchObject({ to: 328, duration: 240 });
       expect([label(), room()]).toEqual(["Collapse details", 8 + 792]);
       timings.finish(last());
       expect([label(), room()]).toEqual(["Expand details", 8 + 464]);
@@ -2701,12 +3341,204 @@ describe("Tasks board, desktop", () => {
 
       // Closed while a switch moves: the switch never reaches the board, and the sheet opens at half again.
       act(() => toggle().props.onPress());
+      mountFrames();
       const lost = last();
-      act(() => hostsById("detail-close")[0]!.props.onPress());
-      expect(hostsById("board-sheet")).toHaveLength(0);
+      act(() => hostsById("detail-bar-close")[0]!.props.onPress());
       expect(lost.over).toBe(true);
+      // It slides out at the height it stands at, and the lanes keep their room until it is out.
+      expect(timings.slide().at(-1)).toMatchObject({ to: 464, duration: 200 });
+      expect(hostsById("board-sheet")).toHaveLength(1);
+      expect(room()).toBe(8 + 464);
+      const closing = timings.slide().at(-1)!;
       open();
+      expect(closing.over).toBe(true);
+      expect(timings.slide().at(-1)).toMatchObject({ to: 0, duration: 240 });
+      expect(height()).toBe(464);
       expect([label(), room()]).toEqual(["Expand details", 8 + 464]);
+      timings.finish(timings.slide().at(-1)!);
+      act(() => hostsById("detail-bar-close")[0]!.props.onPress());
+      timings.finish(timings.slide().at(-1)!);
+      expect(hostsById("board-sheet")).toHaveLength(0);
+      expect(room()).toBe(8);
+
+      // A drag down from half slides it out from where the finger left it, then closes it.
+      open();
+      mountFrames();
+      timings.finish(timings.slide().at(-1)!);
+      act(() => {
+        handle().parent!.parent!.props.onStartShouldSetPanResponderCapture({ nativeEvent: { pageY: 300 } });
+        handle().parent!.parent!.props.onPanResponderGrant({ nativeEvent: { pageY: 300 } }, { dy: 0, vy: 0 });
+      });
+      act(() => handle().parent!.parent!.props.onPanResponderMove({ nativeEvent: { pageY: 400 } }, { dy: 100, vy: 0 }));
+      act(() => handle().parent!.parent!.props.onPanResponderRelease({ nativeEvent: { pageY: 400 } }, { dy: 100, vy: 0 }));
+      expect(timings.slide().at(-1)).toMatchObject({ to: 364, duration: 200, native: os !== "web" });
+      expect([hostsById("board-sheet").length, room()]).toEqual([1, 8 + 464]);
+      timings.finish(timings.slide().at(-1)!);
+      expect([hostsById("board-sheet").length, room()]).toEqual([0, 8]);
+      // It opens again at its full half height.
+      act(() => { vi.advanceTimersByTime(300); });
+      open();
+      expect(height()).toBe(464);
+      mountFrames();
+      expect(timings.slide().at(-1)).toMatchObject({ to: 0, duration: 240 });
+
+      // Closed before its first slide starts: nothing slides in, and it slides out from where it waits.
+      const slides = timings.slide().length;
+      timings.finish(timings.slide().at(-1)!);
+      act(() => hostsById("detail-bar-close")[0]!.props.onPress());
+      timings.finish(timings.slide().at(-1)!);
+      open();
+      act(() => hostsById("detail-bar-close")[0]!.props.onPress());
+      mountFrames();
+      expect(timings.slide().slice(slides + 1).map((run) => run.to)).toEqual([464]);
+      timings.finish(timings.slide().at(-1)!);
+      expect(hostsById("board-sheet")).toHaveLength(0);
+    } finally {
+      timings.restore();
+    }
+  });
+
+  it.each(["ios", "android"])("on %s holds the details' viewport while the sheet changes height, then takes the last one", (os) => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = os;
+    const timings = holdTimings();
+    try {
+      act(() => { renderer = TestRenderer.create(screen(false)); });
+      layOut(600);
+      const card = cards().find((node) => node.props.card.id === "sample-running")!;
+      act(() => card.props.onSelect(card.props.card));
+      mountFrames();
+      timings.finish(timings.slide().at(-1)!);
+      const scroll = () => hostsById("detail-tab-short-scroll")[0]!;
+      const viewport = (height: number) => act(() => scroll().props.onLayout({ nativeEvent: { layout: { x: 0, y: 0, width: 580, height } } }));
+      const least = () => StyleSheet.flatten(hostsById("detail-tab-messages-content")[0]!.props.style).minHeight;
+      viewport(300);
+      expect(least()).toBe(300);
+
+      // A switch resizes the scroller on every frame: the page keeps its height until the sheet is there.
+      act(() => hostsById("detail-sheet-toggle")[0]!.props.onPress());
+      mountFrames();
+      viewport(400);
+      viewport(500);
+      expect(least()).toBe(300);
+      timings.finish(timings.sheet().at(-1)!);
+      expect(least()).toBe(500);
+      // At rest it follows at once.
+      viewport(480);
+      expect(least()).toBe(480);
+
+      // So does a drag, until the sheet settles after it.
+      const strip = renderer!.root.find((node) => (node.type as unknown) === "Pressable" && node.props.testID === "board-sheet-handle").parent!.parent!;
+      act(() => {
+        strip.props.onStartShouldSetPanResponderCapture({ nativeEvent: { pageY: 300 } });
+        strip.props.onPanResponderGrant({ nativeEvent: { pageY: 300 } }, { dy: 0, vy: 0 });
+      });
+      viewport(420);
+      expect(least()).toBe(480);
+      act(() => strip.props.onPanResponderRelease({ nativeEvent: { pageY: 400 } }, { dy: 100, vy: 0 }));
+      viewport(360);
+      expect(least()).toBe(480);
+      timings.finish(timings.sheet().at(-1)!);
+      expect(least()).toBe(360);
+    } finally {
+      timings.restore();
+    }
+  });
+
+  it.each(["web", "ios", "android"])("on %s answers a tool permission in the sheet's request section, its controls and Close above it", (os) => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = os;
+    const timings = holdTimings();
+    try {
+      act(() => { renderer = TestRenderer.create(screen(false)); });
+      layOut(600);
+      const card = cards().find((node) => node.props.card.id === "sample-input")!;
+      act(() => card.props.onSelect(card.props.card));
+      mountFrames();
+      timings.finish(timings.slide().at(-1)!);
+      // As a question's: no bottom bar; Open and Close on the row above the request, Allow and Deny under it.
+      expect(hostsById("detail-action-bar")).toHaveLength(0);
+      const controls = hostsById("detail-question-controls");
+      expect(controls).toHaveLength(1);
+      expect(controls[0]!.findAll((node) => typeof node.type === "string" && node.props.accessibilityRole === "button").map((node) => node.props.testID)).toEqual(["detail-bar-open", "detail-bar-close"]);
+      const section = hostsById("detail-question-section");
+      expect(section).toHaveLength(1);
+      expect(StyleSheet.flatten(section[0]!.props.style).borderTopWidth).toBe(0.5);
+      const answers = section[0]!.findAll((node) => typeof node.type === "string" && node.props.testID === "detail-permission-actions");
+      expect(answers[0]!.findAll((node) => typeof node.type === "string" && node.props.accessibilityRole === "button").map((node) => node.props.accessibilityLabel)).toEqual(["Allow", "Deny"]);
+      expect(openAgent).not.toHaveBeenCalled();
+    } finally {
+      timings.restore();
+    }
+  });
+
+  it.each(["web", "ios", "android"])("on %s keeps the sheet's action bar at the bottom of what shows, with one scroller giving up the room below", (os) => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = os;
+    const timings = holdTimings();
+    try {
+      act(() => { renderer = TestRenderer.create(screen(false)); });
+      layOut(600);
+      const card = cards().find((node) => node.props.card.id === "sample-running")!;
+      act(() => card.props.onSelect(card.props.card));
+      mountFrames();
+      timings.finish(timings.slide().at(-1)!);
+      const foot = hostsById("sheet-foot");
+      expect(foot).toHaveLength(1);
+      // The foot moves up by what the sheet's shift moves it down (the mock's multiply hands back the value).
+      expect((StyleSheet.flatten(foot[0]!.props.style).transform as { translateY: unknown }[])[0]!.translateY).toBe(timings.sheetValue());
+      expect(foot[0]!.findAll((node) => typeof node.type === "string" && node.props.testID === "detail-bar-close")).toHaveLength(1);
+      // Inside a tablet's card the foot paints the card's bottom edge; on the web its bar sits on the sheet.
+      const painted = foot[0]!.findAll((node) => typeof node.type === "string" && node.props.pointerEvents === "none" && StyleSheet.flatten(node.props.style)?.position === "absolute");
+      expect(painted.map((node) => StyleSheet.flatten(node.props.style).borderBottomLeftRadius ?? null)).toEqual(os === "web" ? [null] : [null, 12]);
+      expect(StyleSheet.flatten(painted[0]!.props.style).bottom).toBe(os === "web" ? -4 : -(StyleSheet.hairlineWidth + (os === "android" ? 24 : 4)));
+      const room = hostsById("sheet-scroll-room");
+      expect(room).toHaveLength(1);
+      expect(StyleSheet.flatten(room[0]!.props.style).marginBottom).toBe(328);
+      expect(room[0]!.findAll((node) => typeof node.type === "string" && node.props.testID === (os === "web" ? "details-sidebar-scroll" : "detail-tab-short-scroll"))).toHaveLength(1);
+      // The sheet is laid out at its full height whatever it shows.
+      expect(StyleSheet.flatten(hostsById("board-sheet-body")[0]!.props.style).height).toBe(792);
+    } finally {
+      timings.restore();
+    }
+  });
+
+  it.each(["web", "ios", "android"])("on %s drags the sheet by a 16 px strip across its width, and shows the grabber held from the touch down until it lets go", (os) => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = os;
+    const timings = holdTimings();
+    try {
+      act(() => { renderer = TestRenderer.create(screen(false)); });
+      layOut(600);
+      const card = cards().find((node) => node.props.card.id === "sample-running")!;
+      act(() => card.props.onSelect(card.props.card));
+      mountFrames();
+      timings.finish(timings.slide().at(-1)!);
+      const handle = () => renderer!.root.find((node) => (node.type as unknown) === "Pressable" && node.props.testID === "board-sheet-handle");
+      const strip = handle().parent!.parent!;
+      // The strip is the sheet's first row, as wide as the sheet; the handle fills it.
+      expect(StyleSheet.flatten(strip.props.style)).toMatchObject({ height: 16 });
+      expect(StyleSheet.flatten(strip.props.style).width).toBeUndefined();
+      expect(StyleSheet.flatten(handle().props.style)).toMatchObject({ flex: 1 });
+      // The grip's runs: 90 ms in, 160 ms out (the sheet's own run 200-280 ms).
+      expect(hostsById("board-sheet-grabber")).toHaveLength(1);
+      const base = timings.runs().length;
+      const grips = () => timings.runs().slice(base).filter((run) => run.duration === 90 || run.duration === 160).map((run) => [run.to, run.native]);
+      const native = os !== "web";
+
+      // A tap: held while the finger is down.
+      act(() => handle().props.onPressIn());
+      expect(grips()).toEqual([[1, native]]);
+      act(() => handle().props.onPressOut());
+      expect(grips()).toEqual([[1, native], [0, native]]);
+
+      // A drag takes the touch from the handle; the grabber stays held until the drag lets go.
+      act(() => handle().props.onPressIn());
+      act(() => {
+        strip.props.onStartShouldSetPanResponderCapture({ nativeEvent: { pageY: 300 } });
+        strip.props.onPanResponderGrant({ nativeEvent: { pageY: 300 } }, { dy: 0, vy: 0 });
+      });
+      act(() => handle().props.onPressOut());
+      act(() => strip.props.onPanResponderMove({ nativeEvent: { pageY: 280 } }, { dy: -20, vy: 0 }));
+      expect(grips().at(-1)).toEqual([1, native]);
+      act(() => strip.props.onPanResponderRelease({ nativeEvent: { pageY: 280 } }, { dy: -20, vy: 0 }));
+      expect(grips().at(-1)).toEqual([0, native]);
     } finally {
       timings.restore();
     }
@@ -2730,14 +3562,35 @@ describe("Tasks board, desktop", () => {
       const runs = timings.sheet().length;
       act(() => toggle().props.onPress());
       expect(timings.sheet()).toHaveLength(runs);
-      expect((timings.sheetValue() as unknown as { __value: number }).__value).toBe(792);
+      expect((timings.sheetValue() as unknown as { __value: number }).__value).toBe(0);
       expect(toggle().props.accessibilityLabel).toBe("Collapse details");
       act(() => toggle().props.onPress());
-      expect((timings.sheetValue() as unknown as { __value: number }).__value).toBe(464);
+      expect((timings.sheetValue() as unknown as { __value: number }).__value).toBe(328);
       expect(toggle().props.accessibilityLabel).toBe("Expand details");
+      act(() => hostsById("detail-bar-close")[0]!.props.onPress());
+      expect(hostsById("board-sheet")).toHaveLength(0);
     } finally {
       act(() => onReduce(false));
       subscription.mockRestore();
+      timings.restore();
+    }
+  });
+
+  it.each(["ios", "android"])("animates the %s tablet toolbar close before removing the sheet", (os) => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = os;
+    const timings = holdTimings();
+    try {
+      act(() => { renderer = TestRenderer.create(screen(false)); });
+      layOut(600);
+      toggleSidebarControl();
+      mountFrames();
+      timings.finish(timings.slide().at(-1)!);
+      toggleSidebarControl();
+      expect(hostsById("board-sheet")[0]!.props.pointerEvents).toBe("none");
+      expect(timings.slide().at(-1)).toMatchObject({ to: 464, duration: 200 });
+      timings.finish(timings.slide().at(-1)!);
+      expect(hostsById("board-sheet")).toHaveLength(0);
+    } finally {
       timings.restore();
     }
   });
@@ -2857,6 +3710,54 @@ describe("Tasks board, desktop", () => {
     expect(readSidebarPreference().open).toBe(true);
   });
 
+  it.each(["ios", "android"])("%s keeps the board render stable during an inline sidebar drag within the same lanes", (os) => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = os;
+    act(() => { renderer = TestRenderer.create(screen(false)); });
+    layOut(1600);
+    const handle = () => hostsById("sidebar-resize")[0]!;
+    const event = (pageX: number) => ({ nativeEvent: { pageX } });
+    act(() => {
+      handle().props.onStartShouldSetPanResponderCapture(event(700));
+      handle().props.onPanResponderGrant();
+    });
+    act(() => handle().props.onPanResponderMove(event(699)));
+    const board = hostsById("tasks-board-area")[0]!.props;
+    const rows = host.rowRenders;
+    const details = hostsById("details-sidebar")[0]!.props;
+    for (let x = 698; x >= 670; x--) {
+      act(() => handle().props.onPanResponderMove(event(x)));
+      expect(liveNumber(StyleSheet.flatten(hostsById("sidebar-inline")[0]!.props.style).width)).toBe(380 + 700 - x);
+      expect(hostsById("tasks-board-area")[0]!.props).toBe(board);
+      expect(hostsById("details-sidebar")[0]!.props).toBe(details);
+      expect(host.rowRenders).toBe(rows);
+    }
+    // Crossing into another lane view still updates the board during the drag.
+    act(() => handle().props.onPanResponderMove(event(280)));
+    expect(liveNumber(StyleSheet.flatten(hostsById("sidebar-inline")[0]!.props.style).width)).toBe(800);
+    expect(hostsById("tasks-board-area")[0]!.props).not.toBe(board);
+    act(() => handle().props.onPanResponderRelease(event(665)));
+    expect(readSidebarPreference().width).toBe(415);
+    expect(liveNumber(StyleSheet.flatten(hostsById("sidebar-inline")[0]!.props.style).width)).toBe(415);
+  });
+
+  it.each(["ios", "android"])("%s animates the inline sidebar without animating layout width", (os) => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = os;
+    const timing = vi.spyOn(Animated, "timing");
+    act(() => { renderer = TestRenderer.create(screen(false)); });
+    layOut(1600);
+    const progress = timing.mock.calls.filter(([, config]) => config.toValue === 1 && config.duration === 240).at(-1)![0] as Animated.Value;
+    expect(timing).toHaveBeenCalledWith(progress, expect.objectContaining({ useNativeDriver: true }));
+    expect(StyleSheet.flatten(hostsById("sidebar-slot")[0]!.props.style).width).toBe(392);
+    const panel = hostsById("sidebar-inline")[0]!;
+    const motion = hostsById("sidebar-motion")[0]!;
+    expect(hostParentOf(panel)).toBe(motion);
+    expect(StyleSheet.flatten(panel.props.style)).not.toHaveProperty("opacity");
+    expect(StyleSheet.flatten(panel.props.style)).not.toHaveProperty("transform");
+    expect(StyleSheet.flatten(motion.props.style)).not.toHaveProperty("width");
+    toggleSidebarControl();
+    expect(timing).toHaveBeenCalledWith(progress, expect.objectContaining({ toValue: 0, duration: 180, useNativeDriver: true }));
+  });
+
   it.each([
     ["ios", 1100], ["ios", 1600], ["android", 1100], ["android", 1600],
   ] as const)("%s shows and resizes the inline details handle at %i pt", async (os, viewport) => {
@@ -2881,6 +3782,8 @@ describe("Tasks board, desktop", () => {
       expect(hostsById("floating-sidebar-resize")).toHaveLength(0);
       expect(StyleSheet.flatten(hostsById("sidebar-resize-grabber")[0]!.props.style).opacity).toBe(0.5);
       expect(StyleSheet.flatten(hostsById("sidebar-inline")[0]!.props.style).paddingLeft).toBeGreaterThan(StyleSheet.flatten(handle().props.style).width);
+      const panelStyle = StyleSheet.flatten(hostsById("sidebar-inline")[0]!.props.style);
+      expect(panelStyle.right + panelStyle.paddingRight).toBe(panelStyle.paddingLeft);
       expect(handle().props.accessibilityValue).toEqual({ min: 260, max, now: 380 });
       start();
       if (os === "ios") {
@@ -3007,6 +3910,13 @@ describe("Tasks board, desktop", () => {
     toggleSidebarControl();
     const handle = () => hostsById("floating-sidebar-resize")[0]!;
     const width = () => liveNumber(StyleSheet.flatten(hostsById("sidebar-floating")[0]!.props.style).width);
+    const panel = hostsById("sidebar-floating")[0]!;
+    const motion = hostsById("floating-sidebar-motion")[0]!;
+    expect(hostParentOf(panel)).toBe(motion);
+    expect(motion.props.pointerEvents).toBe("box-none");
+    expect(StyleSheet.flatten(panel.props.style)).not.toHaveProperty("opacity");
+    expect(StyleSheet.flatten(panel.props.style)).not.toHaveProperty("transform");
+    expect(StyleSheet.flatten(motion.props.style)).not.toHaveProperty("width");
     const event = (pageX: number) => ({ nativeEvent: { pageX } });
     expect(handle().props.accessibilityValue.min).toBe(210);
     expect(handle().props.onMoveShouldSetPanResponder({}, { dx: 3, dy: 0 })).toBe(false);
@@ -3048,7 +3958,7 @@ describe("Tasks board, desktop", () => {
     toggleSidebarControl();
     expect(StyleSheet.flatten(hostsById("sidebar-floating")[0]!.props.style).width).toBe(380);
     expect(StyleSheet.flatten(hostsById("sidebar-floating")[0]!.props.style).right).toBe(12);
-    expect(StyleSheet.flatten(hostsById("sidebar-floating")[0]!.props.style).paddingLeft).toBe(10);
+    expect(StyleSheet.flatten(hostsById("sidebar-floating")[0]!.props.style).paddingLeft).toBe(6);
     expect(hostsById("sidebar-resize")).toHaveLength(1);
     expect(hostsById("floating-sidebar-resize")).toHaveLength(0);
   });
@@ -3080,7 +3990,6 @@ describe("Tasks board, desktop", () => {
       select();
       const panel = () => hostsById("sidebar-floating")[0]!;
       const width = () => StyleSheet.flatten(panel().props.style).width;
-      const grabberOpacity = () => StyleSheet.flatten(hostsById("sidebar-resize-grabber")[0]!.props.style).opacity;
       const laneWidths = () => LANE_ORDER.map((id) => StyleSheet.flatten(hostsById(`lane-surface-${id}`)[0]!.props.style).width);
       const originalWidths = laneWidths();
       expect(width()).toBe(380);
@@ -3090,11 +3999,7 @@ describe("Tasks board, desktop", () => {
       expect(floatingStyle).toEqual(inlineStyle);
       expect(StyleSheet.flatten(hostsById("sidebar-slot")[0]!.props.style)).toMatchObject({ top: 0, bottom: 0 });
       expect(hostsById("sidebar-inline")).toHaveLength(0);
-      act(() => panel().props.onPointerEnter());
-      expect(grabberOpacity()).toBe(0.5);
       act(() => hostsById("sidebar-resize")[0]!.props.onPointerDown({ nativeEvent: { pageX: 1000, clientY: 200 } }));
-      act(() => panel().props.onPointerLeave());
-      expect(grabberOpacity()).toBe(0.5);
       for (const [pageX, expected] of [[0, 800], [2000, 260], [950, 430]] as const) {
         act(() => listeners.get("pointermove")!({ pageX, clientY: 200 }));
         act(() => { vi.advanceTimersByTime(16); });
@@ -3102,7 +4007,6 @@ describe("Tasks board, desktop", () => {
         expect(laneWidths()).toEqual(originalWidths);
       }
       act(() => listeners.get("pointerup")!({ pageX: 950, clientY: 200 }));
-      expect(grabberOpacity()).toBe(0);
       expect(readSidebarPreference()).toMatchObject({ open: false, width: 430 });
       expect(listeners.has("pointermove")).toBe(false);
       expect(listeners.has("pointerup")).toBe(false);
@@ -3146,6 +4050,37 @@ describe("Tasks board, desktop", () => {
     expect(renderer!.root.findByType(TaskDetailCards).props.card.id).toBe("sample-child-1");
     expect(host.toast).not.toHaveBeenCalled();
     expect(openAgent).not.toHaveBeenCalled();
+    // The parent whose row it was is one press back, as after a jump from the parent's details.
+    expect(hostsById("detail-back")[0]!.props.accessibilityLabel).toContain(parent.props.card.title);
+    act(() => hostsById("detail-back")[0]!.props.onPress());
+    expect(renderer!.root.findByType(TaskDetailCards).props.card.id).toBe("sample-running");
+    expect(hostsById("detail-back")).toHaveLength(0);
+  });
+
+  it("shows a folded historical subtask in the archived parent's details", async () => {
+    const handle = (data as unknown as { __handle: { byId: Map<string, TaskCard>; lanes: Record<string, { cards: TaskCard[] }> } }).__handle;
+    const sample = handle.byId.get("sample-done")!;
+    const parent: TaskCard = { ...sample, id: "history-parent", title: "Historical parent", lane: "archived", status: "archived", archived: "agent", children: [] };
+    const child: TaskCard = { ...sample, id: "history-child", title: "Historical child", lane: "archived", status: "archived", archived: "agent", parent: { id: parent.id, title: parent.title, missing: false, archived: false, detached: true } };
+    const before = handle.lanes.archived!.cards;
+    handle.lanes.archived!.cards = [parent, child];
+    handle.byId.set(parent.id, parent);
+    handle.byId.set(child.id, child);
+    host.settings = { ...DEFAULT_TASKS_SETTINGS, board: { ...DEFAULT_TASKS_SETTINGS.board, showArchived: true } };
+    try {
+      act(() => { renderer = TestRenderer.create(screen(false, { sub: "1" })); });
+      await act(async () => { await deviceTasksStore().update({ showArchived: true }); });
+      layOut(2400);
+      const shown = cards().find((card) => card.props.card.id === parent.id)!;
+      expect(shown.props.card.children.map((row: { id: string }) => row.id)).toEqual([child.id]);
+      act(() => shown.props.onSelect(shown.props.card));
+      expect(renderer!.root.findByType(TaskDetailCards).props.card.children.map((row: { id: string }) => row.id)).toEqual([child.id]);
+      expect(handle.byId.get(parent.id)?.children).toEqual([]);
+    } finally {
+      handle.lanes.archived!.cards = before;
+      handle.byId.delete(parent.id);
+      handle.byId.delete(child.id);
+    }
   });
 
   it("hands the cards Unarchive when the host has the CLI", async () => {
@@ -3163,9 +4098,11 @@ describe("Tasks board, desktop", () => {
     expect(cards()[0]!.props.onUnarchive).toEqual(expect.any(Function));
   });
 
-  it("does not open an archived task, whose tab Paseo would drop for another, and says why", () => {
+  it("does not open an archived task, whose tab Paseo would drop for another, and says why", async () => {
     const handle = (data as unknown as { __handle: { byId: Map<string, unknown> } }).__handle;
     const done = handle.byId.get("sample-done") as Record<string, unknown>;
+    const clearer = vi.fn(async () => {});
+    data.setUnreadClearer(clearer);
     handle.byId.set("archived-task", { ...done, id: "archived-task", lane: "archived", status: "archived", archived: "agent" });
     try {
       act(() => {
@@ -3176,10 +4113,17 @@ describe("Tasks board, desktop", () => {
       act(() => card.props.onOpen("archived-task"));
       expect(openAgent).not.toHaveBeenCalled();
       expect(host.toast).toHaveBeenCalledWith("Unarchive this task to open it in Paseo");
-      act(() => card.props.onOpen("sample-done"));
+      expect(clearer).not.toHaveBeenCalled();
+      await act(async () => {
+        card.props.onOpen("sample-done");
+        await Promise.resolve();
+      });
       expect(openAgent).toHaveBeenCalledWith({ agentId: "sample-done" });
+      // Opened is seen: a task marked unread does not come back to review.
+      expect(clearer).toHaveBeenCalledWith(["sample-done"]);
     } finally {
       handle.byId.delete("archived-task");
+      data.setUnreadClearer(null);
     }
   });
 
@@ -3222,8 +4166,10 @@ describe("Tasks board, desktop", () => {
       key("l");
       const next = cards().find((card) => card.props.focused)!.props.card;
       expect(next.id).not.toBe(first.id);
+      expect(title()).toBe(next.title);
+      key("h");
       expect(title()).toBe(first.title);
-      key(" ");
+      key("l");
       expect(title()).toBe(next.title);
       expect(openAgent).not.toHaveBeenCalled();
       key("Enter");
@@ -3258,7 +4204,12 @@ describe("Tasks board, desktop", () => {
       expect(focused.props.card.id).not.toBe(selected.id);
       expect(doc.activeElement).toBe(root);
       expect(root.focus).toHaveBeenCalledWith({ preventScroll: true });
-      expect(cards().filter((card) => card.props.current).map((card) => card.props.card.id)).toEqual([selected.id]);
+      expect(cards().filter((card) => card.props.current).map((card) => card.props.card.id)).toEqual([focused.props.card.id]);
+      expect(textOf(hostsById("detail-title")[0]!)).toBe(focused.props.card.title);
+      key("k");
+      expect(textOf(hostsById("detail-title")[0]!)).toBe(selected.title);
+      key("j");
+      expect(textOf(hostsById("detail-title")[0]!)).toBe(focused.props.card.title);
       expect(board().props["aria-activedescendant"]).toBe(focused.props.focusId);
       expect(hostsById(`task-card-${focused.props.card.id}`)[0]!.props.nativeID).toBe(focused.props.focusId);
       // Tab hands focus to a card, clearing the old virtual ring.
@@ -3568,8 +4519,8 @@ describe("Tasks board, desktop", () => {
     expect(groups).toHaveLength(2);
     const filters = groups.find((child) => child !== end)!;
     expect(StyleSheet.flatten(filters.props.style)).toMatchObject({ flex: 1, minWidth: 240, flexWrap: "wrap" });
-    expect(textOf(filters)).not.toContain("Clear all");
-    expect(textOf(hostsById("desktop-toolbar")[0]!)).toContain("Clear all");
+    expect(textOf(filters)).not.toContain("Clear filters");
+    expect(textOf(hostsById("desktop-toolbar")[0]!)).toContain("Clear filters");
   });
 
   it("ends a long sort and every filter label in an ellipsis rather than overlap", () => {
@@ -3608,7 +4559,7 @@ describe("Tasks board, desktop", () => {
     const controls = () => view("filter-bar-controls");
     const group = () => hostParentOf(controls())!;
     const words = () => controls().findAll((node) => (node.type as unknown) === "Text").map(textOf);
-    expect(words()).toEqual(["Agent", "Project", "Workspace", "Labels"]);
+    expect(words()).toEqual(["Agent", "Labels", "Project", "Workspace"]);
     const dividers = () => ["board-switches-divider", "lane-width-divider", "done-window-divider"].flatMap(hostsById);
     expect(dividers()).toHaveLength(3);
 
@@ -3620,7 +4571,7 @@ describe("Tasks board, desktop", () => {
     expect(dividers()).toHaveLength(0);
     expect(view("filter-bar-end").findAll((node) => (node.type as unknown) === "Text" && textOf(node) === "Sort")).toHaveLength(0);
     const named = (bar: ReactTestInstance) => bar.findAll((node) => (node.type as unknown) === "Pressable").map((node) => node.props.accessibilityLabel);
-    expect(named(controls())).toEqual(["Agent", "Project", "Workspace", "Labels"]);
+    expect(named(controls())).toEqual(["Agent", "Labels", "Project", "Workspace"]);
     expect(named(view("filter-bar-end"))).toContain("Sort");
 
     // Restoring five labels also restores each chevron and rectangular padding: 5 * (40 + 27) = 335.
@@ -3628,7 +4579,7 @@ describe("Tasks board, desktop", () => {
     expect(hidden.props["aria-hidden"]).toBe(true);
     expect(StyleSheet.flatten(hidden.props.style)).toMatchObject({ position: "absolute", opacity: 0 });
     const dropped = hidden.findAll((node) => (node.type as unknown) === "Text");
-    expect(dropped.map(textOf)).toEqual(["Agent", "Project", "Workspace", "Labels", "Sort"]);
+    expect(dropped.map(textOf)).toEqual(["Agent", "Labels", "Project", "Workspace", "Sort"]);
     lay(controls(), { width: 300 });
     lay(view("filter-bar-end"), { width: 300 });
     for (const text of dropped) act(() => text.props.onLayout({ nativeEvent: { layout: { x: 0, y: 0, width: 40, height: 18 } } }));
@@ -3740,7 +4691,7 @@ describe("Tasks board, sorting", () => {
     expect(menuOption(strings.emptyGroups.row)).toBeDefined();
     expect(menuOption("Claude")).toBeDefined();
     const rowStyle = StyleSheet.flatten(menuOption("Claude").props.style);
-    expect(rowStyle).toMatchObject({ paddingHorizontal: 8, marginHorizontal: 6, gap: 8 });
+    expect(rowStyle).toMatchObject({ paddingHorizontal: 8, marginHorizontal: 10, gap: 8 });
     for (const [tip, width] of [[strings.tips.project, 280], [strings.tips.workspace, 260], [strings.tips.labels, 200]] as const) {
       toggle(tip);
       expect(StyleSheet.flatten(hostsById("menu-panel")[0]!.props.style).width).toBe(Math.min(Math.round(width * base / 14), 390 - 16));
@@ -3802,7 +4753,7 @@ describe("Tasks board, sorting", () => {
     expect(text).not.toContain("Hide subtasks");
     expect(text).not.toContain("Show subtasks");
     expect(text).not.toContain("7 days");
-    expect(text).toContain("Clear all");
+    expect(text).toContain("Clear filters");
 
     // The folded chip draws the agent icon and the count; the sentence is read out.
     const chip = renderer!.root.find((node) => (node.type as unknown) === "Pressable" && node.props.testID === "chip-group-agent");
@@ -3821,12 +4772,12 @@ describe("Tasks board, sorting", () => {
     expect(summary.find((node) => (node.type as unknown) === "View" && node.props.accessibilityLabel === "Agent").findAll((node) => node.props.name === "Bot")).not.toHaveLength(0);
   });
 
-  it("leaves out Clear all while only the switches or the done window are set", () => {
+  it("leaves out Clear filters while only the switches or the done window are set", () => {
     act(() => {
       renderer = TestRenderer.create(screen(false, { sub: "1", win: "7d" }));
     });
     layOut(1600);
-    expect(textOf(renderer!.root)).not.toContain("Clear all");
+    expect(textOf(renderer!.root)).not.toContain("Clear filters");
   });
 
   it("picks a sort from the dropdown, keeps it for the session, and counts the done lane plainly by default", () => {
@@ -4098,6 +5049,8 @@ describe("Tasks board, archived lane switch", () => {
     expect(textOf(toggle())).toBe("");
     expect(toggle().props).toMatchObject({ accessibilityRole: "switch", accessibilityLabel: "Show the archived lane", accessibilityState: { checked: false } });
     expect(slashed()).toBe(true);
+    expect(toggle().find((node) => (node.type as unknown) === "Icon").props.color).toBe("#1b1b1f");
+    expect(toggle().findByType(SlashMark).props.color).toBe("#1b1b1f");
     const outline = () => StyleSheet.flatten(toggle().props.style).borderColor;
     const offOutline = outline();
     expect(hostsById("lane-archived")).toHaveLength(0);
@@ -4112,6 +5065,7 @@ describe("Tasks board, archived lane switch", () => {
     // Drawn at once, before the record catches up.
     expect(toggle().props.accessibilityState).toEqual({ checked: true });
     expect(slashed()).toBe(false);
+    expect(toggle().find((node) => (node.type as unknown) === "Icon").props.color).toBe("#1b1b1f");
     // Only the icon changes: the outline stays.
     expect(outline()).toBe(offOutline);
     expect(hostsById("lane-archived")).toHaveLength(1);
@@ -4582,7 +5536,9 @@ describe("Tasks board, toolbar tips", () => {
     expect(tips()).toContain("Hide the archived lane (A)");
     expect(tips()).not.toContain("Show the archived lane (A)");
     const subtasks = renderer!.root.findAll((node) => (node.type as unknown) === "Pressable" && node.props.testID === "subtasks-toggle")[0]!;
+    expect(subtasks.find((node) => (node.type as unknown) === "Icon").props).toMatchObject({ name: "Network", color: "#1b1b1f" });
     act(() => subtasks.props.onPress());
+    expect(hostsById("subtasks-toggle")[0]!.find((node) => (node.type as unknown) === "Icon").props).toMatchObject({ name: "ListTree", color: "#1b1b1f" });
     expect(tips()).toContain("Show subtasks (S)");
     expect(tips()).not.toContain("Hide subtasks (S)");
     // An open menu covers its button's tip.
@@ -4649,6 +5605,52 @@ describe("Tasks board, toolbar tips", () => {
     act(() => listeners.get("pointerover")!({ pointerType: "mouse", target: { closest: () => null } }));
     act(() => { vi.advanceTimersByTime(400); });
     expect(tip()).toHaveLength(0);
+  });
+});
+
+describe("mobile toolbar press feedback", () => {
+  it.each(["ios", "android"].flatMap((os) => [true, false].map((phone) => ({ os, phone }))))("shows the same touch cue on $os phone=$phone", async ({ os, phone }) => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = os;
+    await act(async () => { renderer = TestRenderer.create(screen(phone, phone ? { sort: "branch-desc" } : {})); });
+    if (!phone) layOut(1200);
+    await act(async () => {});
+    const ids = phone ? ["phone-subtasks", "phone-archived", "phone-more", "phone-sort-hint"] : ["subtasks-toggle", "toolbar-filters", "tablet-view", "sidebar-switch", "search-full-conversation-toggle"];
+    const event = { nativeEvent: { pageX: 100, pageY: 100, identifier: 0 } };
+    for (const id of ids) {
+      const button = () => hostsById(id)[0]!;
+      const fill = () => phone && id !== "phone-sort-hint"
+        ? StyleSheet.flatten(button().find((node) => (node.type as unknown) === "View").props.style).backgroundColor
+        : StyleSheet.flatten(button().props.style).backgroundColor;
+      const rest = fill();
+      await act(async () => { button().props.onPressIn(event); button().props.onTouchStart(event); });
+      await act(async () => { await vi.advanceTimersByTimeAsync(100); });
+      expect(StyleSheet.flatten(button().props.style).transform, id).toBeUndefined();
+      expect(fill(), id).toBe(hoverFill(taskTokens(theme).surface0, taskTokens(theme).foreground, false, true));
+      await act(async () => { button().props.onPressOut(event); button().props.onTouchEnd(event); });
+      expect(fill(), id).toBe(rest);
+    }
+    const toggle = () => hostsById(phone ? "phone-subtasks" : "subtasks-toggle")[0]!;
+    const before = toggle().props.accessibilityState.selected;
+    await act(async () => { toggle().props.onPressIn(event); toggle().props.onTouchStart(event); toggle().props.onTouchMove({ nativeEvent: { ...event.nativeEvent, pageY: 108 } }); toggle().props.onPressOut(event); toggle().props.onTouchEnd(event); toggle().props.onPress(event); });
+    expect(toggle().props.accessibilityState.selected).toBe(before);
+    await act(async () => { toggle().props.onPressIn(event); toggle().props.onTouchStart(event); toggle().props.onPressOut(event); toggle().props.onTouchEnd(event); });
+    expect(StyleSheet.flatten(toggle().props.style).transform).toBeUndefined();
+    await act(async () => toggle().props.onPress(event));
+    expect(toggle().props.accessibilityState.selected).toBe(!before);
+    await act(async () => { await vi.advanceTimersByTimeAsync(100); });
+    expect(StyleSheet.flatten(toggle().props.style).transform).toBeUndefined();
+    if (phone) {
+      await act(async () => pressable("Search").props.onPress());
+      const input = renderer!.root.find((node) => (node.type as unknown) === "TextInput" && node.props.accessibilityLabel === BOARD_STRINGS.en.search);
+      await act(async () => input.props.onChangeText("needle"));
+      for (const id of ["phone-search-clear", "search-full-conversation-toggle"]) {
+        const button = () => hostsById(id)[0]!;
+        await act(async () => { button().props.onPressIn(event); button().props.onTouchStart(event); await vi.advanceTimersByTimeAsync(100); });
+        expect(StyleSheet.flatten(button().props.style).transform, id).toBeUndefined();
+        expect(StyleSheet.flatten(button().props.style).backgroundColor, id).toBe(hoverFill(taskTokens(theme).surface0, taskTokens(theme).foreground, false, true));
+        await act(async () => { button().props.onPressOut(event); button().props.onTouchEnd(event); });
+      }
+    }
   });
 });
 
@@ -4722,7 +5724,7 @@ describe("F2: tablet overlays outside toolbar AX bounds", () => {
     expect(hostsById("tablet-view-overlay")).toHaveLength(0);
   });
 
-  it.each([["android", 480, 14], ["ios", 600, 21]] as const)("%s at %i pt/UI%i opens search below the toolbar with autofocus, clear and dismissal", (os, width, base) => {
+  it.each([["android", 320, 14], ["ios", 480, 21]] as const)("%s at %i pt/UI%i opens search below the toolbar with autofocus, clear and dismissal", (os, width, base) => {
     mount(os, width, base);
     const height = style(bar()).height;
     act(() => hostsById("tablet-search-toggle")[0]!.props.onPress());
@@ -4734,12 +5736,12 @@ describe("F2: tablet overlays outside toolbar AX bounds", () => {
     expect(hostsById("tablet-search-toggle")).toHaveLength(1);
     expect(style(hostsById("tablet-search-toggle")[0]!).backgroundColor).toBe("transparent");
     expect(hostsById("tablet-toolbar-start")[0]!.children.map((node) => typeof node === "string" ? node : node.props.testID)).toEqual(["tablet-search-toggle"]);
-    expect(search().findAll((node) => (node.type as unknown) === "Icon" && node.props.name === "Search")).toHaveLength(0);
-    expect(style(search())).toMatchObject({ height: Math.round(40 * base / 14) - 8, width: 320, flexShrink: 1, minWidth: 0 });
+    expect(search().findAll((node) => (node.type as unknown) === "Icon" && node.props.name === "Search")).toHaveLength(1);
+    expect(style(search())).toMatchObject({ height: Math.round(40 * base / 14) - 8, flex: 1, flexBasis: 0, minWidth: 0 });
     expect(style(search()).position).toBeUndefined();
-    expect(hostsById("tablet-toolbar-total")).toHaveLength(1);
+    expect(hostsById("tablet-toolbar-total")).toHaveLength(0);
     expect(style(hostsById("tablet-toolbar-start")[0]!).minWidth).toBe(style(end()).minWidth);
-    expect(style(end())).toMatchObject({ flex: 1, flexBasis: 0 });
+    expect(style(end())).toMatchObject({ flex: 0, flexBasis: "auto" });
     expect(hostsById("toolbar-filters")).toHaveLength(1);
     expect(hostsById("tablet-view")).toHaveLength(1);
     const input = () => search().find((node) => (node.type as unknown) === "TextInput");
@@ -4771,7 +5773,7 @@ describe("F2: tablet overlays outside toolbar AX bounds", () => {
   it.each([["ios", 600], ["ios", 800], ["android", 600], ["android", 800]] as const)("%s at %i keeps the search compact and dismisses only an empty query", (os, width) => {
     mount(os, width);
     act(() => hostsById("tablet-search-toggle")[0]!.props.onPress());
-    expect(style(hostsById("tablet-toolbar-search")[0]!).width).toBe(320);
+    expect(style(hostsById("tablet-toolbar-search")[0]!)).toMatchObject({ flex: 1, flexBasis: 0 });
     expect(hostsById("tablet-toolbar-backdrop")).toHaveLength(1);
     expect(style(hostsById("tablet-toolbar-backdrop")[0]!).zIndex).toBeLessThan(style(bar()).zIndex);
     act(() => hostsById("search-full-conversation-toggle")[0]!.props.onPress());
@@ -4796,7 +5798,7 @@ describe("F2: tablet overlays outside toolbar AX bounds", () => {
     expect(hostsById("tablet-search-toggle")).toHaveLength(0);
     expect(hostsById("tablet-toolbar-search")).toHaveLength(1);
     expect(hostParentOf(hostsById("tablet-toolbar-search-group")[0]!)?.props.testID).toBe("tablet-toolbar-start");
-    expect(StyleSheet.flatten(hostsById("search-full-conversation-toggle")[0]!.props.style)).toMatchObject({ borderWidth: 0, borderRadius: 7 });
+    expect(StyleSheet.flatten(hostsById("search-full-conversation-toggle")[0]!.props.style)).toMatchObject({ borderWidth: 0, borderRadius: 16 });
     const fullSearchIcon = hostsById("search-full-conversation-toggle")[0]!.findAll((node) => node.props.icon?.svg)[0]!;
     expect(fullSearchIcon.props.size).toBe(18);
   });
@@ -4825,6 +5827,28 @@ describe("F2: tablet overlays outside toolbar AX bounds", () => {
 describe("Tasks board, tablet filters", () => {
   beforeEach(() => {
     (globalThis as { __rnMockOS?: string }).__rnMockOS = "android";
+  });
+
+  it.each(["ios", "android"].flatMap((os) => [800, 1200].map((width) => ({ os, width }))))("blurs only the focused tablet search on $os at $width", ({ os, width }) => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = os;
+    const input = { nativeTag: 101, isFocused: vi.fn(() => true), blur: vi.fn() };
+    act(() => { renderer = TestRenderer.create(screen(false), {
+      createNodeMock: (element) => element.type === "TextInput" && (element.props as { accessibilityLabel?: string }).accessibilityLabel === BOARD_STRINGS.en.search ? input : null,
+    }); });
+    layOut(width);
+    if (hostsById("tablet-search-toggle").length) act(() => hostsById("tablet-search-toggle")[0]!.props.onPress());
+    const root = renderer!.root.find((node) => typeof node.type === "string" && typeof node.props.onStartShouldSetResponderCapture === "function");
+    expect(root.props.onStartShouldSetResponderCapture({ nativeEvent: { target: "101" } })).toBe(false);
+    expect(input.blur).not.toHaveBeenCalled();
+    for (const target of [102, 103, 104]) {
+      expect(root.props.onStartShouldSetResponderCapture({ nativeEvent: { target } })).toBe(false);
+    }
+    expect(input.blur).toHaveBeenCalledTimes(3);
+    act(() => hostsById("subtasks-toggle")[0]!.props.onPress());
+    expect(hostsById("subtasks-toggle")[0]!.props.accessibilityState.selected).toBe(false);
+    input.isFocused.mockReturnValue(false);
+    root.props.onStartShouldSetResponderCapture({ nativeEvent: { target: 105 } });
+    expect(input.blur).toHaveBeenCalledTimes(3);
   });
 
   it.each(["web", "ios", "android"])("matches the panel direction across sizes and resize boundaries on %s", (os) => {
@@ -4904,7 +5928,7 @@ describe("Tasks board, tablet filters", () => {
     const footer = hostsById("filter-sheet-footer")[0]!;
     expect(hostParentOf(footer)).toBe(hostParentOf(hostsById("filter-sheet-scroll")[0]!));
     expect(hostsById("filter-sheet-subtasks")).toHaveLength(0);
-    expect(hostsById("filter-sheet-empty-groups")).toHaveLength(0);
+    expect(hostsById("filter-sheet-empty-groups")).toHaveLength(1);
     act(() => hostsById("tablet-toolbar-backdrop")[0]!.props.onPress());
     expect(hostsById("tablet-filter-popover")).toHaveLength(0);
     open();
@@ -4950,7 +5974,7 @@ describe("Tasks board, tablet filters", () => {
     expect(Number(StyleSheet.flatten(panel.props.style).width)).toBeLessThanOrEqual(width - 24);
     expect(StyleSheet.flatten(panel.props.style).elevation).toBe(8);
     expect(hostsById("filter-sheet-subtasks")).toHaveLength(0);
-    expect(hostsById("filter-sheet-empty-groups")).toHaveLength(0);
+    expect(hostsById("filter-sheet-empty-groups")).toHaveLength(1);
     act(() => hostsById("tablet-toolbar-backdrop")[0]!.props.onPress());
     expect(hostsById("tablet-filter-popover")).toHaveLength(0);
   });
@@ -4997,12 +6021,18 @@ describe("Tasks board, tablet filters", () => {
     const bar = hostsById("tablet-toolbar")[0]!;
     expect(StyleSheet.flatten(bar.props.style)).toMatchObject({ height: Math.round(40 * Math.max(1, base / 14)), flexDirection: "row", flexShrink: 0 });
     expect(StyleSheet.flatten(hostsById("tablet-toolbar-end")[0]!.props.style).gap).toBe(0);
+    const frames = measureHostTree(bar, { width });
+    const actions = ["subtasks-toggle", "toolbar-filters", "tablet-view", "sidebar-switch"].map((id) => frames.get(hostsById(id)[0]!)!);
+    for (let index = 1; index < actions.length; index++) {
+      expect(actions[index]!.left - (actions[index - 1]!.left + actions[index - 1]!.width)).toBeCloseTo(0, 4);
+    }
+    expect(Math.abs(width - (actions[3]!.left + actions[3]!.width) - 6)).toBeLessThan(0.5);
     const buttons = bar.findAll((n) => (n.type as unknown) === "Pressable" && n.props.testID !== "search-full-conversation-toggle");
     for (const button of buttons) {
       const style = StyleSheet.flatten(button.props.style);
       expect(style.height).toBe(Math.round(32 * Math.max(1, base / 14)));
-      expect(style.minWidth).toBe(Math.round(32 * Math.max(1, base / 14)));
-      expect(style.borderRadius).toBe(7);
+      expect(style.width).toBe(Math.round(32 * Math.max(1, base / 14)));
+      expect(style.borderRadius).toBe(style.height / 2);
       const icon = button.find((node) => button.props.testID === "sidebar-switch" ? typeof node.type === "string" && node.props.testID === "panel-mark" : (node.type as unknown) === "Icon");
       expect(StyleSheet.flatten(hostParentOf(icon)!.props.style)).toMatchObject({ width: 18, height: 18 });
     }
@@ -5012,11 +6042,14 @@ describe("Tasks board, tablet filters", () => {
     expect(textOf(view).includes(BOARD_STRINGS[language].view)).toBe(false);
     act(() => view.props.onPress());
     expect(hostsById("tablet-view-menu")).toHaveLength(1);
-    // Visibility switches share the View menu.
+    // The empty-groups switch belongs to the filter panel, not View.
     const items = hostsById("tablet-view-menu")[0]!.findAll((node) => (node.type as unknown) === "Pressable" && node.props.accessibilityRole === "menuitem").map(textOf);
-    expect(items.some((text) => text.startsWith(BOARD_STRINGS[language].emptyGroups.row))).toBe(true);
+    expect(items.some((text) => text.startsWith(BOARD_STRINGS[language].emptyGroups.row))).toBe(false);
     act(() => hostsById("tablet-toolbar-backdrop")[0]!.props.onPress());
     expect(hostsById("tablet-view-menu")).toHaveLength(0);
+    act(() => hostsById("toolbar-filters")[0]!.props.onPress());
+    expect(textOf(hostsById("filter-sheet-empty-groups")[0]!)).toContain(BOARD_STRINGS[language].emptyGroups.sheetLabel(true));
+    act(() => hostsById("tablet-toolbar-backdrop")[0]!.props.onPress());
   });
 
   it.each([
@@ -5029,12 +6062,12 @@ describe("Tasks board, tablet filters", () => {
     const order = () => end().findAll((node) => (node.type as unknown) === "Pressable").map((node) => node.props.testID);
     const expected = ["subtasks-toggle", "toolbar-filters", "tablet-view", "sidebar-switch"];
     expect(order()).toEqual(expected);
-    // View owns layout and visibility switches.
+    // View owns layout and the board's visibility switches; empty groups stay with the filters.
     act(() => hostsById("tablet-view")[0]!.props.onPress());
     const strings = BOARD_STRINGS.en;
     const items = hostsById("tablet-view-menu")[0]!.findAll((node) => (node.type as unknown) === "Pressable" && node.props.accessibilityRole === "menuitem").map(textOf);
     expect(items.some((text) => text.startsWith(strings.showSubtasks))).toBe(true);
-    expect(items.some((text) => text.startsWith(strings.emptyGroups.row))).toBe(true);
+    expect(items.some((text) => text.startsWith(strings.emptyGroups.row))).toBe(false);
     expect(items.some((text) => text.startsWith(strings.archivedLane.row))).toBe(true);
     act(() => hostsById("tablet-toolbar-backdrop")[0]!.props.onPress());
     act(() => hostsById("tablet-search-toggle")[0]!.props.onPress());
@@ -5055,7 +6088,7 @@ describe("Tasks board, tablet filters", () => {
   it.each(["en", "zh"] as const)("reserves a complete centred count across count changes in %s", (language) => {
     updateEnhancerPreferences({ language });
     act(() => { renderer = TestRenderer.create(screen(false)); });
-    layOut(1000);
+    layOut(800);
     const props = renderer!.root.findByType(TabletToolbar).props as React.ComponentProps<typeof TabletToolbar>;
     let slotStyle: unknown;
     let searchStyle: unknown;
@@ -5108,10 +6141,12 @@ describe("Tasks board, tablet filters", () => {
     expect(hostsById("tablet-toolbar-end")[0]!.findAll((n) => (n.type as unknown) === "Pressable").map((n) => n.props.testID)).toEqual(["subtasks-toggle", "toolbar-filters", "tablet-view", "sidebar-switch"]);
     expect(hostsById("subtasks-toggle")[0]!.props.accessibilityState.selected).toBe(true);
     expect(StyleSheet.flatten(hostsById("subtasks-toggle")[0]!.props.style).backgroundColor).toBe("transparent");
+    expect(hostsById("subtasks-toggle")[0]!.find((n) => (n.type as unknown) === "Icon").props.color).toBe("#1b1b1f");
     await act(async () => hostsById("subtasks-toggle")[0]!.props.onPress());
     expect(deviceTasksStore().snapshot().values).toMatchObject({ hideSubtasks: true });
     expect(hostsById("subtasks-toggle")[0]!.props.accessibilityState.selected).toBe(false);
     expect(StyleSheet.flatten(hostsById("subtasks-toggle")[0]!.props.style).backgroundColor).toBe("transparent");
+    expect(hostsById("subtasks-toggle")[0]!.find((n) => (n.type as unknown) === "Icon").props).toMatchObject({ name: "List", color: "#1b1b1f" });
     act(() => hostsById("toolbar-filters")[0]!.props.onPress());
     const sheet = hostsById("filter-sheet-scroll")[0]!;
     act(() => hostsById("filter-sheet-workspaces-toggle")[0]!.props.onPress());
@@ -5129,7 +6164,7 @@ describe("Tasks board, tablet filters", () => {
     expect(lastBoardParams("host-1")).toMatchObject({ providers: [], labels: [], workspaceIds: [] });
   });
 
-  it.each(["ios", "android"])("%s moves filter switches into View and retains their saved state", async (os) => {
+  it.each(["ios", "android"])("%s keeps subtasks in View and empty groups in the filter panel, retaining their saved state", async (os) => {
     (globalThis as { __rnMockOS?: string }).__rnMockOS = os;
     const handle = (data as unknown as { __handle: { providers: object[] } }).__handle;
     const saved = handle.providers;
@@ -5137,31 +6172,36 @@ describe("Tasks board, tablet filters", () => {
     try {
       await act(async () => { renderer = TestRenderer.create(screen(false)); });
       layOut(800);
+      const emptyGroups = () => hostsById("filter-sheet-empty-groups")[0]!;
       act(() => hostsById("toolbar-filters")[0]!.props.onPress());
       expect(hostsById("filter-sheet-subtasks")).toHaveLength(0);
-      expect(hostsById("filter-sheet-empty-groups")).toHaveLength(0);
+      expect(emptyGroups().props).toMatchObject({ accessibilityRole: "switch", accessibilityState: { checked: true } });
+      expect(textOf(emptyGroups())).toContain("Show all");
       expect(textOf(hostsById("filter-sheet-scroll")[0]!)).toContain("Pi");
+      await act(async () => emptyGroups().props.onPress());
+      expect(emptyGroups().props.accessibilityState).toEqual({ checked: false });
+      expect(textOf(hostsById("filter-sheet-scroll")[0]!)).not.toContain("Pi");
+      expect(hostsById("tablet-filter-popover")).toHaveLength(1);
       act(() => hostsById("tablet-view")[0]!.props.onPress());
       const rows = () => hostsById("tablet-view-menu")[0]!.findAll((node) => (node.type as unknown) === "Pressable" && node.props.accessibilityRole === "menuitem");
-      expect(rows().slice(-4).map(textOf)).toEqual(["Show subtasks", "Show all", "Collapse empty lanes", "Show the archived lane"]);
-      for (const label of ["Show subtasks", "Show all"]) {
-        expect(menuOption(label).props.accessibilityState.checked).toBe(true);
-        await act(async () => menuOption(label).props.onPress());
-        expect(menuOption(label).props.accessibilityState.checked).toBe(false);
-        expect(hostsById("tablet-view-menu")).toHaveLength(1);
-      }
+      expect(rows().slice(-3).map(textOf)).toEqual(["Show subtasks", "Collapse empty lanes", "Show the archived lane"]);
+      expect(rows().map(textOf)).not.toContain("Show all");
+      expect(menuOption("Show subtasks").props.accessibilityState.checked).toBe(true);
+      await act(async () => menuOption("Show subtasks").props.onPress());
+      expect(menuOption("Show subtasks").props.accessibilityState.checked).toBe(false);
+      expect(hostsById("tablet-view-menu")).toHaveLength(1);
       expect(hostsById("subtasks-toggle")[0]!.props.accessibilityState.selected).toBe(false);
       expect(deviceTasksStore().snapshot().values).toMatchObject({ hideSubtasks: true, showEmptyGroups: false });
       expect(host.save).not.toHaveBeenCalled();
       act(() => hostsById("toolbar-filters")[0]!.props.onPress());
+      expect(emptyGroups().props.accessibilityState).toEqual({ checked: false });
       expect(textOf(hostsById("filter-sheet-scroll")[0]!)).not.toContain("Pi");
+      await act(async () => emptyGroups().props.onPress());
+      expect(textOf(hostsById("filter-sheet-scroll")[0]!)).toContain("Pi");
       act(() => hostsById("tablet-view")[0]!.props.onPress());
       expect(menuOption("Show subtasks").props.accessibilityState.checked).toBe(false);
-      expect(menuOption("Show all").props.accessibilityState.checked).toBe(false);
-      for (const label of ["Show subtasks", "Show all"]) {
-        await act(async () => menuOption(label).props.onPress());
-        expect(menuOption(label).props.accessibilityState.checked).toBe(true);
-      }
+      await act(async () => menuOption("Show subtasks").props.onPress());
+      expect(menuOption("Show subtasks").props.accessibilityState.checked).toBe(true);
       expect(deviceTasksStore().snapshot().values).toMatchObject({ hideSubtasks: false, showEmptyGroups: true });
     } finally {
       handle.providers = saved;
@@ -5226,7 +6266,7 @@ describe("Tasks board, tablet filters", () => {
     for (const id of ["tablet-toolbar", "tablet-toolbar-end"]) {
       expect(hostsById(id)[0]!.props.pointerEvents).toBe("box-none");
     }
-    expect(hostsById("tablet-toolbar-total")[0]!.props.pointerEvents).toBe("none");
+    expect(hostsById("tablet-toolbar-total")).toHaveLength(hostsById("tablet-toolbar-search").length ? 0 : 1);
     act(() => hostsById("tablet-toolbar-backdrop")[0]!.props.onPress());
     expect(hostsById(panel)).toHaveLength(0);
     expect(hostsById("tablet-toolbar-backdrop")).toHaveLength(0);
@@ -5493,15 +6533,16 @@ describe("Tasks board, tablet filters", () => {
     expect(toggle().props).toMatchObject({ accessibilityLabel: "Show subtasks", accessibilityState: { checked: true } });
     expect(toggle().find((node) => (node.type as unknown) === "Icon").props.name).toBe("Network");
     expect(slashed()).toBe(false);
-    const on = { ...look() };
+    expect(look().backgroundColor).toBe("#ffffff");
+    expect(toggle().find((node) => (node.type as unknown) === "Icon").props.color).toBe("#1b1b1f");
     act(() => toggle().props.onPress());
     expect(lastBoardParams("host-1")).toMatchObject({ hideSubtasks: null });
     expect(deviceTasksStore().snapshot().values?.hideSubtasks).toBe(true);
     expect(toggle().props.accessibilityState).toEqual({ checked: false });
     expect(toggle().find((node) => (node.type as unknown) === "Icon").props.name).toBe("ListTree");
     expect(slashed()).toBe(false);
-    // Only the icon changes: the outline and fill stay.
-    expect(look()).toMatchObject(on);
+    expect(look().backgroundColor).toBe("#ffffff");
+    expect(toggle().find((node) => (node.type as unknown) === "Icon").props.color).toBe("#1b1b1f");
   });
 });
 
@@ -5686,6 +6727,44 @@ describe("Tasks board, the 1 s clock", () => {
 });
 
 describe("Tasks board, phone", () => {
+  it.each(["ios", "android"].flatMap((os) => ["en", "zh"].flatMap((language) => [14, 21].map((base) => ({ os, language, base })))))
+  ("$os $language UI $base keeps the phone update dot at the bottom right without replacing the filter badge", async ({ os, language, base }) => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = os;
+    updateEnhancerPreferences({ language: language as "en" | "zh" });
+    const openSettings = vi.fn(); setTasksSettingsOpener(openSettings);
+    host.agentUpdates = { state: "done", entries: [{ provider: "codex", status: "available", updateAvailable: true }], error: null };
+    await act(async () => { renderer = TestRenderer.create(screen(true, { agent: "codex" }, { ...(theme as object), typography: { fontSize: { ui: base } } })); });
+    const anchor = hostsById("phone-more-container")[0]!;
+    const more = hostsById("phone-more")[0]!;
+    // The existing active-filter count remains visible alongside the separate update indicator.
+    expect(textOf(more)).toContain("1");
+    const badgeText = more.find((node) => (node.type as unknown) === "Text" && node.props.children === 1);
+    const badge = hostParentOf(badgeText)!;
+    const dot = hostsById("phone-more-update-dot")[0]!;
+    const frames = measureHostTree(anchor, { width: 44 });
+    const point = frames.get(dot)!; const count = frames.get(badge)!;
+    expect(point.width).toBe(4); expect(point.height).toBe(4);
+    expect(point.top + point.height).toBe(34);
+    expect(point.left + point.width).toBe(frames.get(anchor)!.left + 33);
+    expect(dot.props.style.backgroundColor).toBe("#da4738");
+    expect(point.left + point.width <= count.left || point.top >= count.top + count.height).toBe(true);
+    act(() => more.props.onPress());
+    const settings = hostsById("filter-sheet-settings")[0]!;
+    const settingsDot = hostsById("filter-sheet-settings-update-dot")[0]!;
+    const footer = hostsById("filter-sheet-footer")[0]!;
+    for (const width of [320, 390]) {
+      const layout = measureHostTree(footer, { width });
+      const button = layout.get(settings)!; const indicator = layout.get(settingsDot)!;
+      const label = layout.get(hostsById("filter-sheet-settings-label")[0]!)!;
+      expect(indicator.width).toBe(4); expect(indicator.height).toBe(4);
+      expect(Math.abs(indicator.top + 2 - (label.top + label.height / 2))).toBeLessThanOrEqual(0.5);
+      expect(Math.abs(indicator.left - (label.left + label.width) - 4)).toBeLessThanOrEqual(0.5);
+      expect(indicator.left + 4).toBeLessThanOrEqual(button.left + button.width);
+      expect(button.left + button.width).toBeLessThanOrEqual(width);
+    }
+    act(() => settings.props.onPress()); expect(openSettings).toHaveBeenCalledOnce();
+  });
+
   it("puts settings to the right of reset and opens it", () => {
     const openSettings = vi.fn();
     setTasksSettingsOpener(openSettings);
@@ -5722,6 +6801,35 @@ describe("Tasks board, phone", () => {
     }
   });
 
+  it.each(["ios", "android"])("%s leaves the phone's open details alone for another agent's update and for its own scroller", async (os) => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = os;
+    const running = (id: string, title: string, updatedAt: string) => makeAgent({ id, title, status: "running", workspaceId: "ws", updatedAt, lastUserMessageAt: updatedAt });
+    const start = new Date(Date.now() - 60_000).toISOString();
+    const fake = createFakePaseo({ agents: [running("open-card", "Open card", start), running("other-card", "Other card", start)] });
+    host.liveTasks = fake.paseo;
+    await act(async () => { renderer = TestRenderer.create(screen(true)); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(800); });
+    const find = (id: string) => cards().find((node) => node.props.card.id === id);
+    if (!find("open-card")) await act(async () => pressable("Running 2").props.onPress());
+    await act(async () => find("open-card")!.props.onSelect(find("open-card")!.props.card));
+    const drawn = hostsById("detail-cards")[0]!.props;
+    const push = async (agent: ReturnType<typeof makeAgent>) => {
+      await act(async () => { fake.pushAgentSnapshot(agent); });
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    };
+    await push(running("other-card", "Other card, renamed", new Date().toISOString()));
+    expect(hostsById("detail-cards")[0]!.props).toBe(drawn);
+    // Content runs under the pinned action bar: only the bar casts its edge.
+    const scroll = hostsById("detail-tab-short-scroll")[0]!;
+    await act(async () => scroll.props.onLayout({ nativeEvent: { layout: { x: 0, y: 0, width: 360, height: 300 } } }));
+    await act(async () => scroll.props.onContentSizeChange(360, 900));
+    expect(StyleSheet.flatten(hostsById("detail-action-bar")[0]!.props.style).boxShadow).toBeTruthy();
+    expect(hostsById("detail-cards")[0]!.props).toBe(drawn);
+    await push(running("open-card", "Open card, renamed", new Date(Date.now() + 1000).toISOString()));
+    expect(hostsById("detail-cards")[0]!.props).not.toBe(drawn);
+    expect(textOf(hostsById("detail-title")[0]!)).toBe("Open card, renamed");
+  });
+
   it.each(["ios", "android", "web"])("%s still updates lane rows and open details when task data changes", async (os) => {
     (globalThis as { __rnMockOS?: string }).__rnMockOS = os;
     const handle = (data as unknown as { __handle: { lanes: Record<string, { cards: Array<{ id: string; title: string }> }>; byId: Map<string, unknown> } }).__handle;
@@ -5754,8 +6862,12 @@ describe("Tasks board, phone", () => {
     const controls = hostParentOf(button())!.findAll((node) => (node.type as unknown) === "Pressable");
     expect(controls.slice(-3).map((node) => node.props.testID)).toEqual(["phone-subtasks", "phone-archived", "phone-more"]);
     expect(button().props.accessibilityState).toEqual({ selected: true });
+    expect(button().findAll((node) => (node.type as unknown) === "View" && StyleSheet.flatten(node.props.style)?.backgroundColor === "#e4e4e7")).toHaveLength(0);
+    expect(button().find((node) => (node.type as unknown) === "Icon").props.color).toBe("#1b1b1f");
     await act(async () => button().props.onPress());
     expect(button().props.accessibilityState).toEqual({ selected: false });
+    expect(button().find((node) => (node.type as unknown) === "Icon").props).toMatchObject({ name: "List", color: "#1b1b1f" });
+    expect(button().findAll((node) => (node.type as unknown) === "View" && StyleSheet.flatten(node.props.style)?.backgroundColor === "#e4e4e7")).toHaveLength(0);
     expect(deviceTasksStore().snapshot().values?.hideSubtasks).toBe(true);
     expect(lastBoardParams("host-1").hideSubtasks).toBeNull();
     act(() => pressable("More").props.onPress());
@@ -5909,6 +7021,90 @@ describe("Tasks board, phone", () => {
     expect(pressable("Running 2").props.accessibilityState).toEqual({ selected: true });
   });
 
+  it.each(["ios", "android"])("restores the phone tabs and each lane after a screen remount on %s", (os) => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = os;
+    const scrollTo = vi.fn();
+    const scrollToOffset = vi.fn();
+    const create = () => TestRenderer.create(screen(true), { createNodeMock: (element) => element.type === "ScrollView" ? { scrollTo } : element.type === "FlatList" ? { scrollToOffset } : null });
+    const list = (id: string) => hostsById(`phone-lane-${id}`)[0]!.find((node) => (node.type as unknown) === "FlatList");
+    const tabs = () => hostParentOf(hostsById("phone-stat-running")[0]!)!;
+    const scroll = (id: string, y: number) => list(id).props.onScroll({ nativeEvent: { contentOffset: { x: 0, y }, contentSize: { height: 1800 }, layoutMeasurement: { height: 500 } } });
+    act(() => { renderer = create(); });
+    act(() => { scroll("needs_input", 240); scroll("running", 420); tabs().props.onScroll({ nativeEvent: { contentOffset: { x: 75, y: 0 } } }); });
+    act(() => pressable("Running 2").props.onPress());
+    act(() => renderer!.unmount());
+    scrollTo.mockClear();
+    scrollToOffset.mockClear();
+    act(() => { renderer = create(); });
+    if (os === "ios") {
+      // iOS reports no event for a mount's contentOffset: each list scrolls there once it is mounted, without animating.
+      expect(list("needs_input").props.contentOffset).toBeUndefined();
+      expect(list("running").props.contentOffset).toBeUndefined();
+      expect(scrollToOffset.mock.calls).toEqual([[{ offset: 240, animated: false }], [{ offset: 420, animated: false }]]);
+      // Its scroll event ends the restore; later renders do not scroll again.
+      act(() => { scroll("needs_input", 240); scroll("running", 420); });
+      act(() => renderer!.update(screen(true)));
+      expect(scrollToOffset).toHaveBeenCalledTimes(2);
+    } else {
+      expect(list("needs_input").props.contentOffset).toEqual({ x: 0, y: 240 });
+      expect(list("running").props.contentOffset).toEqual({ x: 0, y: 420 });
+      expect(scrollToOffset).not.toHaveBeenCalled();
+    }
+    expect(tabs().props.contentOffset).toEqual({ x: 75, y: 0 });
+    const running = () => hostsById("phone-stat-running")[0]!;
+    const row = () => running().find((node) => node !== running() && typeof node.type === "string" && typeof node.props.onLayout === "function");
+    act(() => {
+      hostParentOf(tabs())!.props.onLayout({ nativeEvent: { layout: { width: 200 } } });
+      running().props.onLayout({ nativeEvent: { layout: { x: 80, width: 100 } } });
+      row().props.onLayout({ nativeEvent: { layout: { x: 0, width: 100 } } });
+    });
+    act(() => running().props.onLayout({ nativeEvent: { layout: { x: 90, width: 100 } } }));
+    expect(scrollTo).not.toHaveBeenCalledWith(expect.objectContaining({ animated: true }));
+  });
+
+  it("measures a lane restored at its end from the restored offset on ios", () => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = "ios";
+    const list = () => hostsById("phone-lane-running")[0]!.find((node) => (node.type as unknown) === "FlatList");
+    const bottom = () => hostsById("phone-lane-running")[0]!.findAll((node) => typeof node.type === "string" && node.props.testID === "phone-scroll-bottom");
+    const scrollToOffset = vi.fn();
+    const create = () => TestRenderer.create(screen(true), { createNodeMock: (element) => element.type === "FlatList" ? { scrollToOffset } : null });
+    act(() => { renderer = create(); });
+    act(() => pressable("Running 2").props.onPress());
+    act(() => list().props.onScroll({ nativeEvent: { contentOffset: { x: 0, y: 900 }, contentSize: { height: 1400 }, layoutMeasurement: { height: 500 } } }));
+    act(() => renderer!.unmount());
+    act(() => { renderer = create(); });
+    expect(scrollToOffset).toHaveBeenCalledExactlyOnceWith({ offset: 900, animated: false });
+    // Measured before the restore's scroll event comes: from the restored offset, not 0.
+    act(() => hostParentOf(list())!.props.onLayout({ nativeEvent: { layout: { height: 500 } } }));
+    act(() => list().props.onContentSizeChange(390, 1400));
+    expect(bottom()).toHaveLength(0);
+  });
+
+  it("leaves a lane emptied while away at its top on ios", () => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = "ios";
+    const list = () => hostsById("phone-lane-running")[0]!.find((node) => (node.type as unknown) === "FlatList");
+    const scrollToOffset = vi.fn();
+    const create = () => TestRenderer.create(screen(true), { createNodeMock: (element) => element.type === "FlatList" ? { scrollToOffset } : null });
+    act(() => { renderer = create(); });
+    act(() => pressable("Running 2").props.onPress());
+    act(() => list().props.onScroll({ nativeEvent: { contentOffset: { x: 0, y: 600 }, contentSize: { height: 1400 }, layoutMeasurement: { height: 500 } } }));
+    act(() => renderer!.unmount());
+    const handle = (data as unknown as { __handle: { lanes: Record<string, { cards: TaskCard[] }> } }).__handle;
+    const saved = handle.lanes;
+    try {
+      handle.lanes = { ...saved, running: { ...saved.running!, cards: [] } };
+      act(() => { renderer = create(); });
+      expect(scrollToOffset).not.toHaveBeenCalled();
+      handle.lanes = saved;
+      act(() => renderer!.update(screen(true)));
+      act(() => renderer!.unmount());
+      act(() => { renderer = create(); });
+      expect(scrollToOffset).not.toHaveBeenCalled();
+    } finally {
+      handle.lanes = saved;
+    }
+  });
+
   it.each(["ios", "android", "web"])("%s scrolls only when the selected tab is pressed again", (os) => {
     (globalThis as { __rnMockOS?: string }).__rnMockOS = os;
     const scrollToOffset = vi.fn();
@@ -5942,6 +7138,78 @@ describe("Tasks board, phone", () => {
     expect(pressable("Review 2").props.accessibilityState).toEqual({ selected: true });
     act(() => pager().props.onScrollEndDrag({ nativeEvent: { contentOffset: { x: 390, y: 0 } } }));
     expect(pressable("Running 2").props.accessibilityState).toEqual({ selected: true });
+  });
+
+  it("does not draw a lane's rows again as its list grows, unless it crosses two screens", () => {
+    act(() => { renderer = TestRenderer.create(screen(true)); });
+    const list = () => renderer!.root.findAll((node) => (node.type as unknown) === "FlatList")[0]!;
+    act(() => hostParentOf(list())!.props.onLayout({ nativeEvent: { layout: { height: 500 } } }));
+    act(() => list().props.onContentSizeChange(390, 600));
+    let rows = host.rowRenders;
+    // Each batch of mounted rows changes the measured height; the lane stays as it is drawn.
+    for (const height of [700, 820, 990]) act(() => list().props.onContentSizeChange(390, height));
+    expect(host.rowRenders).toBe(rows);
+    expect(hostsById("phone-scroll-actions")).toHaveLength(0);
+    // Past two screens the scroll actions show: that draws once.
+    rows = host.rowRenders;
+    act(() => list().props.onContentSizeChange(390, 1100));
+    expect(hostsById("phone-scroll-actions")).toHaveLength(1);
+    expect(host.rowRenders).toBeGreaterThan(rows);
+  });
+
+  it.each(["ios", "android"])("%s keeps the press-started pager animation free of subsequent offset prop writes", async (os) => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = os;
+    const scrollTo = vi.fn();
+    await act(async () => {
+      renderer = TestRenderer.create(screen(true), { createNodeMock: (element) => (element.props as { testID?: string }).testID === "phone-lane-pager" ? { scrollTo } : null });
+    });
+    const pager = () => renderer!.root.find((node) => (node.type as unknown) === "ScrollView" && node.props.testID === "phone-lane-pager");
+    act(() => pager().props.onLayout({ nativeEvent: { layout: { x: 0, y: 0, width: 390, height: 600 } } }));
+    const initialOffset = pager().props.contentOffset;
+    scrollTo.mockClear();
+    let selectedAtTurn: unknown;
+    scrollTo.mockImplementation(() => { selectedAtTurn = pressable("Running 2").props.accessibilityState; });
+    act(() => pressable("Running 2").props.onPress());
+    // The page turn started while the old lane was still the board's; the render found the pager there.
+    expect(scrollTo).toHaveBeenCalledExactlyOnceWith({ x: 390, y: 0, animated: true });
+    expect(selectedAtTurn).toEqual({ selected: false });
+    expect(pressable("Running 2").props.accessibilityState).toEqual({ selected: true });
+    // Both native implementations apply changed offset props without animation.
+    // Observe the prop after the selected-lane render as well as the earlier command.
+    expect(pager().props.contentOffset).toEqual(initialOffset);
+    // A tab two lanes away is not mounted beside it: it jumps once the board draws it.
+    scrollTo.mockClear();
+    act(() => hostsById("phone-stat-done")[0]!.props.onPress());
+    expect(scrollTo).toHaveBeenCalledExactlyOnceWith({ x: 390 * 3, y: 0, animated: false });
+    expect(pager().props.contentOffset).toEqual(initialOffset);
+  });
+
+  it.each(["ios", "android"])("%s initializes a remembered pager lane and uses commands for layout changes and swipe settlement", async (os) => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = os;
+    rememberLane("host-1", "done");
+    const scrollTo = vi.fn();
+    await act(async () => {
+      renderer = TestRenderer.create(screen(true), { createNodeMock: (element) => (element.props as { testID?: string }).testID === "phone-lane-pager" ? { scrollTo } : null });
+    });
+    const pager = () => hostsById("phone-lane-pager")[0]!;
+    const layout = (width: number, height = 600) => act(() => pager().props.onLayout({ nativeEvent: { layout: { x: 0, y: 0, width, height } } }));
+    const initialOffset = pager().props.contentOffset;
+    expect(initialOffset).toEqual({ x: 390 * 3, y: 0 });
+    expect(scrollTo).not.toHaveBeenCalled();
+    layout(360);
+    expect(scrollTo).toHaveBeenCalledExactlyOnceWith({ x: 360 * 3, y: 0, animated: false });
+    expect(pager().props.contentOffset).toEqual(initialOffset);
+    scrollTo.mockClear();
+    layout(360, 590);
+    expect(scrollTo).not.toHaveBeenCalled();
+    // The native swipe is already at its destination; state must not send it another command.
+    act(() => pager().props.onMomentumScrollEnd({ nativeEvent: { contentOffset: { x: 360 * 2, y: 0 } } }));
+    expect(pressable("Review 2").props.accessibilityState).toEqual({ selected: true });
+    expect(scrollTo).not.toHaveBeenCalled();
+    expect(pager().props.contentOffset).toEqual(initialOffset);
+    layout(844, 390);
+    expect(scrollTo).toHaveBeenCalledExactlyOnceWith({ x: 844 * 2, y: 0, animated: false });
+    expect(pager().props.contentOffset).toEqual(initialOffset);
   });
 
   it.each(["ios", "android", "web"])("%s shows the bottom shortcut only when the active lane exceeds two viewports, and ends the list clear of it", (os) => {
@@ -6031,7 +7299,8 @@ describe("Tasks board, phone", () => {
     }
   });
 
-  it("jumps without animation when reduced motion is on", () => {
+  it.each(["ios", "android"])("%s jumps without animation when reduced motion is on", async (os) => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = os;
     let onReduce: (enabled: boolean) => void = () => {};
     const addListener = AccessibilityInfo.addEventListener;
     const subscription = vi.spyOn(AccessibilityInfo, "addEventListener").mockImplementation(((name: string, listener: (enabled: boolean) => void) => {
@@ -6042,7 +7311,15 @@ describe("Tasks board, phone", () => {
     try {
       const scrollToOffset = vi.fn();
       const scrollToIndex = vi.fn();
-      act(() => { renderer = TestRenderer.create(screen(true), { createNodeMock: (element) => element.type === "FlatList" ? { scrollToOffset, scrollToIndex } : null }); });
+      const scrollTo = vi.fn();
+      await act(async () => { renderer = TestRenderer.create(screen(true), { createNodeMock: (element) => {
+        if ((element.props as { testID?: string }).testID === "phone-lane-pager") return { scrollTo };
+        return element.type === "FlatList" ? { scrollToOffset, scrollToIndex } : null;
+      } }); });
+      const pager = () => hostsById("phone-lane-pager")[0]!;
+      const initialOffset = pager().props.contentOffset;
+      act(() => pager().props.onLayout({ nativeEvent: { layout: { x: 0, y: 0, width: 390, height: 600 } } }));
+      scrollTo.mockClear();
       act(() => onReduce(true));
       const list = renderer!.root.findAll((node) => (node.type as unknown) === "FlatList")[0]!;
       act(() => hostParentOf(list)!.props.onLayout({ nativeEvent: { layout: { height: 500 } } }));
@@ -6054,6 +7331,9 @@ describe("Tasks board, phone", () => {
       expect(scrollToOffset).toHaveBeenCalledWith({ offset: 0, animated: false });
       expect(scrollToOffset).toHaveBeenLastCalledWith({ offset: 938, animated: false });
       expect(scrollToIndex).not.toHaveBeenCalled();
+      act(() => pressable("Running 2").props.onPress());
+      expect(scrollTo).toHaveBeenCalledExactlyOnceWith({ x: 390, y: 0, animated: false });
+      expect(pager().props.contentOffset).toEqual(initialOffset);
     } finally {
       act(() => onReduce(false));
       subscription.mockRestore();
@@ -6270,6 +7550,8 @@ describe("Tasks board, phone", () => {
     const scroll = sheet.find((node) => (node.type as unknown) === "ScrollView" && node.props.testID === "filter-sheet-scroll");
     const footer = sheet.find((node) => (node.type as unknown) === "View" && node.props.testID === "filter-sheet-footer");
     expect(scroll.findAll((node) => node === footer)).toHaveLength(0);
+    expect(StyleSheet.flatten(footer.props.style).paddingHorizontal).toBe(8);
+    expect(StyleSheet.flatten(hostsById("filter-sheet-workspace-header")[0]!.props.style).paddingHorizontal).toBe(8);
     expect(textOf(footer)).toMatch(/^ResetShow \d+ tasks?$/);
     const fields = sheet.find((node) => (node.type as unknown) === "View" && node.props.testID === "sort-fields");
     act(() => fields.props.onLayout({ nativeEvent: { layout: { x: 0, y: 0, width: 360, height: 512 } } }));
@@ -6307,8 +7589,12 @@ describe("Tasks board, phone", () => {
     const controls = hostParentOf(button())!.findAll((node) => (node.type as unknown) === "Pressable");
     expect(controls.slice(-2).map((node) => node.props.testID)).toEqual(["phone-archived", "phone-more"]);
     expect(button().props.accessibilityState).toEqual({ selected: false });
+    expect(button().find((node) => (node.type as unknown) === "Icon").props.color).toBe("#1b1b1f");
+    expect(button().findByType(SlashMark).props).toMatchObject({ color: "#1b1b1f", gap: "#ffffff" });
     await act(async () => button().props.onPress());
     expect(button().props.accessibilityState).toEqual({ selected: true });
+    expect(button().findAllByType(SlashMark)).toHaveLength(0);
+    expect(button().find((node) => (node.type as unknown) === "Icon").props.color).toBe("#1b1b1f");
     expect(hostsById("phone-stat-archived")).toHaveLength(1);
     expect(deviceTasksStore().snapshot().values).toMatchObject({ showArchived: true });
     act(() => pressable("More").props.onPress());
@@ -6330,10 +7616,30 @@ describe("Tasks board, phone", () => {
     await act(async () => { finish("done"); });
     expect(list().props.refreshing).toBe(false);
     const more = hostsById("phone-more")[0]!;
-    expect(more.find((node) => (node.type as unknown) === "Icon").props.name).toBe("MoreVertical");
+    const dots = hostsById("phone-more-dot");
+    expect(dots).toHaveLength(3);
+    for (const dot of dots) {
+      expect(dot.props.style).toMatchObject({ width: 3, height: 3, borderRadius: 1.5, backgroundColor: "#1b1b1f" });
+    }
     act(() => more.props.onPress());
     expect(hostsById("filter-sheet-refresh")).toHaveLength(0);
     expect(hostsById("filter-sheet-scroll")).toHaveLength(1);
+  });
+
+  it("uses Android theme colors for pull to refresh and follows theme changes", async () => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = "android";
+    const light = { colors: { ...(theme as unknown as { colors: Record<string, string> }).colors } };
+    const dark = { colors: { ...light.colors, surface1: "#242424", foregroundMuted: "#aaaaaa" } };
+    act(() => { renderer = TestRenderer.create(screen(true, {}, light)); });
+    const list = () => hostsById("phone-lane-needs_input")[0]!.find((node) => (node.type as unknown) === "FlatList");
+    const control = () => list().props.refreshControl.props;
+    expect(control()).toMatchObject({ progressBackgroundColor: light.colors.surface1, colors: [light.colors.foregroundMuted], refreshing: false });
+    act(() => renderer!.update(screen(true, {}, dark)));
+    expect(control()).toMatchObject({ progressBackgroundColor: "#242424", colors: ["#aaaaaa"] });
+    act(() => control().onRefresh());
+    expect(control().refreshing).toBe(true);
+    await act(async () => { await Promise.resolve(); });
+    expect(control().refreshing).toBe(false);
   });
 
   it("opens the filter sheet with the sort first from the header's sort pill, and with the switches first from the filters button", () => {
@@ -6381,9 +7687,10 @@ describe("Tasks board, phone", () => {
     expect(at(BOARD_STRINGS.en.emptyGroups.row)).toBeGreaterThanOrEqual(0);
     expect(at(BOARD_STRINGS.en.emptyGroups.row)).toBeLessThan(at("Time range"));
     expect(at("Time range")).toBeLessThan(at("Agent"));
-    expect(at("Agent")).toBeLessThan(at("Workspace"));
-    expect(at("Workspace")).toBeLessThan(at("Labels"));
-    expect(at("Labels")).toBeLessThan(at("Sort"));
+    expect(at("Agent")).toBeLessThan(at("Labels"));
+    expect(at("Labels")).toBeLessThan(at("Project"));
+    expect(at("Project")).toBeLessThan(at("Workspace"));
+    expect(at("Workspace")).toBeLessThan(at("Sort"));
     const range = () => hostsById("filter-sheet-range-toggle")[0]!;
     expect(range().props.accessibilityState.expanded).toBe(true);
     expect(hostsById("filter-sheet-range-content")[0]!.props.accessibilityElementsHidden).toBe(false);
@@ -6502,14 +7809,65 @@ describe("Tasks board, phone", () => {
     expect(openAgent).not.toHaveBeenCalled();
   });
 
+  it("closes the phone details sheet when its content leaves for translation settings", () => {
+    act(() => { renderer = TestRenderer.create(screen(true)); });
+    act(() => cards()[0]!.props.onSelect(cards()[0]!.props.card));
+    const sheet = renderer!.root.find((node) => typeof node.type === "function" && node.type.name === "DetailsSheetContent");
+    expect(renderer!.root.findAll((node) => (node.type as unknown) === "Modal")).toHaveLength(1);
+    act(() => sheet.props.onCloseSheet());
+    expect(renderer!.root.findAll((node) => (node.type as unknown) === "Modal")).toHaveLength(0);
+  });
+
+  it.each([false, true])("keeps the Android detail actions available with footer support %s", async (supported) => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = "android";
+    (Modal as typeof Modal & { supportsFooter?: boolean }).supportsFooter = supported;
+    await act(async () => { renderer = TestRenderer.create(screen(true)); });
+    await act(async () => pressable("Running 2").props.onPress());
+    const running = cards().find((card) => card.props.card.id === "sample-running")!;
+    await act(async () => running.props.onSelect(running.props.card));
+    const content = renderer!.root.findByType(Modal.Content);
+    expect(Boolean(content.props.footer)).toBe(supported);
+    const bar = hostsById("detail-action-bar");
+    expect(bar).toHaveLength(1);
+    expect(hostsById("detail-bar-open")).toHaveLength(1);
+    expect(hostsById("detail-tab-short-scroll")).toHaveLength(1);
+    await act(async () => hostsById("detail-tab-info")[0]!.props.onPress());
+    expect(hostsById("detail-action-bar")).toHaveLength(1);
+    expect(hostsById("detail-bar-open")).toHaveLength(1);
+  });
+
+  it.each(["ios", "android", "web"])("answers a tool permission in its section, with no bottom bar, in the %s phone sheet", async (os) => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = os;
+    await act(async () => { renderer = TestRenderer.create(screen(true)); });
+    const input = cards().find((card) => card.props.card.id === "sample-input")!;
+    await act(async () => input.props.onSelect(input.props.card));
+    expect(renderer!.root.findByType(TaskDetailCards).props).toMatchObject({ questionActionsInHeader: true, actions: false });
+    // As a question's: Open above the request's section, Allow and Deny inside it.
+    expect(hostsById("detail-action-bar")).toHaveLength(0);
+    const controls = hostsById("detail-question-controls")[0]!;
+    expect(controls.findAll((node) => typeof node.type === "string" && node.props.accessibilityRole === "button").map((node) => node.props.testID)).toEqual(["detail-bar-open"]);
+    const answers = hostsById("detail-permission-actions")[0]!.findAll((node) => typeof node.type === "string" && node.props.accessibilityRole === "button");
+    expect(answers.map((node) => node.props.accessibilityLabel)).toEqual(["Allow", "Deny"]);
+    expect(openAgent).not.toHaveBeenCalled();
+  });
+
   it.each(["ios", "android", "web"])("shows message and info tabs with a pinned action bar in the %s phone sheet", async (os) => {
     (globalThis as { __rnMockOS?: string }).__rnMockOS = os;
     await act(async () => { renderer = TestRenderer.create(screen(true)); });
-    await act(async () => cards()[0]!.props.onSelect(cards()[0]!.props.card));
+    // A running card: the waiting tool permission answers in its section instead of a bar.
+    await act(async () => pressable("Running 2").props.onPress());
+    const running = cards().find((card) => card.props.card.id === "sample-running")!;
+    await act(async () => running.props.onSelect(running.props.card));
     const detail = renderer!.root.findByType(TaskDetailCards);
     expect(detail.props).toMatchObject({ touch: true, tabs: true, scrollHeader: true, actions: false });
+    const content = renderer!.root.find((node) => (node.type as unknown) === "ModalContent");
+    expect(StyleSheet.flatten(content.props.contentContainerStyle).paddingBottom).toBe(os === "ios" ? 0 : 16);
     const scroll = hostsById("detail-tab-short-scroll")[0]!;
     const bar = hostsById("detail-action-bar")[0]!;
+    expect(StyleSheet.flatten(bar.props.style).paddingBottom).toBe(os === "android" ? 4 : 0);
+    expect(StyleSheet.flatten(scroll.props.style).marginRight).toBe(os === "web" ? 0 : -8);
+    expect(scroll.props.contentContainerStyle).toEqual(os === "web" ? undefined : { paddingRight: 8 });
+    expect(StyleSheet.flatten(bar.props.style).paddingHorizontal).toBe(8);
     expect(scroll.findAll((node) => node === bar)).toHaveLength(0);
     expect(hostsById("detail-tab-messages")[0]!.props.accessibilityState.selected).toBe(true);
     expect(hostsById("detail-prompt")).toHaveLength(1);
@@ -6531,6 +7889,129 @@ describe("Tasks board, phone", () => {
     expect(openAgent).not.toHaveBeenCalled();
   });
 
+  it.each(["ios", "android"])("returns through phone task details and restores each page on %s", async (os) => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = os;
+    const handle = (data as unknown as { __handle: { byId: Map<string, TaskCard> } }).__handle;
+    const saved = handle.byId;
+    const parent = saved.get("sample-running")!;
+    const child = saved.get("sample-child-1")!;
+    const grandchild = { ...child, id: "phone-grandchild", title: "Grandchild", children: [] };
+    handle.byId = new Map(saved).set(child.id, { ...child, children: [{ ...parent.children[1]!, id: grandchild.id, title: grandchild.title }] }).set(grandchild.id, grandchild);
+    try {
+      const scrollTo = vi.fn();
+      await act(async () => { renderer = TestRenderer.create(screen(true), { createNodeMock: (element) => (element.props as { testID?: string }).testID === "detail-tab-short-scroll" ? { scrollTo } : null }); });
+      const scroll = () => hostsById("detail-tab-short-scroll")[0]!;
+      const info = () => hostsById("detail-tab-info-content")[0]!;
+      await act(async () => pressable("Running 2").props.onPress());
+      const card = cards().find((node) => node.props.card.id === parent.id)!;
+      await act(async () => card.props.onSelect(card.props.card));
+      expect(hostsById("detail-back")).toHaveLength(0);
+      await act(async () => hostsById("detail-tab-info")[0]!.props.onPress());
+      await act(async () => {
+        info().props.onLayout();
+        scroll().props.onScroll({ nativeEvent: { contentOffset: { y: 280 } } });
+      });
+      await act(async () => hostsById("detail-subtask-sample-child-1")[0]!.props.onPress());
+      expect(renderer!.root.findByType(TaskDetailCards).props.card.id).toBe(child.id);
+      expect(hostsById("detail-tab-messages")[0]!.props.accessibilityState.selected).toBe(true);
+      expect(hostsById("detail-back")[0]!.props.accessibilityLabel).toContain(parent.title);
+      await act(async () => hostsById("detail-tab-info")[0]!.props.onPress());
+      await act(async () => {
+        info().props.onLayout();
+        scroll().props.onScroll({ nativeEvent: { contentOffset: { y: 160 } } });
+      });
+      await act(async () => hostsById("detail-subtask-phone-grandchild")[0]!.props.onPress());
+      expect(renderer!.root.findByType(TaskDetailCards).props.card.id).toBe(grandchild.id);
+      await act(async () => hostsById("detail-back")[0]!.props.onPress());
+      expect(renderer!.root.findByType(TaskDetailCards).props.card.id).toBe(child.id);
+      expect(hostsById("detail-tab-info")[0]!.props.accessibilityState.selected).toBe(true);
+      scrollTo.mockClear();
+      await act(async () => scroll().props.onContentSizeChange(300, 1000));
+      expect(scrollTo).not.toHaveBeenCalled();
+      await act(async () => info().props.onLayout());
+      expect(scrollTo).toHaveBeenLastCalledWith({ y: 160, animated: false });
+      await act(async () => hostsById("detail-back")[0]!.props.onPress());
+      expect(renderer!.root.findByType(TaskDetailCards).props.card.id).toBe(parent.id);
+      expect(hostsById("detail-tab-info")[0]!.props.accessibilityState.selected).toBe(true);
+      expect(hostsById("detail-back")).toHaveLength(0);
+      await act(async () => {
+        info().props.onLayout();
+        scroll().props.onContentSizeChange(300, 1000);
+      });
+      expect(scrollTo).toHaveBeenLastCalledWith({ y: 280, animated: false });
+
+      await act(async () => hostsById("detail-subtask-sample-child-1")[0]!.props.onPress());
+      await act(async () => renderer!.root.findAllByType(Modal).find((node) => node.props.open)!.props.onOpenChange(false));
+      await act(async () => card.props.onSelect(card.props.card));
+      expect(hostsById("detail-back")).toHaveLength(0);
+      expect(hostsById("detail-tab-messages")[0]!.props.accessibilityState.selected).toBe(true);
+
+      await act(async () => hostsById("detail-tab-info")[0]!.props.onPress());
+      await act(async () => hostsById("detail-subtask-sample-child-1")[0]!.props.onPress());
+      await act(async () => renderer!.root.findByType(TaskDetailCards).props.onJumpWithScroll(parent.id, { info: 0, messages: 0 }));
+      expect(hostsById("detail-back")).toHaveLength(1);
+      await act(async () => pressable("Next task").props.onPress());
+      expect(hostsById("detail-back")).toHaveLength(0);
+      expect(hostsById("detail-tab-messages")[0]!.props.accessibilityState.selected).toBe(true);
+      expect(renderer!.root.findByType(TaskDetailCards).props.initialScrollOffsets).toBeUndefined();
+    } finally {
+      handle.byId = saved;
+    }
+  });
+
+  it.each(["ios", "android"])("restores each phone detail page's scroll after returning on %s", async (os) => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = os;
+    const scrollTo = vi.fn();
+    await act(async () => { renderer = TestRenderer.create(screen(true), {
+      createNodeMock: (element) => (element.props as { testID?: string }).testID === "detail-tab-short-scroll" ? { scrollTo } : null,
+    }); });
+    await act(async () => pressable("Running 2").props.onPress());
+    const card = cards().find((node) => node.props.card.id === "sample-running")!;
+    await act(async () => card.props.onSelect(card.props.card));
+    const scroll = () => hostsById("detail-tab-short-scroll")[0]!;
+    const read = (y: number) => scroll().props.onScroll({ nativeEvent: { contentOffset: { y } } });
+    const page = (id: string) => hostsById(`detail-tab-${id}-content`)[0]!;
+    await act(async () => {
+      hostsById("detail-tab-anchor")[0]!.props.onLayout({ nativeEvent: { layout: { y: 200, height: 44 } } });
+      read(260);
+      hostsById("detail-tab-info")[0]!.props.onPress();
+    });
+    await act(async () => {
+      page("info").props.onLayout();
+      read(430);
+    });
+    await act(async () => hostsById("detail-subtask-sample-child-1")[0]!.props.onPress());
+    expect(renderer!.root.findByType(TaskDetailCards).props.card.id).toBe("sample-child-1");
+    await act(async () => read(90));
+    scrollTo.mockClear();
+    await act(async () => hostsById("detail-back")[0]!.props.onPress());
+    expect(hostsById("detail-tab-info")[0]!.props.accessibilityState.selected).toBe(true);
+    await act(async () => {
+      read(0);
+      page("info").props.onLayout();
+    });
+    expect(scrollTo).not.toHaveBeenCalled();
+    await act(async () => scroll().props.onContentSizeChange(300, 0));
+    expect(scrollTo).not.toHaveBeenCalled();
+    await act(async () => scroll().props.onContentSizeChange(300, 1200));
+    expect(scrollTo).toHaveBeenLastCalledWith({ y: 430, animated: false });
+    await act(async () => hostsById("detail-tab-messages")[0]!.props.onPress());
+    await act(async () => page("messages").props.onLayout());
+    expect(scrollTo).toHaveBeenLastCalledWith({ y: 260, animated: false });
+    await act(async () => hostsById("detail-tab-info")[0]!.props.onPress());
+    await act(async () => page("info").props.onLayout());
+    expect(scrollTo).toHaveBeenLastCalledWith({ y: 430, animated: false });
+
+    await act(async () => renderer!.root.findAllByType(Modal).find((node) => node.props.open)!.props.onOpenChange(false));
+    scrollTo.mockClear();
+    await act(async () => card.props.onSelect(card.props.card));
+    await act(async () => {
+      scroll().props.onContentSizeChange(300, 1200);
+      page("messages").props.onLayout();
+    });
+    expect(scrollTo).not.toHaveBeenCalled();
+  });
+
   it("returns to messages when stepping to another phone task", async () => {
     (globalThis as { __rnMockOS?: string }).__rnMockOS = "ios";
     await act(async () => { renderer = TestRenderer.create(screen(true)); });
@@ -6542,6 +8023,7 @@ describe("Tasks board, phone", () => {
     await act(async () => pressable("Next task").props.onPress());
     expect(renderer!.root.findByType(TaskDetailCards).props.card.id).not.toBe(card.props.card.id);
     expect(hostsById("detail-tab-messages")[0]!.props.accessibilityState.selected).toBe(true);
+    expect(hostsById("detail-back")).toHaveLength(0);
     expect(hostsById("detail-action-bar")).toHaveLength(1);
   });
 
@@ -6791,13 +8273,13 @@ describe("Tasks board, phone lane swipe and the host's pans", () => {
 });
 
 describe("Tasks sidebar entry", () => {
-  function entry(screenId: string | null, openScreen = vi.fn()) {
+  function entry(screenId: string | null, openScreen = vi.fn(), compact = false) {
     act(() => {
       renderer = TestRenderer.create(
         React.createElement(TasksSidebarEntry, {
           theme,
           host: { id: "host-1", label: "Local" },
-          layout: { compact: false, platform: "web" },
+          layout: { compact, platform: "web" },
           currentScreen: screenId ? { screenId, params: {} } : null,
           openScreen,
           openPopover: vi.fn(),
@@ -6817,6 +8299,72 @@ describe("Tasks sidebar entry", () => {
     const counts = row.findAll((node) => node.props.accessibilityLabel !== undefined && (node.type as unknown) === "View");
     expect(counts.map((node) => node.props.accessibilityLabel)).toEqual(label ? [label] : []);
     expect(textOf(row)).toBe(text);
+  });
+
+  it("opens a pending question directly from the needs-input count", () => {
+    const sample = (data as unknown as { __handle: { lanes: { needs_input: { cards: TaskCard[] } } } }).__handle.lanes.needs_input.cards[0]!;
+    const card = { ...sample, permission: { requestId: "q1", kind: "question" as const, name: "AskUserQuestion", title: "Question", summary: "Choose", actions: [], remaining: 0, questions: [{ header: "One", question: "Choose", options: [{ label: "Yes" }], multiSelect: false, allowOther: false, allowEmpty: false }] } };
+    host.counts = { needsInput: 1, running: 0, review: 0, done: 0, questions: [card] };
+    const openScreen = vi.fn();
+    const row = entry(null, openScreen);
+    const stopPropagation = vi.fn();
+    act(() => row.findByProps({ testID: "sidebar-open-questions" }).props.onPress({ stopPropagation }));
+    expect(stopPropagation).toHaveBeenCalledOnce();
+    expect(openScreen).not.toHaveBeenCalled();
+    expect(renderer!.root.findAllByProps({ testID: "task-question-dialog" }).length).toBeGreaterThan(0);
+    expect(textOf(renderer!.root)).toContain("Choose");
+  });
+
+  it.each([false, true])("opens the question's agent via the board only once (provider subagent: %s)", (subagent) => {
+    const sample = (data as unknown as { __handle: { lanes: { needs_input: { cards: TaskCard[] } } } }).__handle.lanes.needs_input.cards[0]!;
+    const card = { ...sample, id: "question-agent", ...(subagent ? { subagent: { subtitle: null }, parent: { id: "parent-agent", title: "Parent", missing: false, archived: false } } : {}), permission: { requestId: "q1", kind: "question" as const, name: "AskUserQuestion", title: "Question", summary: "Choose", actions: [], remaining: 0, questions: [{ header: "One", question: "Choose", options: [{ label: "Yes" }], multiSelect: false, allowOther: false, allowEmpty: false }] } };
+    host.counts = { needsInput: 1, running: 0, review: 0, done: 0, questions: [card] };
+    const openScreen = vi.fn();
+    const row = entry(null, openScreen, true);
+    act(() => row.findByProps({ testID: "sidebar-open-questions" }).props.onPress({ stopPropagation() {} }));
+    act(() => renderer!.root.findByProps({ testID: "task-question-open" }).props.onPress());
+    expect(renderer!.root.findAllByProps({ testID: "task-question-dialog" })).toHaveLength(0);
+    const route = openScreen.mock.calls[0]![0] as { screenId: string; params: Record<string, string> };
+    expect(route.screenId).toBe("tasks");
+    act(() => { renderer!.unmount(); renderer = TestRenderer.create(screen(true, route.params)); });
+    expect(openAgent).toHaveBeenCalledExactlyOnceWith({ agentId: subagent ? "parent-agent" : "question-agent" });
+    act(() => { renderer!.unmount(); renderer = TestRenderer.create(screen(true, route.params)); });
+    expect(openAgent).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps open requests scoped to their host and ignores replaced routes", () => {
+    const old = requestBoardOpen("host-1", "first");
+    const next = requestBoardOpen("host-1", "second");
+    const other = requestBoardOpen("host-2", "third");
+    expect(consumeBoardOpen("host-1", old)).toBeUndefined();
+    expect(consumeBoardOpen("host-2", next)).toBeUndefined();
+    expect(consumeBoardOpen("host-1", next)).toBe("second");
+    expect(consumeBoardOpen("host-1", next)).toBeUndefined();
+    expect(consumeBoardOpen("host-2", other)).toBe("third");
+  });
+
+  it("reports when the board's client cannot navigate", () => {
+    const token = requestBoardOpen("host-1", "question-agent");
+    act(() => { renderer = TestRenderer.create(React.createElement(TasksBoardScreen, { theme, host: { id: "host-1", label: "Local" }, layout: { compact: true, platform: "ios" }, params: { openRequest: token } })); });
+    expect(host.toast).toHaveBeenCalledWith("Cannot open task: navigation is unavailable in this client");
+    expect(openAgent).not.toHaveBeenCalled();
+    expect(consumeBoardOpen("host-1", token)).toBeUndefined();
+  });
+
+  it("clears the unread mark of a task the sidebar opens through the board", async () => {
+    const clearer = vi.fn(async () => {});
+    data.setUnreadClearer(clearer);
+    try {
+      const token = requestBoardOpen("host-1", "sample-done");
+      await act(async () => {
+        renderer = TestRenderer.create(React.createElement(TasksBoardScreen, { theme, host: { id: "host-1", label: "Local" }, layout: { compact: true, platform: "ios" }, params: { openRequest: token }, navigation: { openAgent, openWorkspace: vi.fn() } } as never));
+        await Promise.resolve();
+      });
+      expect(openAgent).toHaveBeenCalledWith({ agentId: "sample-done" });
+      expect(clearer).toHaveBeenCalledWith(["sample-done"]);
+    } finally {
+      data.setUnreadClearer(null);
+    }
   });
 
   it("draws needs input, running and review in that order with their lane icons", () => {
@@ -6880,6 +8428,107 @@ describe("Tasks sidebar entry", () => {
     expect(modal.findAll((node) => typeof node.type === "string" && node.props.testID === `task-card-${card.id}`)).toHaveLength(1);
     expect(modal.findAll((node) => node.props.testID === "agent-pill-thinking").map((node) => textOf(node))).toContain(card.thinkingLabel);
     expect(modal.findAllByType(ProviderLogo).length).toBeGreaterThan(0);
+    const scroll = modal.findByProps({ testID: "hidden-tasks-scroll" });
+    expect(textOf(scroll)).toContain(card.title);
+    expect(scroll.findAllByProps({ testID: "hidden-tasks-actions" })).toHaveLength(0);
+    expect(modal.findByType(Modal.Content).props.scrollable).toBe(false);
+    expect(modal.findAllByProps({ testID: "hidden-tasks-clear-filters" }).length).toBeGreaterThan(0);
+  });
+
+  it("shows the hidden-task footer shadow only while content remains below", () => {
+    const card = (data as unknown as { __handle: { lanes: { running: { cards: TaskCard[] } } } }).__handle.lanes.running.cards[0]!;
+    host.settings = { ...DEFAULT_TASKS_SETTINGS, sidebar: { count: "all" } };
+    host.counts = { needsInput: 0, running: 0, review: 0, done: 0, hidden: [card] };
+    const row = entry(null);
+    act(() => row.findAll((node) => node.props.testID === "hidden-tasks-count")[0]!.props.onPress());
+    const scroll = () => renderer!.root.findByProps({ testID: "hidden-tasks-scroll" });
+    const shadow = () => StyleSheet.flatten(renderer!.root.findByProps({ testID: "hidden-tasks-actions" }).props.style).boxShadow;
+    act(() => { scroll().props.onLayout({ nativeEvent: { layout: { height: 200 } } }); scroll().props.onContentSizeChange(300, 150); });
+    expect(shadow()).toBeUndefined();
+    act(() => scroll().props.onContentSizeChange(300, 400));
+    expect(shadow()).toBeTruthy();
+    act(() => scroll().props.onScroll({ nativeEvent: { contentOffset: { y: 200 } } }));
+    expect(shadow()).toBeUndefined();
+    act(() => scroll().props.onScroll({ nativeEvent: { contentOffset: { y: 80 } } }));
+    expect(shadow()).toBeTruthy();
+    act(() => scroll().props.onContentSizeChange(300, 150));
+    expect(shadow()).toBeUndefined();
+  });
+
+  it("keeps the phone hidden-task action outside the scrolling list", () => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = "ios";
+    const card = (data as unknown as { __handle: { lanes: { running: { cards: TaskCard[] } } } }).__handle.lanes.running.cards[0]!;
+    host.settings = { ...DEFAULT_TASKS_SETTINGS, sidebar: { count: "all" } };
+    host.counts = { needsInput: 0, running: 0, review: 0, done: 0, hidden: [card] };
+    const row = entry(null, vi.fn(), true);
+    act(() => row.findAll((node) => node.props.testID === "hidden-tasks-count")[0]!.props.onPress());
+    const scroll = renderer!.root.findByProps({ testID: "hidden-tasks-scroll" });
+    expect(textOf(scroll)).toContain(card.title);
+    expect(scroll.findAllByProps({ testID: "hidden-tasks-actions" })).toHaveLength(0);
+    expect(renderer!.root.findAllByProps({ testID: "hidden-tasks-clear-filters" }).length).toBeGreaterThan(0);
+  });
+
+  it("clears the board's search and filters from the hidden-task dialog and closes it", () => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = "web";
+    const card = (data as unknown as { __handle: { lanes: { running: { cards: TaskCard[] } } } }).__handle.lanes.running.cards[0]!;
+    host.settings = { ...DEFAULT_TASKS_SETTINGS, sidebar: { count: "all" } };
+    host.counts = { needsInput: 0, running: 0, review: 0, done: 0, hidden: [card] };
+    rememberBoardParams("host-1", { ...EMPTY_PARAMS, query: "deploy", providers: ["codex"], labels: ["frontend"] });
+    const openScreen = vi.fn();
+    const row = entry(null, openScreen);
+    act(() => row.findAll((node) => node.props.testID === "hidden-tasks-count")[0]!.props.onPress());
+    const button = renderer!.root.findAll((node) => node.props.testID === "hidden-tasks-clear-filters" && (node.type as unknown) === "Pressable")[0]!;
+    expect(button.props.accessibilityLabel).toBe("Clear filters");
+    act(() => button.props.onPress());
+    expect(renderer!.root.findAllByType(Modal)).toHaveLength(0);
+    expect(openScreen).toHaveBeenCalledOnce();
+    const params = openScreen.mock.calls[0]![0] as { screenId: string; params: Record<string, string> };
+    expect(params.screenId).toBe("tasks");
+    // The subtask switch is the device's own preference and stays out of the cleared route.
+    expect(params.params).toEqual({});
+    expect(boardClearCount("host-1")).toBe(1);
+  });
+
+  it.each([null, { key: "title", direction: "asc" }] as const)("clears cached filters before mounting a closed board (sort=%j)", (sort) => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = "web";
+    const storage = new Map<string, string>();
+    vi.stubGlobal("sessionStorage", { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => storage.set(key, value) });
+    try {
+      const card = (data as unknown as { __handle: { lanes: { running: { cards: TaskCard[] } } } }).__handle.lanes.running.cards[0]!;
+      host.settings = { ...DEFAULT_TASKS_SETTINGS, sidebar: { count: "all" } };
+      host.counts = { needsInput: 0, running: 0, review: 0, done: 0, hidden: [card] };
+      const filtered: BoardParams = { ...EMPTY_PARAMS, query: "deploy", workspaceIds: ["other-workspace"], providers: ["codex"], labels: ["frontend"], doneWindow: "7d", sort };
+      // A previous board edited the route that clearing will open again.
+      rememberBoardRoute("host-1", encodeBoardParams({ ...EMPTY_PARAMS, sort }), filtered);
+      rememberBoardParams("host-1", filtered);
+      const openScreen = vi.fn();
+      const row = entry(null, openScreen);
+      act(() => row.findAll((node) => node.props.testID === "hidden-tasks-count")[0]!.props.onPress());
+      act(() => renderer!.root.findAll((node) => node.props.testID === "hidden-tasks-clear-filters" && (node.type as unknown) === "Pressable")[0]!.props.onPress());
+      expect(openScreen).toHaveBeenCalledOnce();
+      const route = openScreen.mock.calls[0]![0] as { params: Record<string, string> };
+      act(() => renderer!.unmount());
+      act(() => { renderer = TestRenderer.create(screen(false, route.params)); });
+      layOut(1600);
+      expect(lastBoardParams("host-1")).toEqual({ ...EMPTY_PARAMS, sort });
+      expect(hostsById("desktop-toolbar-search")[0]!.find((node) => (node.type as unknown) === "TextInput").props.value).toBe("");
+      expect(hostsById("desktop-toolbar-search-summary")).toHaveLength(0);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("asks an open board to clear instead of opening the route again", () => {
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = "web";
+    const card = (data as unknown as { __handle: { lanes: { running: { cards: TaskCard[] } } } }).__handle.lanes.running.cards[0]!;
+    host.settings = { ...DEFAULT_TASKS_SETTINGS, sidebar: { count: "all" } };
+    host.counts = { needsInput: 0, running: 0, review: 0, done: 0, hidden: [card] };
+    const openScreen = vi.fn();
+    const row = entry("tasks", openScreen);
+    act(() => row.findAll((node) => node.props.testID === "hidden-tasks-count")[0]!.props.onPress());
+    act(() => renderer!.root.findAll((node) => node.props.testID === "hidden-tasks-clear-filters" && (node.type as unknown) === "Pressable")[0]!.props.onPress());
+    expect(openScreen).not.toHaveBeenCalled();
+    expect(boardClearCount("host-1")).toBe(1);
   });
 
   it("folds hidden groups independently and stops dialog clicks reaching the sidebar", () => {
@@ -7021,6 +8670,34 @@ describe("Tasks board, new tasks", () => {
     expect(outlined("fresh")).toBe(false);
   });
 
+  it("sees no new card on ios from what a restored lane reports before its restore scroll", async () => {
+    const { push, announce } = await mount(true, "ios");
+    act(() => hostsById("phone-stat-running")[0]!.props.onPress());
+    act(() => list("running").props.onScroll({ nativeEvent: { contentOffset: { x: 0, y: 420 }, contentSize: { height: 1800 }, layoutMeasurement: { height: 500 } } }));
+    act(() => renderer!.unmount());
+    const scrollToOffset = vi.fn();
+    await act(async () => { renderer = TestRenderer.create(screen(true), { createNodeMock: (element) => element.type === "FlatList" ? { scrollToIndex: vi.fn(), scrollToOffset } : null }); });
+    layOut(390);
+    expect(scrollToOffset).toHaveBeenCalledExactlyOnceWith({ offset: 420, animated: false });
+    // A task comes while the restore's scroll event has not reached the list yet.
+    await push(running("fresh", new Date().toISOString()));
+    await announce();
+    expect(newCardStore("host-1").pending("running")).toEqual(["fresh"]);
+    // Until that event, VirtualizedList reports the cards from offset 0, not the ones on screen.
+    onScreen("running", ["a", "b", "fresh"]);
+    expect(newCardStore("host-1").pending("running")).toEqual(["fresh"]);
+    // VirtualizedList calls onScroll, then reports the cards at the new offset, in one event.
+    const target = list("running");
+    const report = (target.props.viewabilityConfigCallbackPairs as { onViewableItemsChanged(info: unknown): void }[])[0]!;
+    act(() => {
+      target.props.onScroll({ nativeEvent: { contentOffset: { x: 0, y: 420 }, contentSize: { height: 1800 }, layoutMeasurement: { height: 500 } } });
+      report.onViewableItemsChanged({ viewableItems: [{ key: "b", item: null, index: 1, isViewable: true }], changed: [] });
+    });
+    expect(newCardStore("host-1").pending("running")).toEqual(["fresh"]);
+    onScreen("running", ["b", "fresh"]);
+    expect(newCardStore("host-1").pending("running")).toEqual([]);
+  });
+
   it.each(["ios", "web"])("%s offers a pill for a new card below the screen, and scrolls to it", async (os) => {
     const { push, announce, scrollToIndex } = await mount(true, os);
     act(() => hostsById("phone-stat-running")[0]!.props.onPress());
@@ -7079,6 +8756,21 @@ describe("Tasks board, new tasks", () => {
     expect(hostsById("phone-new-dot-review")).toHaveLength(0);
   });
 
+  it("marks a collapsed lane when an existing card moves into it, then clears on expansion", async () => {
+    const { push } = await mount(false, "web");
+    act(() => hostsById("lane-header-review")[0]!.findAll((node) => (node.type as unknown) === "Pressable" && node.props.accessibilityLabel === BOARD_STRINGS.en.collapse)[0]!.props.onPress());
+    layOut(2400);
+    await act(async () => { await vi.advanceTimersByTimeAsync(400); });
+    const old = new Date(Date.now() - 120000).toISOString();
+    await push(makeAgent({ id: "a", title: "Task a", workspaceId: "ws", status: "idle", requiresAttention: true, attentionReason: "finished", createdAt: old, updatedAt: new Date(Date.now() + 1000).toISOString(), lastUserMessageAt: old }));
+    expect(hostsById("lane-new-count-review")).toHaveLength(1);
+    expect(textOf(hostsById("lane-new-count-review")[0]!)).toBe("+1");
+    const strip = renderer!.root.findAll((node) => node.props.accessibilityRole === "button" && typeof node.props.accessibilityLabel === "string" && node.props.accessibilityLabel.startsWith(`${BOARD_STRINGS.en.expand}: Review`))[0]!;
+    act(() => strip.props.onPress());
+    await act(async () => { await vi.advanceTimersByTimeAsync(400); });
+    expect(hostsById("lane-new-count-review")).toHaveLength(0);
+  });
+
   it("on the desktop floats a pill over the lane, and marks a collapsed lane", async () => {
     const { push, scrollToIndex } = await mount(false, "web");
     onScreen("running", ["a", "b"]);
@@ -7095,4 +8787,108 @@ describe("Tasks board, new tasks", () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(400); });
     expect(hostsById("lane-new-dot-running")).toHaveLength(1);
   });
+});
+
+describe("Tasks sidebar filter options", () => {
+  const builds = () => vi.mocked(buildFilterOptions).mock.calls.length;
+  /** Builds of a data and params pair already built: the work a shared result saves. */
+  const repeats = () => vi.mocked(buildFilterOptions).mock.calls.filter(([tasks, params], index, calls) => calls.findIndex((call) => call[0] === tasks && call[1] === params) < index).length;
+  const handle = () => (data as unknown as { __handle: data.TasksHandle }).__handle;
+  const groupRows = () => renderer!.root.findByProps({ testID: "sidebar-groups" }).findAll((node) => node.props.accessibilityRole === "checkbox" && typeof node.props.onPress === "function").map((node) => node.props.accessibilityLabel as string);
+  const statsText = () => textOf(renderer!.root.findByProps({ testID: "sidebar-stats" }));
+  /** Counts the builds `run` causes. */
+  const during = async (run: () => unknown) => {
+    vi.mocked(buildFilterOptions).mockClear();
+    await act(async () => { await run(); });
+    return builds();
+  };
+
+  beforeEach(() => {
+    // A tablet: its filter panel (closed here) is the board's only other builder, so every count is the sidebar's.
+    (globalThis as { __rnMockOS?: string }).__rnMockOS = "android";
+  });
+
+  it("builds the overview's options once for the counts and the groups, and once per change", async () => {
+    vi.mocked(buildFilterOptions).mockClear();
+    await act(async () => { renderer = TestRenderer.create(screen(false)); });
+    layOut(1400);
+    expect(hostsById("sidebar-stats")).toHaveLength(1);
+    expect(hostsById("sidebar-groups")).toHaveLength(1);
+    // Mounting reads the data twice (its availability arrives after the first draw): one build for each.
+    expect(builds()).toBe(new Set(vi.mocked(buildFilterOptions).mock.calls.map(([tasks]) => tasks)).size);
+    expect(builds()).toBeGreaterThan(0);
+    expect(repeats()).toBe(0);
+    expect(groupRows()).toEqual(expect.arrayContaining([expect.stringMatching(/^Claude \d+$/), expect.stringMatching(/^Codex \d+$/)]));
+    const before = statsText();
+
+    // A filter: both cards follow from the one build.
+    const codex = () => renderer!.root.findByProps({ testID: "sidebar-groups" }).find((node) => node.props.accessibilityRole === "checkbox" && /^Codex /.test(node.props.accessibilityLabel ?? ""));
+    expect(await during(() => codex().props.onPress())).toBe(1);
+    expect(codex().props.accessibilityState).toEqual({ checked: true });
+    expect(statsText()).not.toBe(before);
+    expect(statsText()).toContain("Codex");
+
+    // New data from the store.
+    const next = { ...handle(), providers: [...handle().providers, { id: "pi", label: "Pi" }] };
+    const useTasks = vi.spyOn(data, "useTasks").mockReturnValue(next);
+    expect(await during(() => renderer!.update(screen(false)))).toBe(1);
+    expect(groupRows()).toContain("Pi 0");
+
+    // Hiding the empty groups.
+    expect(await during(() => deviceTasksStore().update({ showEmptyGroups: false }))).toBe(1);
+    expect(groupRows()).not.toContain("Pi 0");
+    expect(await during(() => deviceTasksStore().update({ showEmptyGroups: true }))).toBe(1);
+    expect(groupRows()).toContain("Pi 0");
+    useTasks.mockRestore();
+
+    // Closed, the sidebar builds nothing: no other part of the board was counted.
+    finishSidebarCloseImmediately();
+    act(() => renderer!.root.findByProps({ testID: "sidebar-switch" }).props.onPress());
+    expect(hostsById("sidebar-stats")).toHaveLength(0);
+    expect(await during(() => renderer!.root.findAllByType(TabletToolbar)[0]!.props.board.setParams((params: BoardParams) => ({ ...params, providers: [] })))).toBe(0);
+  });
+
+  it("builds once for the counts above a chosen card, and not at all in a sheet that leaves them out", async () => {
+    await act(async () => { renderer = TestRenderer.create(screen(false)); });
+    layOut(1400);
+    const card = cards().find((node) => node.props.card.id === "sample-running")!;
+    // Choosing a card keeps the counts' options: nothing new to build.
+    expect(await during(() => card.props.onSelect(card.props.card))).toBe(0);
+    expect(hostsById("sidebar-stats")).toHaveLength(1);
+    expect(hostsById("sidebar-groups")).toHaveLength(0);
+    const filter = () => renderer!.root.findAllByType(TabletToolbar)[0]!.props.board.setParams((params: BoardParams) => ({ ...params, providers: ["codex"] }));
+    expect(await during(filter)).toBe(1);
+    expect(statsText()).toContain("Codex");
+    act(() => renderer!.unmount());
+    renderer = undefined;
+
+    // A sheet showing a card: neither the counts nor the groups.
+    await act(async () => { renderer = TestRenderer.create(screen(false)); });
+    layOut(600);
+    const sheetCard = cards().find((node) => node.props.card.id === "sample-running")!;
+    expect(await during(() => sheetCard.props.onSelect(sheetCard.props.card))).toBe(0);
+    expect(hostsById("board-sheet")).toHaveLength(1);
+    expect(hostsById("sidebar-stats")).toHaveLength(0);
+    expect(hostsById("sidebar-groups")).toHaveLength(0);
+    expect(await during(() => renderer!.root.findAllByType(TabletToolbar)[0]!.props.board.setParams((params: BoardParams) => ({ ...params, providers: [] })))).toBe(0);
+    const useTasks = vi.spyOn(data, "useTasks").mockReturnValue({ ...handle(), providers: [...handle().providers, { id: "pi", label: "Pi" }] });
+    expect(await during(() => renderer!.update(screen(false)))).toBe(0);
+    useTasks.mockRestore();
+  });
+});
+
+it.each((["ios", "android"] as const).flatMap((os) => ["needle", "needle 中文"].map((query) => [os, query] as const)))("%s phone board keeps the real search summary height for %s", async (os, query) => {
+  (globalThis as { __rnMockOS?: string }).__rnMockOS = os;
+  await act(async () => { renderer = TestRenderer.create(screen(true, { q: query }, { ...(theme as object), typography: { fontSize: { ui: 14 } } })); });
+  act(() => { vi.advanceTimersByTime(200); });
+  expect(hostsById("phone-search-reveal")).toHaveLength(1);
+  const summary = hostsById("phone-search-summary")[0]!;
+  const chip = hostsById("search-query-chip")[0]!;
+  expect(summary.findAll((node) => node === chip)).toHaveLength(1);
+  const frames = measureHostTree(summary, { width: 390 });
+  expect(summary.props.contentContainerStyle).toMatchObject({ flexDirection: "row", alignItems: "center" });
+  // rn-mock omits ScrollView's native content view. Its actual row height is
+  // the tallest rendered child, rather than the mock's default column sum.
+  expect(Math.max(...hostChildren(summary).map((child) => frames.get(child)!.height))).toBe(36);
+  expect(frames.get(chip)!.height).toBe(36);
 });

@@ -142,12 +142,111 @@ export function openPointLayer(node: unknown, point: { x: number; y: number }, c
   };
 }
 
+/** The text box keeps its intrinsic scroll width even when CSS ellipsizes it. */
+export function optionTextClipped(node: unknown): boolean {
+  if (Platform.OS !== "web") return false;
+  const text = node as HTMLElement | null;
+  return !!text && text.scrollWidth > text.clientWidth;
+}
 
-/** Keep interactive toolbar details above timeline stacking contexts without moving their React tree. */
-export function openToolbarDetailsLayer(node: unknown, anchor: unknown, side: "above" | "below"): () => void {
+/** Lift a question option above the lane, without moving the button's layout slot. */
+export function openOptionExpansion(labelNode: unknown, panelNode: unknown, reduced: boolean) {
+  const label = labelNode as HTMLElement;
+  const panel = panelNode as HTMLElement;
+  const button = label.parentElement!;
+  const view = panel.ownerDocument.defaultView!;
+  let frame = 0;
+  let expanded = false;
+  panel.setAttribute("popover", "manual");
+  Object.assign(panel.style, {
+    position: "fixed", inset: "auto", margin: "0", boxSizing: "border-box",
+    maxWidth: "none", maxHeight: "none", overflow: "hidden", opacity: "1",
+    transition: reduced ? "none" : "width 160ms ease-out, left 160ms ease-out",
+  });
+  const position = () => {
+    const box = button.getBoundingClientRect();
+    const width = expanded ? Math.min(label.scrollWidth + box.width - label.clientWidth + 1, view.innerWidth - 16) : box.width;
+    const left = expanded ? Math.max(8, Math.min(box.left, view.innerWidth - width - 8)) : box.left;
+    Object.assign(panel.style, { width: `${width}px`, height: `${box.height}px`, left: `${left}px`, top: `${box.top}px` });
+  };
+  panel.showPopover();
+  position();
+  // Commit the starting width before the next frame changes it.
+  panel.getBoundingClientRect();
+  view.addEventListener("resize", position);
+  view.addEventListener("scroll", position, true);
+  return {
+    setExpanded(value: boolean) {
+      view.cancelAnimationFrame(frame);
+      expanded = value;
+      frame = view.requestAnimationFrame(position);
+    },
+    close() {
+      view.cancelAnimationFrame(frame);
+      view.removeEventListener("resize", position);
+      view.removeEventListener("scroll", position, true);
+      panel.hidePopover();
+    },
+  };
+}
+
+
+/**
+ * Lift a name tooltip onto the top layer, at the box it already occupies.
+ *
+ * A code block clips with `overflow: hidden`. The name drawn under its icon
+ * is cut off there, and the leftover of its shadow reads as a bar along the
+ * block's bottom edge. The popover keeps the name and the shadow outside
+ * that clip, and follows the button while the timeline scrolls.
+ */
+export function pinTooltipLayer(node: unknown, anchor: unknown): () => void {
   if (Platform.OS !== "web") return () => {};
   const panel = node as HTMLElement | null;
   const trigger = anchor as HTMLElement | null;
+  if (!panel || !trigger || typeof panel.showPopover !== "function" || typeof panel.getBoundingClientRect !== "function" || typeof trigger.getBoundingClientRect !== "function") return () => {};
+  const view = panel.ownerDocument?.defaultView;
+  if (!view) return () => {};
+  const originalStyle = panel.style.cssText;
+  const originalPopover = panel.getAttribute("popover");
+  const initial = panel.getBoundingClientRect();
+  const origin = trigger.getBoundingClientRect();
+  panel.setAttribute("popover", "manual");
+  const place = () => {
+    const next = trigger.getBoundingClientRect();
+    panel.style.left = `${initial.left + next.left - origin.left}px`;
+    panel.style.top = `${initial.top + next.top - origin.top}px`;
+  };
+  Object.assign(panel.style, {
+    position: "fixed", inset: "auto", margin: "0", width: `${initial.width}px`,
+    overflow: "visible", background: "transparent", border: "0",
+  });
+  place();
+  try {
+    panel.showPopover();
+  } catch {
+    panel.style.cssText = originalStyle;
+    if (originalPopover === null) panel.removeAttribute("popover");
+    else panel.setAttribute("popover", originalPopover);
+    return () => {};
+  }
+  view.addEventListener("scroll", place, true);
+  view.addEventListener("resize", place);
+  return () => {
+    view.removeEventListener("scroll", place, true);
+    view.removeEventListener("resize", place);
+    if (panel.matches?.(":popover-open")) panel.hidePopover();
+    if (originalPopover === null) panel.removeAttribute("popover");
+    else panel.setAttribute("popover", originalPopover);
+    panel.style.cssText = originalStyle;
+  };
+}
+
+/** Keep interactive toolbar details above timeline stacking contexts without moving their React tree. */
+export function openToolbarDetailsLayer(node: unknown, anchor: unknown, side: "above" | "below", matchBounds?: unknown, onPlacement?: (placement: "above" | "below") => void): () => void {
+  if (Platform.OS !== "web") return () => {};
+  const panel = node as HTMLElement | null;
+  const trigger = anchor as HTMLElement | null;
+  const bounds = matchBounds as HTMLElement | null | undefined;
   if (!panel || !trigger) return () => {};
   const view = panel.ownerDocument.defaultView!;
   const originalStyle = panel.style.cssText;
@@ -162,21 +261,26 @@ export function openToolbarDetailsLayer(node: unknown, anchor: unknown, side: "a
   panel.showPopover();
   const position = () => {
     const rect = trigger.getBoundingClientRect();
+    const matched = bounds?.getBoundingClientRect();
+    if (matched) panel.style.width = `${matched.width}px`;
     const { width, height } = panel.getBoundingClientRect();
     const above = rect.top - height;
     const below = rect.bottom;
     const fitsAbove = above >= 8;
     const fitsBelow = below + height <= view.innerHeight - 8;
-    const top = side === "above"
-      ? (fitsAbove || !fitsBelow ? above : below)
-      : (fitsBelow || !fitsAbove ? below : above);
-    panel.style.left = `${Math.max(8, Math.min(rect.left + offset, view.innerWidth - width - 8))}px`;
+    const placement = side === "above"
+      ? (fitsAbove || !fitsBelow ? "above" : "below")
+      : (fitsBelow || !fitsAbove ? "below" : "above");
+    const top = placement === "above" ? above : below;
+    panel.style.left = `${Math.max(8, Math.min(matched ? matched.left : rect.left + offset, view.innerWidth - width - 8))}px`;
     panel.style.top = `${Math.max(8, Math.min(top, view.innerHeight - height - 8))}px`;
+    onPlacement?.(placement);
   };
   position();
   const observer = new view.ResizeObserver(position);
   observer.observe(panel);
   observer.observe(trigger);
+  if (bounds) observer.observe(bounds);
   view.addEventListener("resize", position);
   return () => {
     observer.disconnect();

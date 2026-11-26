@@ -1,3 +1,4 @@
+const toast = vi.hoisted(() => ({ error: () => {} }));
 import React from "react";
 import { afterAll, describe, expect, it, vi } from "vitest";
 import type { PluginTimelineItemProps } from "@getpaseo/plugin/client";
@@ -7,12 +8,12 @@ import type { LiveReasoningPayload, LiveToolCallPayload } from "../../client/liv
 // the render count. Layout is asserted on the real root views.
 const renders = vi.hoisted(() => ({ count: 0 }));
 vi.mock("react-native", () => import("./helpers/rn-mock"));
-vi.mock("@getpaseo/plugin/client/react-native", () => ({
+vi.mock("@getpaseo/plugin/client/ui", () => ({ useToast: () => toast,
   Icon: () => null,
-  useRevealedText: (text: string) => text,
 }));
 vi.mock("@getpaseo/plugin/client", () => ({
   useAgent: () => undefined,
+  usePaseo: () => ({}),
   useWorkspace: () => undefined,
   useRpc: () => () => Promise.resolve(null),
 }));

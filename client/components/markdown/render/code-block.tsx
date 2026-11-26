@@ -1,7 +1,6 @@
 import React, { useState } from "react";
 import { Pressable, Text, View } from "react-native";
-import { Icon } from "@getpaseo/plugin/client/react-native";
-import { Markdown } from "@getpaseo/plugin/client/ui";
+import { Icon, Markdown } from "@getpaseo/plugin/client/ui";
 import type { Tokens } from "../../../vendor/marked";
 import { SyntaxHighlightBlock } from "../../syntax-highlight";
 import type { RenderContext } from "./context";
@@ -9,6 +8,7 @@ import { FadeIn } from "../../../ui/fade-in";
 import { codeSurface } from "../../host-font-escape";
 import { codeLanguage, fenceClosed } from "./text";
 import { MarkdownCodePreview } from "./code-preview";
+import { selectionColorProps } from "../../text-selection";
 
 function lineCount(code: string): number {
   let count = 1;
@@ -39,7 +39,7 @@ export function CodeBlock({
   const language = lang === "" ? "plaintext" : lang;
   const lines = lineCount(token.text);
 
-  if (context.renderText) return <View style={styles.codeBlock}><Text selectable {...(codeSurface as object)} style={styles.plain}>{context.renderText(token.text)}</Text></View>;
+  if (context.renderText) return <View style={styles.codeBlock}><Text selectable {...selectionColorProps()} {...(codeSurface as object)} style={styles.plain}>{context.renderText(token.text)}</Text></View>;
 
   if (collapseCode && variant === "compact" && !expanded) {
     return (

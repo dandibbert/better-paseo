@@ -8,7 +8,7 @@ import { matchesSearch, searchWords } from "./search";
 /**
  * The board's menus, after Linear's (measured at 2x on its light theme):
  * a panel with a 12 pt corner, a hairline border and a soft wide shadow;
- * rows 32 high inset 6 from the panel's edges, a 6 pt rounded hover fill;
+ * rows 32 high inset 10 from the panel's edges, a 6 pt rounded hover fill;
  * groups split by a full-width hairline with 6 above and below; a row is a
  * 16 icon, 8, a 14 label, then a muted hint and a small chevron for a
  * submenu. A submenu has the same chrome and opens beside its row.
@@ -18,8 +18,8 @@ import { matchesSearch, searchWords } from "./search";
  */
 export const MENU = {
   radius: 12,
-  padV: 6,
-  inset: 6,
+  padV: 10,
+  inset: 10,
   rowHeight: 32,
   rowRadius: 6,
   icon: 16,
@@ -105,8 +105,7 @@ function isDark(color: string): boolean {
 }
 
 /**
- * The menu's colours from the host theme. Linear's #f1f1f1 hover on white is
- * the foreground at about 5.5%; a dark surface needs a little more to read.
+ * The menu's colours from the host theme. Rows use the shared 5% hover fill.
  * The shadow is the one fixed colour (the theme has no shadow token): soft
  * and wide on light, deeper on dark where a light shadow vanishes.
  */
@@ -120,7 +119,7 @@ export function menuChrome(theme: PluginTheme): MenuChrome {
     chrome = {
       background: colors.surface0,
       border: colors.border,
-      hover: mix(colors.surface0, colors.foreground, dark ? 0.08 : 0.055),
+      hover: mix(colors.surface0, colors.foreground, 0.05),
       shadow: dark
         ? "0px 4px 24px rgba(0, 0, 0, 0.45), 0px 1px 3px rgba(0, 0, 0, 0.3)"
         : "0px 4px 24px rgba(0, 0, 0, 0.08), 0px 1px 3px rgba(0, 0, 0, 0.04)",
@@ -156,9 +155,9 @@ export function layoutMenu(sections: readonly MenuSection[], scale = 1): { rows:
   return { rows, height: y + MENU.padV };
 }
 
-/** A searchable menu's field and the 1 pt box of its hairline, with the UI scale's growth. */
+/** A searchable menu's top inset, scaled field and the 1 pt box of its hairline. */
 export function menuSearchHeight(scale = 1): number {
-  return Math.round(MENU.searchHeight * Math.max(1, scale)) + 1;
+  return MENU.padV + Math.round(MENU.searchHeight * Math.max(1, scale)) + 1;
 }
 
 /**

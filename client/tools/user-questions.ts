@@ -1,11 +1,13 @@
+import type { ToolCallTimelineItem } from "@getpaseo/protocol/agent-types";
 import type { ToolCallView } from "./classify";
+import { readCodexAsyncQuestions } from "./codex-questions";
 
 export interface UserQuestion {
   id?: string;
   question: string;
   header?: string;
   multiSelect: boolean;
-  options: { label: string; description?: string }[];
+  options: { label: string; description?: string; preview?: string }[];
   answer?: string;
   selected?: string[];
 }
@@ -33,6 +35,32 @@ function text(value: unknown): string | undefined {
 }
 
 const QUESTION_TOOLS = new Set(["askuserquestion", "request_user_input", "request_user_input_async", "ask", "ask_user", "ask_user_question", "question"]);
+
+/**
+ * A call to a tool that asks the user, by name alone. Some providers record
+ * one with text only (OMP's `ask`, Pi's `ask_user`), which no card reads back,
+ * yet it is still a question.
+ */
+export function isQuestionTool(name: string | null | undefined): boolean {
+  return QUESTION_TOOLS.has(name?.toLowerCase() ?? "");
+}
+
+/**
+ * The structured questions a call carries besides its detail, as its
+ * timeline row reads them: the host's `metadata.questions` (Codex's
+ * `request_user_input`), or the text of Codex's async questions.
+ */
+export function timelineQuestionData(item: ToolCallTimelineItem): Record<string, unknown> | undefined {
+  const metadata = item.metadata;
+  if (Array.isArray(metadata?.questions)) return {
+    questions: metadata.questions,
+    ...(metadata.answers !== undefined ? { answers: metadata.answers } : {}),
+    ...(metadata.questionResult !== undefined ? { result: metadata.questionResult } : {}),
+    ...(metadata.questionStatus !== undefined ? { status: metadata.questionStatus } : {}),
+  };
+  return item.name === "request_user_input_async" && item.detail.type === "plain_text"
+    ? readCodexAsyncQuestions(item.detail.text) : undefined;
+}
 
 function answerValues(value: unknown): string[] | undefined {
   if (typeof value === "string") return [value];
@@ -69,7 +97,7 @@ export function readUserQuestions(call: ToolCallView): UserQuestionData | undefi
       const option = record(value);
       const label = text(value) ?? text(option?.label);
       if (!label) return undefined;
-      options.push({ label, description: text(option?.description) });
+      options.push({ label, description: text(option?.description), ...(text(option?.preview) ? { preview: text(option?.preview) } : {}) });
     }
     questions.push({ id: text(row.id), question, header: text(row.header),
       multiSelect: row.multiSelect === true || row.multi === true || row.multiple === true || row.allowMultiple === true, options });
@@ -82,7 +110,8 @@ export function readUserQuestions(call: ToolCallView): UserQuestionData | undefi
   const positionalAnswers = Array.isArray(input.answers) ? input.answers : Array.isArray(output?.answers) ? output.answers : undefined;
   const transcriptResponse = call.questionData && call.status !== "running" && input.status !== "pending" && input.status !== "dismissed" ? text(call.text) : undefined;
   const response = text(output?.output) ?? (output?.answers ? undefined : text(call.output)) ?? transcriptResponse;
-  const summary = response?.match(/^(?:Your questions have been answered|User has answered your questions): ([\s\S]*)\. You can now continue with (?:the (?:user's )?|these )answers in mind\.$/)?.[1];
+  const summary = response?.match(/^(?:Your questions have been answered|User has answered your questions): ([\s\S]*)\. You can now continue with (?:the (?:user's )?|these )answers in mind\.$/)?.[1] ??
+    response?.match(/^The user answered: ([\s\S]*)\. Read the answers carefully \u2014 they may request clarification, changes, or that you not proceed \u2014 and follow what they actually say\.$/)?.[1];
   for (const [index, question] of questions.entries()) {
     const value = (question.id ? answers?.[question.id] : undefined) ?? answers?.[question.question] ??
       (question.header ? answers?.[question.header] : undefined);

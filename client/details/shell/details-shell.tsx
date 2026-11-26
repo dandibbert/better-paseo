@@ -1,5 +1,5 @@
 /**
- * The block details panel (docs/prototypes/block-details-sheet.md): the open
+ * The block details panel (https://github.com/RoundRedDot/better-paseo/blob/f2ab453297c4ccb88a08e2129af0cb3528c4e628/docs/prototypes/block-details-sheet.md): the open
  * block's preview drawn as a bottom drawer (phone), a floating bottom panel
  * (tablet) or a right-hand side panel (wide windows), chosen by the window.
  *
@@ -20,11 +20,12 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Animated, Modal, Platform, StyleSheet, View, useWindowDimensions, type ViewStyle } from "react-native";
 import { useRpc } from "@getpaseo/plugin/client";
-import { Icon } from "@getpaseo/plugin/client/react-native";
+import { Icon, useToast } from "@getpaseo/plugin/client/ui";
 import type { ExtendedThemeTokens } from "../../components/theme-tokens";
 import { DetailsShellContext, type BlockEntry, type Detent, type DetailsForm, type DetailsShellValue, type DetailsZoom } from "../contracts";
+import { TranslationSettingsParentCloseContext } from "../../translation/navigation";
 import { useBlock, useBlockList } from "../block-registry";
-import { detailsApi, useDetails } from "../details-store";
+import { closeDetailsIfCurrent, detailsApi, useDetails } from "../details-store";
 import { DETAILS_BREAKPOINTS, floatingWidth } from "../layout-model";
 import { SWIPE_DISTANCE_RATIO, swipeDecision } from "../gesture-model";
 import { HoverPreviewContext, PreviewActionsContext, PreviewChromeContext, usePanelWrap, type PreviewActions } from "../../ui/hover-preview";
@@ -38,20 +39,22 @@ import { useReducedMotion } from "../../ui/use-reduced-motion";
 import { holdHostGestures } from "../../ui/hold-host-gestures";
 import { useListScrollLock } from "../../ui/scroll-anchor";
 import { revealPathRpc } from "../../../shared/file-rpc";
+import { revealWithSetting } from "../../i18n/file-open-error";
 import { DETAILS_MOTION, animate } from "./motion";
 import { OVERDRAG, panelResponder, type DragTarget } from "./gestures";
 import { useSafeInsets } from "./safe-area";
 import { useDetailsLayout } from "./use-details-layout";
-import { bindDetailsLayer, keepOffWindowDrag, layerTakesKey, webBodyAtTop } from "./web-layer";
+import { bindDetailsLayer, bindTimelineSpace, bindWorkOutsideClick, keepOffWindowDrag, layerTakesKey, webBodyAtTop } from "./web-layer";
 import { bindDetailsKeys, registerDetailsKeyboardActions } from "../keyboard";
 import { useCopy } from "../../ui/use-copy";
 import { canProbeOlder, noteNavigation, stepDetails, syncTimeline, useHostList } from "./timeline-sync";
 import { DetailsBodyContext, createBodyScroll } from "./body-handover";
+import { createZoomControls } from "./zoom-controls";
 import { BottomDrawer } from "./bottom-drawer";
 import { FloatingPanel } from "./floating-panel";
 import { SidePanel, sideWidth } from "./side-panel";
 import type { Entrance } from "./bottom-panel";
-import { DETAILS_FONT_SIZE_DEFAULT } from "../../../shared/preferences-settings";
+import { clampDetailsFontSize, DETAILS_FONT_SIZE_DEFAULT } from "../../../shared/preferences-settings";
 
 /** Where the open block sits among the navigable blocks: 1-based, 0 when it is not one. */
 export function navigationOf(list: readonly BlockEntry[], id: string): { index: number; count: number; first: string | null } {
@@ -95,10 +98,10 @@ export function DetailsShell({ agentId, tokens }: { agentId: string; tokens: Ext
     setLastId(null);
   }, [agentId]);
   if (!shownId || !entry) return null;
-  return <OpenShell agentId={agentId} tokens={tokens} entry={entry} openId={state.openId} detent={state.detent} fullscreen={state.fullscreen} storeForm={state.form} onExited={onExited} />;
+  return <OpenShell agentId={agentId} tokens={tokens} entry={entry} openId={state.openId} detent={state.detent} fullscreen={state.fullscreen} storeForm={state.form} docked={state.docked === true} onExited={onExited} />;
 }
 
-function OpenShell({ agentId, tokens, entry, openId, detent, fullscreen, storeForm, onExited }: {
+function OpenShell({ agentId, tokens, entry, openId, detent, fullscreen, storeForm, docked, onExited }: {
   agentId: string;
   tokens: ExtendedThemeTokens;
   entry: BlockEntry;
@@ -107,6 +110,7 @@ function OpenShell({ agentId, tokens, entry, openId, detent, fullscreen, storeFo
   detent: Detent;
   fullscreen: boolean;
   storeForm: DetailsForm;
+  docked: boolean;
   onExited(): void;
 }) {
   const leaving = openId === null;
@@ -117,14 +121,17 @@ function OpenShell({ agentId, tokens, entry, openId, detent, fullscreen, storeFo
   const paneRef = useRef<View>(null);
   const anchor = useCallback(() => paneRef.current, []);
   const host = useHostList(agentId, anchor);
-  const layout = useDetailsLayout(pointer, host);
+  // "Open in panel" asks for the side: make room in the timeline as work details do.
+  const reserveTimeline = entry.reserveTimeline === true || docked;
+  const layout = useDetailsLayout(pointer, host, reserveTimeline);
   const [insets, insetProbe] = useSafeInsets();
   const lockList = useListScrollLock();
   const revealPath = useRpc(revealPathRpc);
+  const toast = useToast();
   const cwd = useRef<string | undefined>(undefined);
   const reveal = useCallback((path: string) => {
-    void revealPath({ cwd: cwd.current ?? "", path }).catch(() => {});
-  }, [revealPath]);
+    revealWithSetting(revealPath, toast, cwd.current ?? "", path);
+  }, [revealPath, toast]);
   const paths = usePathContextValue(agentId, reveal);
   cwd.current = paths.cwd;
 
@@ -154,6 +161,7 @@ function OpenShell({ agentId, tokens, entry, openId, detent, fullscreen, storeFo
 
   // The form drawn, which trails the layout's by the form change's fade.
   const [form, setForm] = useState<DetailsForm>(layout.form);
+  const shownPanel = useRef(false);
   const [entrance, setEntrance] = useState<Entrance>(quiet ? "none" : "slide");
   const formFade = useRef(new Animated.Value(1)).current;
   const panelTop = useRef<number | null>(null);
@@ -162,6 +170,10 @@ function OpenShell({ agentId, tokens, entry, openId, detent, fullscreen, storeFo
   useEffect(() => {
     if (layout.form === form) return;
     const next = layout.form;
+    if (!shownPanel.current) {
+      setForm(next);
+      return;
+    }
     const animation = animate(formFade, 0, latest.current.reduced ? DETAILS_MOTION.reducedMs : DETAILS_MOTION.formOutMs, () => {
       const now = latest.current;
       // Full screen does not carry into or out of the side panel: it opens at its initial size.
@@ -182,6 +194,10 @@ function OpenShell({ agentId, tokens, entry, openId, detent, fullscreen, storeFo
   }, [agentId, storeForm, form]);
 
   const close = useCallback(() => detailsApi.close(agentId), [agentId]);
+  useEffect(() => {
+    if (form !== "side" || openId !== entry.id) return;
+    return bindWorkOutsideClick(layerRef.current, entry.id, () => closeDetailsIfCurrent(agentId, entry.id));
+  }, [agentId, entry.id, form, openId]);
 
   // ‹ › and the header swipe.
   const list = useBlockList(agentId);
@@ -202,6 +218,15 @@ function OpenShell({ agentId, tokens, entry, openId, detent, fullscreen, storeFo
   const panelWidth = form === "side" ? sideWidth(layout.stage, fullscreen)
     : form === "floating" ? floatingWidth(layout.stage.width)
       : layout.stage.width;
+  const timelineSpace = useRef<ReturnType<typeof bindTimelineSpace> | null>(null);
+  useLayoutEffect(() => {
+    if (Platform.OS !== "web" || !pointer || !reserveTimeline || form !== "side" || leaving || !layout.ready) return;
+    const reservation = bindTimelineSpace(paneRef.current);
+    timelineSpace.current = reservation;
+    reservation.setWidth(panelWidth);
+    return () => { timelineSpace.current = null; reservation.release(); };
+  }, [reserveTimeline, form, leaving, layout.ready, pointer]);
+  useLayoutEffect(() => { timelineSpace.current?.setWidth(panelWidth); }, [panelWidth]);
   const navRef = useRef({ nav, canStep, panelWidth });
   navRef.current = { nav, canStep, panelWidth };
   const slideTo = useCallback((direction: -1 | 1) => {
@@ -333,6 +358,7 @@ function OpenShell({ agentId, tokens, entry, openId, detent, fullscreen, storeFo
   }, [runSync]);
 
   const bodyScroll = useMemo(() => createBodyScroll(), []);
+  const zoomControls = useMemo(() => createZoomControls(), []);
 
   // Phones keep the timeline's body size; tablets use a denser 7/8 ratio.
   // The saved pinch value scales either relative to the host's content size.
@@ -342,10 +368,12 @@ function OpenShell({ agentId, tokens, entry, openId, detent, fullscreen, storeFo
   const window = useWindowDimensions();
   const proseScale = Math.min(window.width, window.height) < DETAILS_BREAKPOINTS.drawerEnter ? 1 : 7 / 8;
   const textSize = liveZoom ?? detailsFontSize;
-  const textZoom = zooms ? Math.round(tokens.typography.content.size * proseScale * textSize / DETAILS_FONT_SIZE_DEFAULT) : 0;
+  const textZoom = useMemo(() => zooms ? Math.round(tokens.typography.content.size * proseScale * textSize / DETAILS_FONT_SIZE_DEFAULT)
+    : textSize === DETAILS_FONT_SIZE_DEFAULT ? 0 : { scale: textSize / DETAILS_FONT_SIZE_DEFAULT },
+  [zooms, tokens.typography.content.size, proseScale, textSize]);
   const zoomRef = useRef(textSize);
   zoomRef.current = textSize;
-  const zoom = useMemo<DetailsZoom | undefined>(() => (zooms ? {
+  const zoom = useMemo<DetailsZoom>(() => ({
     base: DETAILS_FONT_SIZE_DEFAULT,
     current: () => zoomRef.current,
     preview(next) {
@@ -357,19 +385,23 @@ function OpenShell({ agentId, tokens, entry, openId, detent, fullscreen, storeFo
       if (getEnhancerPreferences().detailsFontSize !== next) updateEnhancerPreferences({ detailsFontSize: next });
       setLiveZoom(null);
     },
-  } : undefined), [zooms]);
+  }), []);
 
   // Web keys while the panel is open (`keyboard.ts`): only this lease holder's
   // layer, and only while its pane is shown. ← → take the panel's own step.
   const { copy } = useCopy();
-  const keys = useRef({ step, toggleWrap, toggleFullscreen, copy });
-  keys.current = { step, toggleWrap, toggleFullscreen, copy };
+  const keys = useRef({ step, toggleWrap, toggleFullscreen, copy, zoom });
+  keys.current = { step, toggleWrap, toggleFullscreen, copy, zoom };
   useEffect(() => {
     if (Platform.OS !== "web" || leaving) return;
     const unregister = registerDetailsKeyboardActions(agentId, {
       step: (direction) => keys.current.step(direction),
       toggleWrap: () => keys.current.toggleWrap(),
       toggleFullscreen: () => keys.current.toggleFullscreen(),
+      changeFontSize: (change) => {
+        const zoom = keys.current.zoom;
+        zoom.commit(change === 0 ? zoom.base : clampDetailsFontSize(zoom.current() + change));
+      },
       copyPrimary: () => {
         const primary = latest.current.entry.copies()[0];
         if (primary?.text) void keys.current.copy(primary.text, { label: primary.label });
@@ -398,7 +430,8 @@ function OpenShell({ agentId, tokens, entry, openId, detent, fullscreen, storeFo
     toggleFullscreen,
     headerHandlers: touch ? (headerPan.panHandlers as unknown as Record<string, unknown>) : undefined,
     zoom,
-  }), [agentId, entry, form, detent, fullscreenOn, pointer, nav.index, nav.count, canStep, step, close, toggleFullscreen, touch, headerPan, zoom]);
+    zoomControls,
+  }), [agentId, entry, form, detent, fullscreenOn, pointer, nav.index, nav.count, canStep, step, close, toggleFullscreen, touch, headerPan, zoom, zoomControls]);
   const actions = useMemo<PreviewActions>(() => ({
     maximizable: true,
     maximized: fullscreenOn,
@@ -412,6 +445,7 @@ function OpenShell({ agentId, tokens, entry, openId, detent, fullscreen, storeFo
   }), [toggleFullscreen, fullscreenOn, close, entry.id, memory, wrapOn, toggleWrap, tokens]);
 
   const content = (
+    <TranslationSettingsParentCloseContext.Provider value={close}>
     <DetailsShellContext.Provider value={shellValue}>
       <PreviewChromeContext.Provider value="details">
         <HoverPreviewContext.Provider value>
@@ -449,9 +483,12 @@ function OpenShell({ agentId, tokens, entry, openId, detent, fullscreen, storeFo
         </HoverPreviewContext.Provider>
       </PreviewChromeContext.Provider>
     </DetailsShellContext.Provider>
+    </TranslationSettingsParentCloseContext.Provider>
   );
 
-  const frame = insets === null ? null : form === "side" ? (
+  const ready = layout.ready && (shownPanel.current || form === layout.form);
+  if (ready && insets !== null) shownPanel.current = true;
+  const frame = insets === null || !ready ? null : form === "side" ? (
     <SidePanel
       key="side"
       tokens={tokens}
@@ -462,7 +499,9 @@ function OpenShell({ agentId, tokens, entry, openId, detent, fullscreen, storeFo
       leaving={leaving}
       onExited={onExited}
       wide={fullscreen}
-      resizable={pointer && Platform.OS === "web"}
+      resizable={pointer && Platform.OS === "web" || Platform.OS === "ios" && Platform.isPad}
+      onResizeStart={() => { if (fullscreen) detailsApi.setFullscreen(agentId, false); }}
+      onWidthChange={(width) => timelineSpace.current?.setWidth(width)}
       onOutside={close}
     >
       {content}

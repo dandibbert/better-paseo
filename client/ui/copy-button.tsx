@@ -1,15 +1,17 @@
 import React, { useCallback } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
-import { Icon } from "@getpaseo/plugin/client/react-native";
+import { Icon } from "@getpaseo/plugin/client/ui";
 import type { ExtendedThemeTokens } from "../components/theme-tokens";
-import { radiusV2, space } from "../components/theme-tokens";
+import { space } from "../components/theme-tokens";
 import { unselectable } from "../components/selection";
 import { useCopy, type CopyFeedback } from "./use-copy";
 import { useHover } from "./use-hover";
+import { iconHoverSize } from "./icon-hover-size";
 import { UI_SCALE } from "./tokens/typography";
 
 /** Visual box; `hitSlop` brings the touch target to 32 (plan §3.8, §3.11). */
-const BOX = 24;
+export const COPY_BUTTON_BOX = 24;
+const BOX = COPY_BUTTON_BOX;
 const HIT_SLOP = (32 - BOX) / 2;
 const ICON = 14;
 
@@ -54,11 +56,17 @@ export function CopyButton({
       style={({ pressed }) => [
         styles.button,
         showLabel && styles.withLabel,
-        hovered && { backgroundColor: tokens.v2.surface1 },
-        pressed && { backgroundColor: tokens.v2.surface2 },
+        showLabel && hovered && { backgroundColor: tokens.v2.surface1 },
+        showLabel && pressed && { backgroundColor: tokens.v2.surface2 },
       ]}
     >
-      <View style={styles.icon}>
+      {({ pressed }) => <>
+      <View pointerEvents="none" testID={!showLabel && (hovered || pressed) ? "copy-icon-fill" : undefined}
+        style={[styles.icon, !showLabel && (hovered || pressed) && {
+          width: iconHoverSize(ICON), height: iconHoverSize(ICON), borderRadius: iconHoverSize(ICON) / 2,
+          // The same fill as a toolbar icon. surface1 is the code block itself, so a hover in that colour never shows.
+          backgroundColor: tokens.v2.surface2,
+        }]}>
         <Icon name={copied ? "Check" : "Copy"} size={ICON} color={color} />
       </View>
       {showLabel ? (
@@ -69,6 +77,7 @@ export function CopyButton({
           {copied ? "Copied" : label}
         </Text>
       ) : null}
+      </>}
     </Pressable>
   );
 }
@@ -77,7 +86,7 @@ const styles = StyleSheet.create({
   button: {
     minWidth: BOX,
     height: BOX,
-    borderRadius: radiusV2.chip,
+    borderRadius: BOX / 2,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",

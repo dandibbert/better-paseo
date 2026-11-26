@@ -5,24 +5,22 @@
 import type { PluginTimelineTransformResult } from "@getpaseo/plugin";
 import type { CompactionTimelineItem, ToolCallTimelineItem } from "@getpaseo/protocol/agent-types";
 import { toolErrorText } from "./error-text";
-import { isTaskEcho } from "./task-notification";
-import { readCodexAsyncQuestions } from "./codex-questions";
+import { isUndrawnCall } from "./undrawn-call";
+import { timelineQuestionData } from "./user-questions";
 import { agentMessageFromDetail, agentMessageSchema, senderlessAgentMessage } from "./agent-message";
 import {
   isNativeGenUiToolName,
   isNativeTerminalControlToolName,
   isNativeUserShellToolCall,
 } from "./native-genui";
+import { showToolAtLevel } from "./timeline-level";
+import { standardFoldActive } from "./standard-fold";
+import type { EnhancerPreferences } from "../preferences";
 
 type JsonValue = boolean | null | number | string | JsonValue[] | { [key: string]: JsonValue };
 
 function toJsonValue(value: unknown): JsonValue {
   return value as JsonValue;
-}
-
-function isEmptyTerminalPoll(detail: unknown): boolean {
-  const plain = detail as { type?: unknown; label?: unknown; text?: unknown };
-  return plain.type === "plain_text" && !plain.label && !plain.text;
 }
 
 /** What a task notification's row reads of its metadata. */
@@ -83,18 +81,11 @@ export function transformToolCall({ item, phase }: {
   // The rest can be large and no row reads it.
   // A task notification that only repeats its command's row is not drawn at all.
   const taskNotification = item.name === "task_notification";
-  if (taskNotification && isTaskEcho(item.detail as Record<string, unknown>, item.metadata)) return { items: [] };
-  // Codex polling a terminal it names nothing about says nothing at all.
-  if (item.name === "terminal" && item.status === "completed" && isEmptyTerminalPoll(item.detail)) return { items: [] };
+  // So does Codex polling a terminal it names nothing about.
+  if (isUndrawnCall(item)) return { items: [] };
   const approved = item.metadata?.approved;
   const metadata = item.metadata;
-  const questionData = Array.isArray(metadata?.questions) ? {
-    questions: metadata.questions,
-    ...(metadata.answers !== undefined ? { answers: metadata.answers } : {}),
-    ...(metadata.questionResult !== undefined ? { result: metadata.questionResult } : {}),
-    ...(metadata.questionStatus !== undefined ? { status: metadata.questionStatus } : {}),
-  } : item.name === "request_user_input_async" && item.detail.type === "plain_text"
-    ? readCodexAsyncQuestions(item.detail.text) : undefined;
+  const questionData = timelineQuestionData(item);
   return {
     items: [
       {
@@ -116,4 +107,24 @@ export function transformToolCall({ item, phase }: {
       },
     ],
   };
+}
+
+/**
+ * The `tool_call` transformer under the reader's preferences: the level's
+ * filter, then the row. Standard folds successful edits into the assistant
+ * reply's work card only while the plugin draws that reply (`standardFoldActive`).
+ */
+export function transformToolCallAt(input: { item: ToolCallTimelineItem; phase: "streaming" | "complete" },
+  preferences: Pick<EnhancerPreferences, "chatEnabled" | "timelineLevel" | "assistantMarkdown">,
+): PluginTimelineTransformResult | undefined {
+  if (input.item.type !== "tool_call") return undefined;
+  if (
+    isNativeGenUiToolName(input.item.name) ||
+    isNativeTerminalControlToolName(input.item.name) ||
+    isNativeUserShellToolCall(input.item.detail)
+  ) {
+    return undefined;
+  }
+  if (!showToolAtLevel(input.item, preferences.timelineLevel, standardFoldActive(preferences))) return { items: [] };
+  return transformToolCall(input);
 }

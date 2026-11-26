@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useMemo, useRef } from "react";
+import React, { createContext, useCallback, useContext, useMemo, useRef } from "react";
 import { Platform, View } from "react-native";
 import type { ExtendedThemeTokens } from "../theme-tokens";
 import { selectionSurface } from "../selection-actions";
@@ -11,9 +11,10 @@ import { repairTail } from "./repair";
 import type { RenderContext } from "./render/context";
 import { MdBlock } from "./render/md-block";
 import { buildStyles, variantMetrics, type MarkdownVariant } from "./render/styles";
-import { useZoomedTokens } from "../../ui/text-zoom";
+import { TextZoomContext, useZoomedTokens } from "../../ui/text-zoom";
 import { dismissBlockSelection } from "./render/block-selection";
 import { NativeFileLinkContext, NativeLinkMenuContext } from "./native-file-links";
+import { SelectionTranslationContext, bindSelectionScopeElement, selectionScopeDataSet } from "../../translation/selection";
 
 export { MARKDOWN_VARIANTS, type MarkdownVariant } from "./render/styles";
 
@@ -26,6 +27,8 @@ export const TimelineProseContext = createContext(false);
 
 export interface MarkdownViewProps {
   text: string;
+  /** Interpret structured directives in an assistant reply. */
+  codexDirectives?: boolean;
   /** Optional inline decoration, leaving Markdown layout and parsing intact. */
   renderText?(text: string): React.ReactNode;
   /** False for a continuation row of the same reply. */
@@ -46,6 +49,8 @@ export interface MarkdownViewProps {
   compact?: boolean;
   /** One step quieter: muted text a size down (a thought, not the answer). */
   quiet?: boolean;
+  /** Whether native double-tap block selection is enabled. */
+  blockSelection?: boolean;
   /**
    * Metrics base instead of the reply's content size. Tool and thought prose
    * pass `blockProseBase`, which equals the content size at the default block
@@ -70,8 +75,8 @@ interface Split {
   tail: string;
 }
 
-function split(text: string, cache: BlockCache, streaming: boolean): Split {
-  const blocks = splitBlocks(text, cache);
+function split(text: string, cache: BlockCache, streaming: boolean, codex: boolean): Split {
+  const blocks = splitBlocks(text, cache, codex);
   const last = blocks[blocks.length - 1] ?? "";
   return { blocks, tail: streaming ? repairTail(last) : last };
 }
@@ -84,6 +89,7 @@ function split(text: string, cache: BlockCache, streaming: boolean): Split {
  */
 export function MarkdownView({
   text,
+  codexDirectives = false,
   renderText,
   firstBlock = true,
   listContinuation = false,
@@ -93,6 +99,7 @@ export function MarkdownView({
   collapseCode = false,
   compact = false,
   quiet = false,
+  blockSelection = true,
   size,
   onRevealPath,
   probeId,
@@ -101,9 +108,9 @@ export function MarkdownView({
   const tokens = useZoomedTokens(given);
   // One cache per message, owned by this component: never shared with
   // another reply that streams at the same time.
-  const cacheRef = useRef<BlockCache | null>(null);
-  if (cacheRef.current === null) cacheRef.current = createBlockCache();
-  const cache = cacheRef.current;
+  const cacheRef = useRef<{ codex: boolean; cache: BlockCache } | null>(null);
+  if (cacheRef.current === null || cacheRef.current.codex !== codexDirectives) cacheRef.current = { codex: codexDirectives, cache: createBlockCache() };
+  const cache = cacheRef.current.cache;
   // The flip probe compares a view with its own previous parse. `probeId`
   // names the message by timestamp, and several replies can share a
   // millisecond (seen on web history-100: 41 "flips" between unrelated
@@ -116,14 +123,14 @@ export function MarkdownView({
   const instance = probeId === undefined ? undefined : instanceRef.current?.instance;
 
   const { blocks, tail } = useMemo(() => {
-    if (!perfOn()) return split(text, cache, streaming);
+    if (!perfOn()) return split(text, cache, streaming, codexDirectives);
     let result: Split = { blocks: [], tail: "" };
     probeMarkdown(instance, text, (source) => {
-      result = split(source, cache, streaming);
+      result = split(source, cache, streaming, codexDirectives);
       const last = result.blocks.length - 1;
       const kinds = result.blocks.map((raw, index) => ({
         kind: blockKind(
-          index === last ? lexBlock(result.tail, streaming) : lexBlock(raw),
+          index === last ? lexBlock(result.tail, streaming, codexDirectives) : lexBlock(raw, false, codexDirectives),
         ),
       }));
       // A tail the repair held back entirely (a lone `#` or `-`) draws
@@ -132,7 +139,7 @@ export function MarkdownView({
       return kinds;
     });
     return result;
-  }, [text, cache, streaming, instance]);
+  }, [text, cache, streaming, instance, codexDirectives]);
 
   // Sizes follow the host's content size (S7 §2.3); the metrics object is
   // cached per input, so the context — and every finished block — stays put
@@ -140,9 +147,11 @@ export function MarkdownView({
   const openNativeFileLink = useContext(NativeFileLinkContext);
   const showNativeLinkMenu = useContext(NativeLinkMenuContext);
   const timelineProse = useContext(TimelineProseContext) && size !== undefined;
+  const zoom = useContext(TextZoomContext);
+  const scaledSize = size !== undefined && typeof zoom !== "number" ? Math.round(size * zoom.scale) : size;
   const metrics = timelineProse
     ? variantMetrics(variant, tokens.typography.content.size, compact)
-    : variantMetrics(variant, size ?? tokens.typography.content.size, compact, quiet);
+    : variantMetrics(variant, scaledSize ?? tokens.typography.content.size, compact, quiet);
   const styles = useMemo(() => buildStyles(tokens, variant, metrics, quiet), [tokens, variant, metrics, quiet]);
   // iOS only: elsewhere prose is the same `Text` either way, and the context
   // must stay put when the reply settles so finished blocks are not redrawn.
@@ -155,12 +164,14 @@ export function MarkdownView({
       variant,
       collapseCode,
       plainProse,
+      codexDirectives,
+      blockSelection,
       onRevealPath,
       onOpenFileLink: openNativeFileLink ?? undefined,
       onShowLinkMenu: showNativeLinkMenu ?? undefined,
       renderText,
     }),
-    [styles, tokens, metrics, variant, collapseCode, plainProse, onRevealPath, openNativeFileLink, showNativeLinkMenu, renderText],
+    [styles, tokens, metrics, variant, collapseCode, plainProse, codexDirectives, blockSelection, onRevealPath, openNativeFileLink, showNativeLinkMenu, renderText],
   );
 
   // A streamed chunk changes the tail and leaves every block before it as it
@@ -190,12 +201,27 @@ export function MarkdownView({
     return next.map((block) => block.node);
   }, [displayBlocks, streaming, context, firstBlock]);
 
+  // On web the selection bar is DOM and reads the conversation a selection
+  // belongs to from the surface it was made in.
+  // The element itself carries the scope and its translator (React Native Web
+  // hands the DOM node to the ref); the attributes only mark it for `closest`.
+  const scope = useContext(SelectionTranslationContext);
+  const web = Platform.OS === "web";
+  const scopeData = web ? selectionScopeDataSet(scope) : null;
+  const surface = metrics.mono ? surfaceProps(selectionSurface, codeSurface) : selectionSurface;
+  const bindScope = useCallback((node: View | null) => {
+    if (!node || !scope) return;
+    bindSelectionScopeElement(node, scope);
+    return () => bindSelectionScopeElement(node, null);
+  }, [scope]);
+
   return (
     // The terminal variant sets the whole body in the mono face, so the whole
     // reply is a code surface the host's UI font rule must skip.
     <View
-      onTouchStart={dismissBlockSelection}
-      {...(metrics.mono ? surfaceProps(selectionSurface, codeSurface) : selectionSurface)}
+      ref={web && scope ? bindScope : undefined}
+      onTouchStart={blockSelection ? dismissBlockSelection : undefined}
+      {...(scopeData ? surfaceProps(surface, { dataSet: scopeData } as never) : surface)}
       style={[styles.root, !firstBlock && { paddingTop: listContinuation ? metrics.itemGap : metrics.blockGap }]}
     >
       {nodes}

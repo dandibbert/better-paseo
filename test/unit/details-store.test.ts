@@ -34,6 +34,38 @@ describe("details store", () => {
     vi.useRealTimers();
   });
 
+  it("docks a panel opened at the side, keeps it docked while stepping, and not on a later plain open", () => {
+    const agentId = "details-docked";
+    const registrations = [
+      registerBlock(entry("one", agentId, { seq: 1 })),
+      registerBlock(entry("two", agentId, { seq: 2 })),
+    ];
+    let state!: DetailsState;
+    function StateProbe() {
+      state = useDetails(agentId);
+      return null;
+    }
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => { renderer = TestRenderer.create(React.createElement(StateProbe)); });
+
+    act(() => { detailsApi.open(agentId, "one"); });
+    expect(state.docked).toBe(false);
+    act(() => { detailsApi.open(agentId, "one", { form: "side" }); });
+    expect(state.docked).toBe(true);
+    act(() => { detailsApi.step(agentId, 1); });
+    expect(state).toMatchObject({ openId: "two", docked: true });
+    act(() => { detailsApi.close(agentId); });
+    // Still docked while the exit plays, so the closing panel keeps its form.
+    expect(state).toMatchObject({ openId: null, docked: true });
+    act(() => { detailsApi.open(agentId, "one"); });
+    expect(state.docked).toBe(false);
+    act(() => { detailsApi.open(agentId, "two", { form: "floating" }); });
+    expect(state.docked).toBe(false);
+
+    act(() => renderer.unmount());
+    registrations.forEach((registration) => registration.release());
+  });
+
   it("opens, changes fields, steps over inert entries, and stops at the ends", () => {
     const agentId = "details-api";
     const openFirst = vi.fn();
@@ -133,6 +165,33 @@ describe("details store", () => {
     expect(phases.b).toBe("off");
     expect(renders.other).toBe(initial.other);
     act(() => { renderer.unmount(); });
+  });
+
+  it("clears the marker immediately but keeps an independent host through the exit", () => {
+    vi.useFakeTimers();
+    const agentId = "details-independent-exit";
+    let state!: DetailsState;
+    let phase = "";
+    function Probe() {
+      state = useDetails(agentId);
+      phase = useMarkerPhase(agentId, "work");
+      return null;
+    }
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => { renderer = TestRenderer.create(React.createElement(Probe)); });
+    act(() => { detailsApi.open(agentId, "work", { independent: true }); });
+    act(() => { detailsApi.close(agentId, { clearMarker: true }); });
+    expect(state).toMatchObject({ openId: null, lingerId: null, independent: true });
+    expect(phase).toBe("off");
+    act(() => { vi.advanceTimersByTime(180); });
+    expect(state.independent).toBe(true);
+    act(() => { detailsApi.open(agentId, "work", { independent: true }); });
+    act(() => { vi.advanceTimersByTime(MARKER_LINGER_MS); });
+    expect(state).toMatchObject({ openId: "work", independent: true });
+    act(() => { detailsApi.close(agentId, { clearMarker: true }); });
+    act(() => { vi.advanceTimersByTime(MARKER_LINGER_MS); });
+    expect(state).toMatchObject({ openId: null, independent: false });
+    act(() => renderer.unmount());
   });
 
   it("hands the host lease to the next claimant and notifies subscribers", () => {

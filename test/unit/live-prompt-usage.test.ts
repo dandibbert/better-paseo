@@ -26,6 +26,10 @@ vi.mock("@getpaseo/plugin/client", async () => {
     useRpc: () => async () => null,
   };
 });
+vi.mock("@getpaseo/plugin/client/ui", async (original) => ({
+  ...(await original<typeof import("@getpaseo/plugin/client/ui")>()),
+  useToast: () => ({ show() {}, error() {} }),
+}));
 vi.mock("../../client/ui/chat-composer", async () => {
   const ReactModule = await import("react");
   return { ChatComposerContext: ReactModule.createContext(null) };
@@ -36,7 +40,8 @@ vi.mock("../../client/preferences", () => ({
     toolDetail: "collapsed", markdownVariant: "document", pathDisplay: "relative", previewWrap: true,
   }),
 }));
-vi.mock("../../client/components/theme-tokens", () => ({
+vi.mock("../../client/components/theme-tokens", async (original) => ({
+  ...await original<object>(),
   useThemeTokens: () => ({
     fontUi: "system", fontMono: "monospace", foreground: "#111", foregroundMuted: "#666",
     typography: { block: { rowHeight: { compact: 22, desktop: 26 }, caption: { size: 11 } } },
@@ -51,8 +56,9 @@ vi.mock("../../client/components/task-list", () => ({
 vi.mock("../../client/components/task-activity-row", () => ({ TaskActivityRow: () => null }));
 vi.mock("../../client/components/user-message", async () => {
   const ReactModule = await import("react");
+  const { SelectionTranslationContext } = await import("../../client/translation/selection");
   return {
-    UserMessage: ({ footer }: { footer?: React.ReactNode }) => ReactModule.createElement("PromptProbe", null, footer),
+    UserMessage: ({ footer }: { footer?: React.ReactNode }) => ReactModule.createElement("PromptProbe", { translationScope: ReactModule.useContext(SelectionTranslationContext) }, footer),
     TurnUsageRow: (props: Record<string, unknown>) => ReactModule.createElement("UsageProbe", props),
   };
 });
@@ -71,7 +77,8 @@ vi.mock("../../client/components/hub-live", () => ({ TimelineTailHub: () => null
 vi.mock("../../client/components/turn-footer", () => ({ AssistantFooter: () => null }));
 vi.mock("../../client/components/system-card", () => ({ SystemCard: () => null }));
 vi.mock("../../client/components/markdown/markdown-view", () => ({ MarkdownView: () => null }));
-vi.mock("../../client/timeline-tail", () => ({ useTextItemTailKey: () => "reply-key" }));
+vi.mock("../../client/timeline-tail", () => ({ useTextItemTailKey: () => ({ key: "reply-key", previous: null }),
+  useNoteTimelineItem: () => {}, useIsTimelineTail: () => false, useTimelineTailAt: () => null }));
 vi.mock("../../client/timeline-order", () => ({
   useHasEntryAfter: () => false, useNextEntryIsRow: () => false, useTimelineEntry() {},
   useTimelineToolGroup: () => ({ group: null, anythingBelow: false, rowBelow: false, copiesBelow: 0, copiesBelowHeight: 0 }),
@@ -86,7 +93,8 @@ vi.mock("../../client/tools/classify", () => ({ classifyTool: () => ({ title: "R
 vi.mock("../../client/tools/disclosure", () => ({ defaultToolExpanded: () => false, toolDisclosureKey: () => "tool-key" }));
 vi.mock("../../client/debug/perf", () => ({ probeCard: () => ({ node: null, viewProps: {} }), textItemKey: () => "text-key" }));
 vi.mock("../../client/ui/use-revealed-text", () => ({ useRevealedText: (text: string) => text }));
-vi.mock("../../client/state/turn-footers", () => ({ useTurnFooter: () => null }));
+vi.mock("../../client/state/turn-footers", () => ({ useTurnFooter: () => null, useTurnWork: () => ({ store: null, work: null }) }));
+vi.mock("../../client/components/turn-work-card", () => ({ TurnWorkCard: () => null }));
 vi.mock("../../client/state/agent-message-senders", () => ({ useAgentMessageSender: () => null }));
 vi.mock("../../client/state/footer-model", () => ({ useFooterModel: () => ({ modelName: null, thinkingLabel: null }) }));
 vi.mock("../../client/system-envelope", () => ({ parseSystemEnvelope: () => null }));
@@ -127,6 +135,14 @@ const flush = () => act(async () => { for (let index = 0; index < 4; index += 1)
 afterEach(() => { runtime.listeners.clear(); });
 
 describe("live prompt usage", () => {
+  it("provides the originating conversation for prompt selection", async () => {
+    runtime.api = { agents: { ref: () => ({ refresh: runtime.refresh }) } };
+    let renderer!: TestRenderer.ReactTestRenderer;
+    await act(async () => { renderer = TestRenderer.create(prompt("prompt-agent", "message", 0)); });
+    expect(renderer.root.find((node) => (node.type as unknown) === "PromptProbe").props.translationScope)
+      .toMatchObject({ agentId: "prompt-agent", kind: "user_message", streaming: false });
+    act(() => renderer.unmount());
+  });
   it("keeps a finished turn's figures when its row remounts after a newer prompt, without borrowing the newer turn's", async () => {
     runtime.api = { agents: { ref: () => ({ refresh: runtime.refresh }) } };
     runtime.refresh.mockReset().mockImplementation(async () => ({ agent: { lastUsage: runtime.usage } }));

@@ -1,3 +1,4 @@
+vi.mock("../../client/state/home-directory", () => ({ useHomeDirectory: () => "/Users/dev" }));
 import React from "react";
 import TestRenderer, { act, type ReactTestInstance } from "react-test-renderer";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -20,13 +21,17 @@ vi.mock("../../client/web", async (original) => ({
     return () => { if (id) hover.delete(id); };
   },
 }));
-vi.mock("@getpaseo/plugin/client", () => ({ useRpc: () => actions.reveal }));
+vi.mock("@getpaseo/plugin/client", () => ({
+  useRpc: () => actions.reveal,
+  usePaseo: () => ({}),
+  useSettings: () => ({ status: "loading" }),
+}));
 // Node has no matchMedia, which reads as touch and hides Open folder; these are mouse sidebars.
 vi.mock("../../client/ui/use-input-capabilities", async (original) => ({
   ...await original<object>(),
   useInputCapabilities: () => ({ hover: true, touch: false, compact: false, native: false }),
 }));
-vi.mock("@getpaseo/plugin/client/react-native", async () => {
+vi.mock("@getpaseo/plugin/client/ui", async () => {
   const rn = await import("./helpers/rn-mock");
   return {
     Icon: (props: Record<string, unknown>) => React.createElement("Icon", props),
@@ -38,7 +43,7 @@ vi.mock("@getpaseo/plugin/client/react-native", async () => {
 });
 vi.mock("../../client/components/markdown/markdown-view", () => ({ MarkdownView: () => null }));
 vi.mock("../../client/tasks/data/first-prompt", () => ({ useFirstPrompt: () => null }));
-vi.mock("../../client/tasks/data/last-message", () => ({ useLastMessage: () => null, lastMessageVersion: () => "", useLiveReplyCount: () => 0 }));
+vi.mock("../../client/tasks/data/last-message", () => ({ useLastMessage: () => ({ prompt: { state: "idle" }, load() {} }), lastMessageVersion: () => "", useLiveReplyCount: () => 0 }));
 vi.mock("../../client/tasks/data/last-human-message", () => ({ useLastHumanMessage: () => ({ prompt: { state: "idle" }, load() {} }), lastHumanMessageVersion: () => "" }));
 vi.mock("../../client/tasks/data/session-tokens", () => ({ useSessionTokens: () => null }));
 vi.mock("../../client/tasks/data/subagent-timeline", () => ({ useSubagentTimeline: () => ({ firstPrompt: null, lastMessage: null }) }));
@@ -53,6 +58,7 @@ import { BoardTips, CardHints } from "../../client/tasks/cards/card-hints";
 import { TASK_MONO } from "../../client/tasks/typography";
 import { resetSectionChoices } from "../../client/tasks/cards/detail-collapse";
 import { TaskDetailCards, type TaskDetailCardsProps } from "../../client/tasks/cards/detail-cards";
+import { detailColors } from "../../client/tasks/cards/detail-charts";
 import { cardStrings } from "../../client/tasks/cards/strings";
 import { taskTokens } from "../../client/tasks/cards/tokens";
 import { LANE_ORDER } from "../../client/tasks/model";
@@ -118,15 +124,43 @@ function details(language: "zh" | "en", id = "sample-running", overrides: Partia
 }
 
 describe("sidebar action tips", () => {
-  it("uses the toolbar's quiet rounded outline for both header buttons", async () => {
+  it.each(["zh", "en"] as const)("shows the parent title with the parent icon and returns on press in %s", async (language) => {
+    const onPress = vi.fn();
+    const props = details(language, "sample-running", { back: { title: "Parent", onPress } });
+    const root = await render(<TaskDetailCards {...props} />);
+    const button = host(root, "detail-back");
+    expect(button.find((node) => (node.type as unknown) === "Icon").props.name).toBe("CornerLeftUp");
+    expect(button.findAll((node) => (node.type as unknown) === "Text")[0]!.children).toEqual(["Parent"]);
+    expect(button.props.accessibilityLabel).toBe(props.strings.back("Parent"));
+    await act(async () => button.props.onHoverIn());
+    expect(StyleSheet.flatten(host(root, "detail-back").props.style).backgroundColor).toBe(detailColors(taskTokens(THEME)).rowHover);
+    await act(async () => host(root, "detail-back").props.onHoverOut());
+    expect(StyleSheet.flatten(host(root, "detail-back").props.style).backgroundColor).toBe("transparent");
+    await act(async () => button.props.onPress());
+    expect(onPress).toHaveBeenCalledOnce();
+  });
+  it("uses the shared detail row hover in a dark theme", async () => {
+    const theme = { colors: { ...THEME.colors, surface0: "#17171a", surface1: "#222225", surface2: "#303033", foreground: "#f0f0f0" } };
+    const root = await render(<TaskDetailCards {...details("en", "sample-running", { theme })} />);
+    await act(async () => host(root, "detail-back").props.onHoverIn());
+    expect(StyleSheet.flatten(host(root, "detail-back").props.style).backgroundColor).toBe(detailColors(taskTokens(theme)).rowHover);
+    await act(async () => host(root, "detail-back").props.onHoverOut());
+    expect(StyleSheet.flatten(host(root, "detail-back").props.style).backgroundColor).toBe("transparent");
+  });
+  it("uses the shared hover fill for both header buttons", async () => {
     const root = await render(<TaskDetailCards {...details("en", "sample-running", { onMenu() {} })} />);
     for (const id of ["detail-menu", "detail-close"]) {
       const button = () => host(root, id);
-      expect(StyleSheet.flatten(button().props.style)).toMatchObject({ borderRadius: 7, borderColor: "transparent" });
+      expect(StyleSheet.flatten(button().props.style)).toMatchObject({ borderRadius: 6, borderColor: "transparent" });
       await act(async () => button().props.onHoverIn());
-      expect(StyleSheet.flatten(button().props.style)).toMatchObject({ borderRadius: 7, borderWidth: StyleSheet.hairlineWidth, borderColor: taskTokens(THEME).borderStrong, boxShadow: taskTokens(THEME).card.buttonShadowHover });
+      const fill = () => host(root, `${id}-fill`);
+      const icon = button().find((node) => (node.type as unknown) === "Icon");
+      const diameter = 24;
+      expect(fill().find((node) => (node.type as unknown) === "Icon")).toBe(icon);
+      expect(StyleSheet.flatten(fill().props.style)).toMatchObject({ width: diameter, height: diameter, borderRadius: 6, backgroundColor: detailColors(taskTokens(THEME)).rowHover });
+      expect(StyleSheet.flatten(button().props.style)).toMatchObject({ borderWidth: StyleSheet.hairlineWidth, borderColor: "transparent" });
       await act(async () => button().props.onHoverOut());
-      expect(StyleSheet.flatten(button().props.style)).toMatchObject({ borderColor: "transparent", boxShadow: undefined });
+      expect(StyleSheet.flatten(fill().props.style).backgroundColor).toBe("transparent");
     }
   });
   it("opens the selected card menu at the header button", async () => {
@@ -144,7 +178,7 @@ describe("sidebar action tips", () => {
       tasks: { ready: true }, cardById: () => card, setParams, callbacks: {},
       stop: { phase: () => "idle" }, read: { available: false }, unarchive: { available: false }, archive: { pending: () => false }, buttonsFor: () => [],
     } as unknown as BoardController;
-    const root = await render(<DetailsSidebar board={board} theme={THEME} selection={{ id: card.id, back: [] }} dispatch={() => {}} onLane={() => {}} onReveal={() => {}} touch={false} stats={false} />);
+    const root = await render(<DetailsSidebar board={board} theme={THEME} selection={{ id: card.id, tab: "messages", back: [] }} dispatch={() => {}} onLane={() => {}} onReveal={() => {}} touch={false} stats={false} />);
     const button = host(root, "detail-notice").find((node) => typeof node.type === "string" && node.props.accessibilityRole === "button");
     await act(async () => button.props.onPress());
     expect(setParams).toHaveBeenCalledOnce();
@@ -241,7 +275,7 @@ describe("sidebar action tips", () => {
       callbacks: { onOpen, onReveal }, stop: { phase: () => "idle" }, read: { available: false, pending: () => false }, unarchive: { available: false }, archive: { pending: () => false },
       buttonsFor: () => [],
     } as unknown as BoardController;
-    const root = await render(<DetailsSidebar board={board} theme={THEME} selection={{ id: parent.id, back: [] }} dispatch={() => {}} onLane={() => {}} onReveal={onReveal} touch={false} stats={false} />);
+    const root = await render(<DetailsSidebar board={board} theme={THEME} selection={{ id: parent.id, tab: "messages", back: [] }} dispatch={() => {}} onLane={() => {}} onReveal={onReveal} touch={false} stats={false} />);
     await act(async () => contextMenus.get(`detail-subtask-${child.id}`)!({ x: 20, y: 30 }));
     expect(root.findAll((node) => node.props.accessibilityLabel === cardStrings("en").copyTitle).length).toBeGreaterThan(0);
     expect(onReveal).not.toHaveBeenCalled();
@@ -265,7 +299,7 @@ describe("sidebar action tips", () => {
       },
       setParams: vi.fn(), callbacks: {}, cardById: () => undefined,
     } as unknown as BoardController;
-    const root = await render(<DetailsSidebar board={board} theme={THEME} selection={{ id: null, back: [] }} dispatch={() => {}} onLane={() => {}} onReveal={() => {}} touch={touch} stats={false} />);
+    const root = await render(<DetailsSidebar board={board} theme={THEME} selection={{ id: null, tab: "messages", back: [] }} dispatch={() => {}} onLane={() => {}} onReveal={() => {}} touch={touch} stats={false} />);
     const rows = () => root.findAll((node) => typeof node.type === "string" && node.props.accessibilityRole === "checkbox");
     const expectLines = (row: ReactTestInstance, label: string, detail: string) => {
       const texts = row.findAll((node) => (node.type as unknown) === "Text");
@@ -279,7 +313,7 @@ describe("sidebar action tips", () => {
     };
     await act(async () => host(root, "sidebar-group-tab-FolderKanban").props.onPress());
     expectLines(rows()[0]!, "Payments", "~/code/payments");
-    expectLines(rows()[1]!, "Website", "~/code/website");
+    expectLines(rows()[1]!, "Website", "/home/dev/code/website");
     expectLines(rows()[2]!, "Server", "/srv/server");
     expect(rows()[3]!.props.style.height).toBe(touch ? 44 : 36);
     await act(async () => rows()[0]!.props.onPress());
@@ -306,7 +340,7 @@ describe("sidebar action tips", () => {
       },
       setParams: vi.fn(), callbacks: {}, cardById: () => undefined,
     } as unknown as BoardController;
-    const root = await render(<DetailsSidebar board={board} theme={THEME} selection={{ id: null, back: [] }} dispatch={() => {}} onLane={() => {}} onReveal={() => {}} touch={touch} stats={false} />);
+    const root = await render(<DetailsSidebar board={board} theme={THEME} selection={{ id: null, tab: "messages", back: [] }} dispatch={() => {}} onLane={() => {}} onReveal={() => {}} touch={touch} stats={false} />);
     const input = () => host(root, "sidebar-groups-search-input");
     const rows = () => root.findAll((node) => typeof node.type === "string" && node.props.accessibilityRole === "checkbox");
     expect(host(root, "sidebar-groups-search").props.style).toMatchObject({ borderRadius: 999, height: touch ? 36 : 28, borderColor: THEME.colors.border });
@@ -329,6 +363,7 @@ describe("sidebar action tips", () => {
       expect(rows().map((row) => row.props.accessibilityLabel)).toEqual([label]);
       await act(async () => input().props.onChangeText("missing"));
       expect(rows()).toHaveLength(0);
+      expect(StyleSheet.flatten(host(root, "sidebar-groups-search-clear").props.style)).toMatchObject({ width: 20, height: 20, borderRadius: 10 });
       await act(async () => host(root, "sidebar-groups-search-clear").props.onPress());
       expect(input().props.value).toBe("");
       expect(rows()).toHaveLength(2);
@@ -426,7 +461,7 @@ describe("sidebar action tips", () => {
       tasks: { lanes, ready: true, workspaces: [], providers: [{ id: "claude", label: "Claude" }], labels: [], requestProjectIcon() {} },
       setParams: vi.fn(), callbacks: {}, cardById: () => undefined,
     } as unknown as BoardController;
-    const root = await render(<DetailsSidebar board={board} theme={THEME} selection={{ id: null, back: [] }} dispatch={() => {}} onLane={() => {}} onReveal={() => {}} touch={false} />);
+    const root = await render(<DetailsSidebar board={board} theme={THEME} selection={{ id: null, tab: "messages", back: [] }} dispatch={() => {}} onLane={() => {}} onReveal={() => {}} touch={false} />);
     expectActionTips(root);
     for (const id of LANE_ORDER) expect(tip(host(root, `sidebar-stat-${id}`))).toBe(BOARD_STRINGS[language].lanes[id]);
     const tabs = root.findAll((node) => typeof node.type === "string" && node.props.accessibilityRole === "tab");
@@ -445,7 +480,7 @@ describe("sidebar action tips", () => {
     expect(iconSizes()).toEqual([18, 18, 18, 18]);
     const filter = root.find((node) => typeof node.type === "string" && node.props.accessibilityRole === "checkbox");
     expect(tip(filter)).toBe("Claude");
-    const controlHover = taskTokens(THEME).card.controlHover;
+    const controlHover = detailColors(taskTokens(THEME)).rowHover;
     const tab = host(root, "sidebar-group-tab-FolderKanban");
     await act(async () => tab.props.onHoverIn());
     expect(tab.props.style).toMatchObject({ backgroundColor: controlHover });

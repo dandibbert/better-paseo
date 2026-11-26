@@ -1,6 +1,7 @@
-import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Platform, StyleSheet, View, type LayoutChangeEvent, type ViewStyle } from "react-native";
 import { useAgent, usePaseo, useRpc } from "@getpaseo/plugin/client";
+import { useToast } from "@getpaseo/plugin/client/ui";
 import { useRevealedText } from "./ui/use-revealed-text";
 import { ChatComposerContext, type ComposerTimelineItemProps as PluginTimelineItemProps } from "./ui/chat-composer";
 import { NativeFileLinkContext, NativeLinkMenuContext, type NativeFileLinkActions } from "./components/markdown/native-file-links";
@@ -27,30 +28,45 @@ import { NoticeCallout } from "./components/notice-callout";
 import { useEnhancerPreferences } from "./preferences";
 import { PreferenceSyncSlot } from "./state/preference-sync-slot";
 import { useIsLatestPrompt } from "./state/latest-prompt";
-import { useTurnFooter } from "./state/turn-footers";
+import { useCodexProvider } from "./state/provider-family";
+import { useTurnFooter, useTurnWork, type WorkAnchor } from "./state/turn-footers";
+import { TurnWorkCard } from "./components/turn-work-card";
+import { standardFoldActive } from "./tools/standard-fold";
 import { setPromptUsage, usePromptUsage } from "./state/prompt-usage";
 import { useAgentMessageSender } from "./state/agent-message-senders";
+import { useTimelineLevelPill } from "./timeline-level-control";
 import { useFooterModel } from "./state/footer-model";
-import type { AssistantRowData } from "./assistant-transform";
+import { type AssistantRowData } from "./assistant-transform";
 import { HOST_REWIND_MENU } from "./ui/host-rewind";
 import { publishHubSnapshot } from "./hub-activity";
 import { MarkdownView } from "./components/markdown/markdown-view";
+import { lexBlock } from "./components/markdown/lex";
+import { splitLocalImages } from "./components/markdown/render/local-path";
+import { variantMetrics } from "./components/markdown/render/styles";
+import { firstLineCenter, firstLineSource } from "./components/markdown/render/first-line";
+import { hairline } from "./ui/tokens/platform";
+import { useZoomedTokens } from "./ui/text-zoom";
 import { TimelineTailHub } from "./components/hub-live";
 import { AssistantFooter } from "./components/turn-footer";
 import { SystemCard } from "./components/system-card";
 import { parseSystemEnvelope } from "./system-envelope";
-import { useTextItemTailKey } from "./timeline-tail";
+import { useIsTimelineTail, useNoteTimelineItem, useTextItemTailKey, useTimelineTailAt } from "./timeline-tail";
 import { useHasEntryAfter, useNextEntryIsRow, useTimelineEntry, useTimelineToolGroup } from "./timeline-order";
 import { useHostStacksRows } from "./host-row-gap";
 import { BlockPlacementContext, type BlockKind } from "./details/contracts";
 import { DetailsHostSlot } from "./details/shell/details-host-slot";
 import type { TaskListData, TaskItemData, NoticeCalloutData } from "../shared/contracts";
 import { revealPathRpc } from "../shared/file-rpc";
+import { revealWithSetting } from "./i18n/file-open-error";
 import { isImagePath, useImageFile } from "./image-file";
 import { classifyTool } from "./tools/classify";
 import { defaultToolExpanded, toolDisclosureKey } from "./tools/disclosure";
 import { PathContext, usePathContextValue } from "./ui/path-text";
 import { probeCard, textItemKey } from "./debug/perf";
+import { SelectionTranslationScope } from "./translation/ui";
+import { InlineTranslation, InlineTranslateButton, InlineTranslationNotice, type InlineTranslationState } from "./translation/inline";
+import { replyTranslationKey, useReplyTranslationPending } from "./translation/reply-pending";
+import { useWholeReplyTranslation } from "./translation/reply-whole";
 import {
   assistantPropsEqual,
   noticePropsEqual,
@@ -61,6 +77,9 @@ import {
 } from "./state/render-equality";
 import { noteTimelineRowShown } from "./state/startup-settled";
 import { useHeldRow } from "./ui/hidden-row";
+import { useHover } from "./ui/use-hover";
+import { useInputCapabilities } from "./ui/use-input-capabilities";
+import { useTranslationSettingsState } from "./translation/settings-store";
 
 type JsonValue = boolean | null | number | string | JsonValue[] | { [key: string]: JsonValue };
 
@@ -159,6 +178,8 @@ function BlockPlacement({ agentId, timestamp, kind, children }: {
   const value = useMemo(() => ({ agentId, at, kind }), [agentId, at, kind]);
   // Work held back until the chat has drawn waits for the first row (`startup-settled.ts`).
   useEffect(noteTimelineRowShown, []);
+  // The agent's Agent steps pill (`timeline-level-control.ts`).
+  useTimelineLevelPill(agentId);
   return <BlockPlacementContext.Provider value={value}>{children}</BlockPlacementContext.Provider>;
 }
 
@@ -170,6 +191,7 @@ function LiveToolCallRendererBody(props: PluginTimelineItemProps<LiveToolCallPay
     item.data.phase === undefined ? null : item.data.phase === "streaming",
   );
   const revealPath = useRpc(revealPathRpc);
+  const toast = useToast();
   const preferences = useEnhancerPreferences();
   const tokens = useThemeTokens(theme, preferences, layout.platform);
   useSelectionActions(tokens, preferences.selectionActions);
@@ -188,8 +210,9 @@ function LiveToolCallRendererBody(props: PluginTimelineItemProps<LiveToolCallPay
   }
   const at = arrivalRef.current.at;
   const itemKey = `tool:${data.callId ?? view.title}:${at}`;
-  // Not the tail: a thought takes no part in it, and a call with a thought
-  // below it kept its gap as if it were the newest row. A call already
+  const isTail = useTimelineTailSlot(agentId, itemKey, null, at, false);
+  // The gap does not follow the tail: a call with a thought below it kept
+  // its gap as if it were the newest row. A call already
   // finished as its row mounts is replayed history (see `timeline-order.ts`).
   const rootRef = useRef<View>(null);
   // Only a stacking host's compensation depends on whether a row comes next.
@@ -201,14 +224,13 @@ function LiveToolCallRendererBody(props: PluginTimelineItemProps<LiveToolCallPay
   const groupFailed = group?.some((call) => call.status === "failed") ?? false;
 
   // The daemon side owns the shell, so revealing a file is one RPC. Paths
-  // arrive absolute (PathText resolves them); a path the daemon cannot stat
-  // answers with an error the press simply ignores.
+  // arrive absolute (PathText resolves them); errors are shown in a toast.
   const pathCwdRef = useRef<string | undefined>(undefined);
   const handleRevealPath = useCallback(
     (path: string) => {
-      void revealPath({ cwd: pathCwdRef.current ?? "", path }).catch(() => {});
+      revealWithSetting(revealPath, toast, pathCwdRef.current ?? "", path);
     },
-    [revealPath],
+    [revealPath, toast],
   );
   // Roots for relative paths (plan §3.9): workspace, project, agent cwd.
   const pathContext = usePathContextValue(agentId, handleRevealPath);
@@ -272,28 +294,24 @@ function LiveToolCallRendererBody(props: PluginTimelineItemProps<LiveToolCallPay
           {probe.node}
           <PreferenceSyncSlot />
           <PathContext.Provider value={pathContext}>
-            <ToolCallout
-              data={view}
-              previewKey={`${disclosureKey}:preview`}
-              groupCalls={group.length > 1 ? group : undefined}
-              tokens={tokens}
-              compact={layout.compact}
-              expanded={expanded}
-              onExpandedChange={setExpanded}
-              imageFile={imageFile}
-              requestImage={readsImage ? markPreviewed : undefined}
-            />
+            <SelectionTranslationScope agentId={agentId} kind="tool_output" streaming={false}>
+              <ToolCallout
+                data={view}
+                previewKey={`${disclosureKey}:preview`}
+                groupCalls={group.length > 1 ? group : undefined}
+                tokens={tokens}
+                compact={layout.compact}
+                expanded={expanded}
+                onExpandedChange={setExpanded}
+                imageFile={imageFile}
+                requestImage={readsImage ? markPreviewed : undefined}
+              />
+            </SelectionTranslationScope>
           </PathContext.Provider>
         </>
       ) : null}
       <DetailsHostSlot agentId={agentId} itemKey={itemKey} tokens={tokens} compact={layout.compact} />
-      <TimelineTailHub
-        agentId={agentId}
-        tokens={tokens}
-        itemKey={itemKey}
-        at={at}
-        kind="tool"
-      />
+      <TimelineTail agentId={agentId} tokens={tokens} compact={layout.compact} isTail={isTail} at={at} kind="tool" />
     </View>
   );
 }
@@ -315,6 +333,7 @@ function LiveReasoningRendererBody({
   useSelectionActions(tokens, preferences.selectionActions);
   const text = item.data.text || "";
   const streaming = item.data.phase === "streaming";
+  const translation = useMemo(() => ({ agentId, theme }), [agentId, theme]);
   const settledKey = streaming ? undefined : `thought:${text}`;
   // The host updates the timestamp as a thought streams, without moving its slot.
   const arrivalRef = useRef({ agentId, at: timestamp.getTime() });
@@ -332,7 +351,7 @@ function LiveReasoningRendererBody({
   const [expanded, setExpanded] = useDisclosure(storeKey, false);
   const toggle = useCallback(() => setExpanded(!expanded), [expanded, setExpanded]);
 
-  // The host's reveal runs a frame loop only for "streaming". A collapsed card
+  // The reveal runs a frame loop only for "streaming". A collapsed card
   // shows one line, so it takes the text whole. The hook still follows the text,
   // so a card opened mid-stream picks up the reveal where the text stands; but
   // its "complete" output lands a commit late (`useRevealedText` settles in a
@@ -351,6 +370,8 @@ function LiveReasoningRendererBody({
   observeReasoning(storeKey, streaming, timestamp.getTime());
   const durationMs = streaming ? null : observedDurationMs(storeKey);
   const hostSlotKey = useRef(`thought:${agentId}:${timestamp.getTime()}`).current;
+  const tailKey = useTextItemTailKey(agentId, "thought", at, text);
+  const isTail = useTimelineTailSlot(agentId, tailKey.key, tailKey.previous, at, false);
 
   // A thought gives up its gap once something of this agent's arrived below
   // it, whatever its phase: the host can mark a thought loading again while
@@ -368,18 +389,22 @@ function LiveReasoningRendererBody({
     >
       {probe.node}
       <PreferenceSyncSlot />
-      <ReasoningCardMemo
-        segmentation={segmentation}
-        streaming={streaming}
-        durationMs={durationMs}
-        expanded={expanded}
-        onToggle={toggle}
-        tokens={tokens}
-        compact={layout.compact}
-        storeKey={storeKey}
-        copyText={text}
-      />
+      <SelectionTranslationScope agentId={agentId} kind="reasoning" streaming={streaming}>
+        <ReasoningCardMemo
+          segmentation={segmentation}
+          streaming={streaming}
+          durationMs={durationMs}
+          expanded={expanded}
+          onToggle={toggle}
+          tokens={tokens}
+          compact={layout.compact}
+          storeKey={storeKey}
+          copyText={text}
+          translation={translation}
+        />
+      </SelectionTranslationScope>
       <DetailsHostSlot agentId={agentId} itemKey={hostSlotKey} tokens={tokens} compact={layout.compact} />
+      <TimelineTail agentId={agentId} tokens={tokens} compact={layout.compact} isTail={isTail} at={at} kind="tool" />
     </View>
   );
 }
@@ -438,6 +463,8 @@ function LiveTodoRendererBody({
 
   const taskListData = useMemo(() => todoTaskListData(items), [items]);
   const hostSlotKey = `todo:${agentId}:${timestamp.getTime()}`;
+  // Only the item drawing the update takes part in the tail.
+  const isTail = useTimelineTailSlot(agentId, `todo:${timestamp.getTime()}`, null, timestamp.getTime(), false, role !== "hidden");
 
   // The checklist's panel lives here, not in the list: when the next update
   // arrives this item folds to a row and its list unmounts, but the item
@@ -483,6 +510,7 @@ function LiveTodoRendererBody({
       )}
       <TaskListPanel panel={panel} data={panelData} tokens={tokens} compact={layout.compact} />
       <DetailsHostSlot agentId={agentId} itemKey={hostSlotKey} tokens={tokens} compact={layout.compact} />
+      <TimelineTail agentId={agentId} tokens={tokens} compact={layout.compact} isTail={isTail} at={timestamp.getTime()} kind="tool" />
     </View>
   );
 }
@@ -494,7 +522,7 @@ const todoStyles = StyleSheet.create({
 export interface LiveAssistantPayload extends AssistantRowData {}
 
 /**
- * Whether a streamed reply reveals at the host's own cadence
+ * Whether a streamed reply reveals at the host's cadence
  * (`useRevealedText`, plan §3.1 item 8) or draws each chunk as it arrives.
  * Decided by an A/B (F1, 3+ alternating runs, markdown-long and
  * table-streaming): on the iOS simulator the reveal changed total assistant
@@ -512,30 +540,95 @@ const ASSISTANT_REVEAL = { web: false, native: true } as const;
  * file-path links still need `assistantMarkdown` off to hand the turn back.
  */
 function LiveAssistantRendererBody(props: PluginTimelineItemProps<LiveAssistantPayload>) {
-  return props.item.data.blockIndex !== undefined && props.item.data.messageText === undefined
-    ? <AssistantBlockRenderer {...props} /> : <LiveAssistantMessageRenderer {...props} />;
+  if (parseSystemEnvelope(props.item.data.text)) return <LiveAssistantMessageRenderer {...props} />;
+  return <InlineTranslation agentId={props.agentId} kind="assistant_message" text={props.item.data.text} streaming={props.item.data.phase === "streaming"}>
+    {(inline) => props.item.data.blockIndex !== undefined && props.item.data.messageText === undefined
+      ? <AssistantBlockRenderer {...props} inline={inline} /> : <LiveAssistantMessageRenderer {...props} inline={inline} />}
+  </InlineTranslation>;
+}
+
+// The reply's right gutter, which the translate button sits in.
+const REPLY_TRANSLATE_GUTTER = 32;
+
+function isImageOnlyReply(text: string, codexDirectives: boolean): boolean {
+  if (!text.includes("![")) return false;
+  const blocks = lexBlock(text, false, codexDirectives).filter((token) => token.type !== "space" && token.type !== "def");
+  return blocks.length > 0 && blocks.every((block) => {
+    if (block.type !== "paragraph") return false;
+    const parts = splitLocalImages(block.tokens);
+    return parts.length > 0 && parts.every((part) => part.kind === "image");
+  });
+}
+
+function InlineReplyBlock({ state, replyKey, theme, tokens: given, compact, text, originalText, firstBlock, listContinuation, codexDirectives, children }: {
+  state: InlineTranslationState;
+  /** The reply this block belongs to: the footer's whole-message translation dims it too. */
+  replyKey: string; theme: PluginTheme; tokens: ReturnType<typeof useThemeTokens>; compact: boolean;
+  /** The Markdown the block shows, original or translated: the button centers on its first line. */
+  text: string; originalText: string; firstBlock: boolean; listContinuation?: boolean; codexDirectives: boolean; children: ReactNode;
+}) {
+  const { hovered, hoverProps } = useHover();
+  const input = useInputCapabilities(compact);
+  const settings = useTranslationSettingsState();
+  const preferences = useEnhancerPreferences();
+  const tokens = useZoomedTokens(given);
+  const metrics = variantMetrics(preferences.markdownVariant, tokens.typography.content.size, compact);
+  const gap = firstBlock ? 0 : listContinuation ? metrics.itemGap : metrics.blockGap;
+  const ruleHeight = Number(hairline(tokens.platform).height ?? 1);
+  const source = firstLineSource(text, codexDirectives);
+  const monoLineHeight = tokens.typography.mono.lineHeight;
+  const center = useMemo(() => firstLineCenter(source, { metrics, ruleHeight, monoLineHeight, first: firstBlock, codexDirectives }),
+    [source, metrics, ruleHeight, monoLineHeight, firstBlock, codexDirectives]);
+  const top = gap + center - REPLY_TRANSLATE_GUTTER / 2;
+  const enabled = (settings.status !== "ready" || settings.values.enabled) && !isImageOnlyReply(originalText, codexDirectives);
+  const whole = useWholeReplyTranslation(replyKey);
+  const replyPending = useReplyTranslationPending(replyKey) || (whole?.active && whole.view?.status === "running");
+  const loading = replyPending || (state.active && state.view && ["running", "settings-loading"].includes(state.view.status));
+  const gutter = enabled ? REPLY_TRANSLATE_GUTTER : 0;
+  // The slot is positioned in the content's own box, so a status notice above
+  // the content does not shift it, and that box spans the gutter so the slot
+  // lands beside the text instead of over its last column.
+  return <View onPointerEnter={hoverProps.onHoverIn} onPointerLeave={hoverProps.onHoverOut} style={{ position: "relative" }}>
+    <View style={{ paddingRight: gutter }}><InlineTranslationNotice state={state} theme={theme} /></View>
+    <View style={{ position: "relative", paddingRight: gutter }}>
+      <View style={loading ? { opacity: 0.55 } : undefined}>{children}</View>
+      {enabled ? <View testID="reply-translation-slot" style={{ position: "absolute", right: 0, top, opacity: hovered || input.touch || state.active ? 1 : 0 }} pointerEvents={hovered || input.touch || state.active ? "auto" : "none"}>
+        <InlineTranslateButton state={state} theme={theme} testID="reply-translate" timeline alignRight />
+      </View> : null}
+    </View>
+  </View>;
 }
 
 /** Interior blocks have no message footer, tail registration or timing reads. */
-function AssistantBlockRenderer({ item, theme, layout, agentId, timestamp }: PluginTimelineItemProps<LiveAssistantPayload>) {
+function AssistantBlockRenderer({ item, theme, layout, agentId, timestamp, inline }: PluginTimelineItemProps<LiveAssistantPayload> & { inline: InlineTranslationState }) {
   const preferences = useEnhancerPreferences();
   const tokens = useThemeTokens(theme, preferences, layout.platform);
   useSelectionActions(tokens, preferences.selectionActions);
   const revealPath = useRpc(revealPathRpc);
+  const toast = useToast();
   const cwd = useAgent(agentId, (agent) => agent.cwd);
+  const provider = useAgent(agentId, (agent) => agent.provider);
+  const codex = useCodexProvider(provider);
   const onRevealPath = useCallback((path: string) => {
-    void revealPath({ cwd: cwd ?? "", path }).catch(() => {});
-  }, [cwd, revealPath]);
+    revealWithSetting(revealPath, toast, cwd ?? "", path);
+  }, [cwd, revealPath, toast]);
   const probe = probeCard("assistant", textItemKey("assistant", item.data.text), false);
   const hostSlotKey = useRef(`assistant:${agentId}:${timestamp.getTime()}:${item.data.blockIndex ?? "block"}`).current;
+  const whole = useWholeReplyTranslation(replyTranslationKey(agentId, timestamp.getTime()));
+  const wholeShown = whole?.active && whole.view?.status === "done";
+  const shown = inline.active && inline.view?.status === "done" ? inline.view.result.translation : item.data.text;
+  if (wholeShown) return null;
+  const codexDirectives = codex;
   return <View {...surfaceProps(itemRootFont(preferences.uiFont), pluginRoot)} {...probe.viewProps}
     style={assistantBlockStyles.continuation}>
     {probe.node}
     <PreferenceSyncSlot />
-    <MarkdownView text={item.data.text} tokens={tokens} variant={preferences.markdownVariant}
-      compact={layout.compact} firstBlock={item.data.blockIndex === 0} onRevealPath={onRevealPath}
-      listContinuation={item.data.listContinuation}
-      probeId={`assistant:${timestamp.getTime()}:${item.data.blockIndex}`} />
+    <SelectionTranslationScope agentId={agentId} kind="assistant_message" streaming={item.data.phase === "streaming"}>
+      <InlineReplyBlock state={inline} replyKey={replyTranslationKey(agentId, timestamp.getTime())} theme={theme} tokens={tokens} compact={layout.compact} text={shown} originalText={item.data.text} codexDirectives={codexDirectives} firstBlock={item.data.blockIndex === 0} listContinuation={item.data.listContinuation}><MarkdownView codexDirectives={codexDirectives} text={shown} tokens={tokens} variant={preferences.markdownVariant}
+        compact={layout.compact} firstBlock={item.data.blockIndex === 0} onRevealPath={onRevealPath}
+        listContinuation={item.data.listContinuation}
+        probeId={`assistant:${timestamp.getTime()}:${item.data.blockIndex}`} /></InlineReplyBlock>
+    </SelectionTranslationScope>
     <DetailsHostSlot agentId={agentId} itemKey={hostSlotKey} tokens={tokens} compact={layout.compact} />
   </View>;
 }
@@ -551,9 +644,16 @@ function LiveAssistantMessageRenderer({
   theme,
   layout,
   timestamp,
-}: PluginTimelineItemProps<LiveAssistantPayload>) {
+  inline,
+}: PluginTimelineItemProps<LiveAssistantPayload> & { inline?: InlineTranslationState }) {
   const messageText = item.data.messageText ?? item.data.text;
   const streaming = item.data.phase === "streaming";
+  const whole = useWholeReplyTranslation(replyTranslationKey(agentId, timestamp.getTime()));
+  const wholeTranslated = whole?.active && whole.view?.status === "done" ? whole.view.result.translation : null;
+  const translated = wholeTranslated ?? (inline?.active && inline.view?.status === "done" ? inline.view.result.translation : null);
+  const provider = useAgent(agentId, (agent) => agent.provider);
+  const codex = useCodexProvider(provider);
+  const codexDirectives = codex;
   const probe = probeCard(
     "assistant",
     textItemKey("assistant", item.data.text),
@@ -565,7 +665,9 @@ function LiveAssistantMessageRenderer({
 
   // The jobs hub still follows the conversation tail. Completed-turn footers
   // are independent: each turn keeps one under its last model reply.
-  const itemKey = useTextItemTailKey(agentId, "assistant", timestamp.getTime(), messageText);
+  const tailKey = useTextItemTailKey(agentId, "assistant", timestamp.getTime(), messageText);
+  const isTail = useTimelineTailSlot(agentId, tailKey.key, tailKey.previous, timestamp.getTime(), true);
+  const turnRunning = useAgent(agentId, (agent) => agent.status === "running") === true;
   const hostSlotKey = useRef(`assistant:${agentId}:${timestamp.getTime()}`).current;
 
   // Paseo's own reply sits 16pt above the tool row that follows it (its 12pt
@@ -581,7 +683,7 @@ function LiveAssistantMessageRenderer({
   // the model's words, so they are drawn as a card, not as prose.
   const envelope = useMemo(() => parseSystemEnvelope(item.data.text), [item.data.text]);
   const reveal = ASSISTANT_REVEAL[layout.platform === "web" ? "web" : "native"];
-  // Where the reply is not paced, it bypasses the host's hook: that hook shows
+  // Where the reply is not paced, it bypasses the reveal hook: that hook shows
   // a longer text one commit late (it settles in a passive effect), and Paseo's
   // web list follows the bottom in the commit that brings the stream data, so a
   // reply growing a commit later was painted pushed down for a frame, then
@@ -592,12 +694,13 @@ function LiveAssistantMessageRenderer({
   // A path in the prose reveals like a path in a tool card: one daemon RPC,
   // relative to the agent's directory.
   const revealPath = useRpc(revealPathRpc);
+  const toast = useToast();
   const cwd = useAgent(agentId, (agent) => agent.cwd);
   const handleRevealPath = useCallback(
     (path: string) => {
-      void revealPath({ cwd: cwd ?? "", path }).catch(() => {});
+      revealWithSetting(revealPath, toast, cwd ?? "", path);
     },
-    [cwd, revealPath],
+    [cwd, revealPath, toast],
   );
 
   return (
@@ -614,18 +717,25 @@ function LiveAssistantMessageRenderer({
       {envelope ? (
         <SystemCard envelope={envelope} tokens={tokens} compact={layout.compact} />
       ) : (
-        <MarkdownView
-          text={revealed}
-          firstBlock={item.data.blockIndex === undefined || item.data.blockIndex === 0}
-          listContinuation={item.data.listContinuation}
-          tokens={tokens}
-          variant={preferences.markdownVariant}
-          compact={layout.compact}
-          streaming={streaming}
-          onRevealPath={handleRevealPath}
-          probeId={`assistant:${timestamp.getTime()}`}
-        />
+        <SelectionTranslationScope agentId={agentId} kind="assistant_message" streaming={streaming}>
+          {inline ? <InlineReplyBlock state={inline} replyKey={replyTranslationKey(agentId, timestamp.getTime())} theme={theme} tokens={tokens} compact={layout.compact} text={translated ?? revealed} originalText={item.data.text} codexDirectives={codexDirectives} firstBlock={wholeTranslated !== null || item.data.blockIndex === undefined || item.data.blockIndex === 0} listContinuation={wholeTranslated !== null ? false : item.data.listContinuation}><MarkdownView codexDirectives={codexDirectives}
+            text={translated ?? revealed}
+            firstBlock={wholeTranslated !== null || item.data.blockIndex === undefined || item.data.blockIndex === 0}
+            listContinuation={wholeTranslated !== null ? false : item.data.listContinuation}
+            tokens={tokens}
+            variant={preferences.markdownVariant}
+            compact={layout.compact}
+            streaming={streaming}
+            onRevealPath={handleRevealPath}
+            probeId={`assistant:${timestamp.getTime()}`}
+          /></InlineReplyBlock> : null}
+        </SelectionTranslationScope>
       )}
+      {/* A split reply draws the card on the block that carries the whole text, as its footer does. */}
+      {!envelope && !streaming && standardFoldActive(preferences) && (item.data.blockIndex === undefined || item.data.messageText !== undefined) ? (
+        <ReplyTurnWork agentId={agentId} at={timestamp.getTime()} text={messageText} handover={isTail && !turnRunning}
+          tokens={tokens} compact={layout.compact} />
+      ) : null}
       {/* A streaming row only observes completion usage; the visible footer
           still belongs exclusively to the final reply of a completed turn. */}
       {!envelope ? (
@@ -633,22 +743,130 @@ function LiveAssistantMessageRenderer({
           agentId={agentId}
           text={messageText}
           at={timestamp}
+          theme={theme}
           tokens={tokens}
           compact={layout.compact}
           streaming={streaming}
         />
       ) : null}
       <DetailsHostSlot agentId={agentId} itemKey={hostSlotKey} tokens={tokens} compact={layout.compact} />
-      <TimelineTailHub
-        agentId={agentId}
-        tokens={tokens}
-        itemKey={itemKey}
-        at={timestamp.getTime()}
-        kind="reply"
-      />
+      <TimelineTail agentId={agentId} tokens={tokens} compact={layout.compact} isTail={isTail} at={timestamp.getTime()} kind="reply"
+        drawWork={turnRunning} />
     </View>
   );
 }
+
+/** Replies the plugin draws, as the assistant transformer decides (`index.client.tsx`). */
+const ownsAnyReply = (text: string) => text.trim() !== "";
+const LIVE_ANCHOR: WorkAnchor = { kind: "live" };
+
+/**
+ * The running turn's work, for a row that arrived during that turn, or null.
+ * `since` is the turn's first item: a row from an earlier turn never draws it.
+ *
+ * Only a running agent's row subscribes: an idle chat's newest row reads
+ * nothing more than its footer does. The agent can report idle before the
+ * store's read of the ended turn lands; a row showing the running card keeps
+ * its subscription until that read takes the card away, so the settled card
+ * replaces it in one update instead of after a gap.
+ */
+function useLiveTurnWork(agentId: string, at: number, candidate: boolean) {
+  const paseo = usePaseo();
+  const running = useAgent(agentId, (agent) => agent.status === "running") === true;
+  const shown = useRef(false);
+  const enabled = candidate && (running || shown.current);
+  // A prompt row has no turn footer to tell the store the agent runs.
+  const { store, work } = useTurnWork(paseo, agentId, enabled ? LIVE_ANCHOR : null, ownsAnyReply, enabled ? running : null);
+  const live = enabled && work && work.running && at >= work.since ? work : null;
+  useLayoutEffect(() => { shown.current = live !== null; });
+  return { store, work: live };
+}
+
+/**
+ * A settled turn's work card under its final reply's text, above the footer
+ * (`components/turn-work-card.tsx`). The running turn's card is not drawn
+ * here but under the newest row (`TailTurnWork`): above a reply it moved down
+ * the list with each newer reply of the turn, and grew above text that was
+ * still streaming, so everything under it jumped. Under the text, the running
+ * card and this one sit in the same place, so nothing moves when the turn
+ * ends; the footer then appears under the card.
+ *
+ * `handover`: this reply is the newest row and the agent stopped. This card
+ * takes over at once, with the host folding the turn's rows, from the running
+ * work the tail card still holds; the read of the ended turn then turns it
+ * into the settled card in place.
+ */
+const ReplyTurnWork = memo(function ReplyTurnWork({ agentId, at, text, handover, tokens, compact }: {
+  agentId: string; at: number; text: string; handover: boolean; tokens: ReturnType<typeof useThemeTokens>; compact: boolean;
+}) {
+  const paseo = usePaseo();
+  const anchor = useMemo((): WorkAnchor => ({ kind: "reply", at, text }), [at, text]);
+  const settled = useTurnWork(paseo, agentId, anchor, ownsAnyReply);
+  const running = useTurnWork(paseo, agentId, handover ? LIVE_ANCHOR : null, ownsAnyReply, null, false);
+  const pending = !settled.work && running.work && running.work.running && at >= running.work.since ? running.work : null;
+  const work = settled.work ?? pending;
+  return work ? <TurnWorkCard agentId={agentId} at={at} work={work} store={settled.store} tokens={tokens} compact={compact} /> : null;
+});
+
+/**
+ * Takes part in the timeline tail (`timeline-tail.ts`) and says whether this
+ * row is the newest one. `restamped`: a reply, whose timestamp the host moves.
+ * A row that is not drawn (`enabled` false) never takes the tail.
+ */
+function useTimelineTailSlot(agentId: string, key: string, previousKey: string | null, at: number, restamped: boolean,
+  enabled = true): boolean {
+  useNoteTimelineItem(agentId, enabled ? key : null, at, restamped);
+  return useIsTimelineTail(agentId, key, previousKey) && enabled;
+}
+
+/**
+ * What every row the plugin draws leaves under itself while it is the newest
+ * one: the running turn's work card at the standard level, then the
+ * running-jobs card. New rows arrive above these, so nothing already on
+ * screen moves when a card changes or passes to the next row. `drawWork`
+ * false: a reply drawing the card itself (`ReplyTurnWork`).
+ */
+function TimelineTail({ agentId, tokens, compact, isTail, at, kind, drawWork = true }: {
+  agentId: string; tokens: ReturnType<typeof useThemeTokens>; compact: boolean;
+  isTail: boolean; at: number; kind: "tool" | "reply"; drawWork?: boolean;
+}) {
+  const fold = standardFoldActive(useEnhancerPreferences());
+  return (
+    <>
+      {fold && isTail ? <TailTurnWork agentId={agentId} at={at} draw={drawWork} tokens={tokens} compact={compact} /> : null}
+      <TimelineTailHub agentId={agentId} tokens={tokens} isTail={isTail} at={at} kind={kind} />
+    </>
+  );
+}
+
+/**
+ * The running turn's work card under the newest row of that turn, so
+ * successful steps show up as they finish instead of disappearing until the
+ * turn ends. When the turn ends the final reply draws the card in its place
+ * (`ReplyTurnWork`), in the same store update that folds the turn's rows.
+ */
+const TailTurnWork = memo(function TailTurnWork({ agentId, at, draw, tokens, compact }: {
+  agentId: string; at: number; draw: boolean; tokens: ReturnType<typeof useThemeTokens>; compact: boolean;
+}) {
+  // Keeps reading while a reply above draws the card (`draw` false), until the read of the ended turn lands.
+  const live = useLiveTurnWork(agentId, at, true);
+  return draw && live.work ? <TurnWorkCard agentId={agentId} at={at} work={live.work} store={live.store} tokens={tokens} compact={compact} /> : null;
+});
+
+/**
+ * The running turn's card under its prompt, until a row of that turn becomes
+ * the newest one and takes it (`TailTurnWork`). Only a prompt the plugin
+ * draws can hold it.
+ */
+const PromptTurnWork = memo(function PromptTurnWork({ agentId, promptKey, at, tokens, compact }: {
+  agentId: string; promptKey: string; at: number; tokens: ReturnType<typeof useThemeTokens>; compact: boolean;
+}) {
+  const latest = useIsLatestPrompt(agentId, promptKey, at);
+  const tailAt = useTimelineTailAt(agentId);
+  const live = useLiveTurnWork(agentId, at, latest);
+  const work = latest && live.work && (tailAt === null || tailAt < live.work.since) ? live.work : null;
+  return work ? <TurnWorkCard agentId={agentId} at={at} work={work} store={live.store} tokens={tokens} compact={compact} /> : null;
+});
 
 /**
  * One footer per completed turn, including history while another turn runs.
@@ -659,6 +877,7 @@ const TurnFooter = memo(function TurnFooter({
   agentId,
   text,
   at,
+  theme,
   tokens,
   compact,
   streaming,
@@ -666,6 +885,7 @@ const TurnFooter = memo(function TurnFooter({
   agentId: string;
   text: string;
   at: Date;
+  theme: PluginTheme;
   tokens: ReturnType<typeof useThemeTokens>;
   compact: boolean;
   streaming: boolean;
@@ -674,14 +894,17 @@ const TurnFooter = memo(function TurnFooter({
   const paseo = usePaseo();
   const timing = useTurnFooter(paseo, agentId, at.getTime(), text, running, streaming);
   if (!timing) return null;
-  return <CompletedReplyFooter agentId={agentId} text={text} at={new Date(timing.completedAt)} tokens={tokens}
+  return <CompletedReplyFooter agentId={agentId} replyAt={at.getTime()} text={text} theme={theme} at={new Date(timing.completedAt)} tokens={tokens}
     compact={compact} durationMs={timing.durationMs} startedAt={timing.startedAt} usage={timing.usage} telemetry={timing.telemetry} />;
 });
 
-function CompletedReplyFooter({ agentId, text, at, tokens, compact, durationMs, startedAt, usage, telemetry }: {
+function CompletedReplyFooter({ agentId, replyAt, text, at, theme, tokens, compact, durationMs, startedAt, usage, telemetry }: {
   agentId: string;
+  /** The reply row's timestamp, which its split rows share. */
+  replyAt: number;
   text: string;
   at: Date;
+  theme: PluginTheme;
   tokens: ReturnType<typeof useThemeTokens>;
   compact: boolean;
   durationMs: number | null;
@@ -695,15 +918,16 @@ function CompletedReplyFooter({ agentId, text, at, tokens, compact, durationMs, 
   const cwd = useAgent(agentId, (agent) => agent.cwd);
   const paseo = usePaseo();
   const model = useFooterModel(paseo, agentName, modelId, thinkingOptionId, cwd);
-  return <AssistantFooter text={text} at={at} agentName={agentName} modelId={modelId} modelName={model.modelName}
+  const translation = useMemo(() => ({ agentId, theme, replyKey: replyTranslationKey(agentId, replyAt) }), [agentId, theme, replyAt]);
+  return <AssistantFooter translation={translation} text={text} at={at} agentName={agentName} modelId={modelId} modelName={model.modelName}
     thinkingLabel={model.thinkingLabel}
     durationMs={durationMs} startedAt={startedAt} usage={usage} telemetry={telemetry} tokens={tokens} compact={compact} />;
 }
 
 /**
- * The host draws a `notification` or `error` item as bare text with an icon,
- * which reads as a different product beside the plugin's callouts. Both carry
- * only a level and a message, so the card is a badge plus that message.
+ * A host `notification` or `error` item carries only a level and a message.
+ * Both transformers turn one into this renderer, which draws the plugin's
+ * notice row instead of the host's tinted card.
  */
 function LiveNoticeRendererBody({
   agentId,
@@ -857,7 +1081,7 @@ function LiveUserMessageRendererBody({
       {envelope ? (
         <SystemCard envelope={envelope} tokens={tokens} compact={layout.compact} />
       ) : (
-        <UserMessage
+        <SelectionTranslationScope agentId={agentId} kind="user_message" streaming={false}><UserMessage
           text={item.data.text}
           images={item.data.images}
           timestamp={timestamp}
@@ -878,8 +1102,11 @@ function LiveUserMessageRendererBody({
               <LivePromptUsage agentId={agentId} promptKey={promptKey} at={atMs} tokens={tokens} />
             ) : null
           }
-        />
+        /></SelectionTranslationScope>
       )}
+      {!envelope && standardFoldActive(preferences) ? (
+        <PromptTurnWork agentId={agentId} promptKey={promptKey} at={atMs} tokens={tokens} compact={layout.compact} />
+      ) : null}
       <DetailsHostSlot agentId={agentId} itemKey={hostSlotKey} tokens={tokens} compact={layout.compact} />
     </View>
   );

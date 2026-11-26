@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { Pressable, StyleSheet, View, type LayoutChangeEvent, type TextStyle, type ViewStyle } from "react-native";
 import type { PluginTheme } from "@getpaseo/plugin";
-import { Icon } from "@getpaseo/plugin/client/react-native";
+import { Icon } from "@getpaseo/plugin/client/ui";
 import { mix } from "../../components/theme-tokens";
 import { ProgressRing } from "../../ui/progress-ring";
 import type { TasksLanguage } from "../i18n";
@@ -24,15 +24,13 @@ import { formatTokens } from "./format";
 import { cardStrings } from "./strings";
 import type { TaskTokens } from "./tokens";
 import { useHover } from "../../ui/use-hover";
-import { useReducedMotion } from "../../ui/use-reduced-motion";
+import { hoverFill } from "../hover-fill";
 import { tipProps } from "./card-hints";
 import { tipChrome } from "./panel";
 import { webTransition } from "./action-style";
-import { liftStyle, scaleStyle, surfaceLift } from "./surface-lift";
-import { usePressCue } from "./action-pressable";
 
 /**
- * The details card's charts (`docs/prototypes/task-details-rich.md`, board 6),
+ * The details card's charts (`https://github.com/RoundRedDot/better-paseo/blob/f2ab453297c4ccb88a08e2129af0cb3528c4e628/docs/prototypes/task-details-rich.md`, board 6),
  * every one drawn with Views: the plugin sandbox has no SVG. Tooltips show on
  * hover with a pointer and on a tap with touch, where a tap elsewhere or 3 s
  * hides them.
@@ -491,7 +489,6 @@ export function SummaryTiles(props: { tiles: SummaryReadout[]; tokens: TaskToken
   const colors = detailColors(tokens);
   const [width, onLayout] = useWidth();
   const wide = width >= 480;
-  const wrap = width > 0 && width < 300;
   return (
     <View
       testID="detail-summary"
@@ -499,9 +496,9 @@ export function SummaryTiles(props: { tiles: SummaryReadout[]; tokens: TaskToken
       style={{
         flexDirection: "row",
         alignItems: "baseline",
-        flexWrap: wrap ? "wrap" : "nowrap",
+        flexWrap: "wrap",
         // Wrapped rows space by row only; a wrapped cluster keeps its own line.
-        rowGap: wrap ? 4 : 0,
+        rowGap: 4,
         columnGap: 0,
         justifyContent: wide ? "space-between" : "flex-start",
         borderWidth: 1,
@@ -524,6 +521,7 @@ export function SummaryTiles(props: { tiles: SummaryReadout[]; tokens: TaskToken
             alignItems: "baseline",
             gap: 6,
             flexShrink: 0,
+            maxWidth: "100%",
             marginRight: wide || index === props.tiles.length - 1 ? 0 : 14,
           }}
         >
@@ -538,7 +536,7 @@ export function SummaryTiles(props: { tiles: SummaryReadout[]; tokens: TaskToken
           >
             {tile.value ?? "—"}
           </Text>
-          <Text style={{ fontSize: F.sm, lineHeight: HOST_LINE.sm, color: tokens.foregroundMuted }}>
+          <Text style={{ fontSize: F.sm, lineHeight: HOST_LINE.sm, color: tokens.foregroundMuted, flexShrink: 1 }}>
             {monoFigures(wide ? tile.wide : tile.short)}
           </Text>
           {/* The rule belongs to the cluster it follows, so space-between divides clusters, not rules. */}
@@ -559,21 +557,12 @@ export function Chip(props: { tokens: TaskTokens; lead?: React.ReactNode; text: 
   // Grows with the text size like the card's other controls, so larger text stays inside the pill.
   const height = taskControlHeight(props.height, useTasksFontScale());
   const { hovered, hoverProps } = useHover();
-  const press = usePressCue(hovered);
-  const reduced = useReducedMotion();
-  const lift = surfaceLift(hovered, press.pressed, reduced, "control", press.input);
   return (
     <Pressable
       testID={props.testID}
       {...hoverProps}
       {...tipProps(props.tip)}
-      onPressIn={press.onPressIn}
-      onPressOut={press.onPressOut}
-      onTouchStart={press.onTouchStart}
-      onTouchMove={press.onTouchMove}
-      onTouchEnd={press.onTouchEnd}
-      onTouchCancel={press.onTouchCancel}
-      style={{ height, minWidth: height, maxWidth: "100%", paddingHorizontal: props.compact ? 9 : 8, borderRadius: height / 2, borderWidth: StyleSheet.hairlineWidth, backgroundColor: props.tokens.card.background, ...liftStyle(props.tokens, lift, { border: props.tokens.card.pillBorder }), flexDirection: "row", alignItems: "center", justifyContent: "center", gap: props.compact ? 6 : 5, ...scaleStyle(lift.scale), ...webTransition }}
+      style={({ pressed }) => ({ height, minWidth: height, maxWidth: "100%", paddingHorizontal: props.compact ? 9 : 8, borderRadius: height / 2, borderWidth: StyleSheet.hairlineWidth, borderColor: props.tokens.card.pillBorder, backgroundColor: hoverFill(props.tokens.card.background, props.tokens.foreground, hovered, pressed), flexDirection: "row", alignItems: "center", justifyContent: "center", gap: props.compact ? 6 : 5, ...webTransition })}
     >
       {props.lead}
       <Text numberOfLines={1} style={{ fontSize: props.font, lineHeight: Math.round(props.font * 1.25), flexShrink: 1, color: props.muted ? props.tokens.foregroundMuted : props.tokens.foreground }}>

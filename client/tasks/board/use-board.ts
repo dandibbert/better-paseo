@@ -1,14 +1,15 @@
+import { useHomeDirectory } from "../../state/home-directory";
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type RefObject } from "react";
 import type { PluginScreenProps } from "@getpaseo/plugin/client";
 import { usePaseo, useSettings } from "@getpaseo/plugin/client";
 import { useTitleUpdateControl } from "../actions/title-update";
 import { TITLE_GENERATION_SETTINGS } from "../../../shared/title-generation";
-import { useToast } from "@getpaseo/plugin/client/react-native";
+import { useToast } from "@getpaseo/plugin/client/ui";
 import type { PaseoApi } from "@getpaseo/client";
 import { DEFAULT_TASKS_SETTINGS, TASKS_SETTINGS, effectiveCard, type CardSettings, type LaneWidth, type TasksSettings } from "../../../shared/tasks-settings";
-import { permissionButtons, respondToPermission, useArchiveControl, useReadControl, useStopControl, useUnarchiveControl, type ArchiveControl, type PermissionButton, type ReadControl, type StopControl, type UnarchiveControl } from "../actions";
+import { permissionButtons, respondToPermission, useArchiveControl, useReadControl, useStopControl, useUnarchiveControl, useUnreadControl, type ArchiveControl, type PermissionButton, type ReadControl, type StopControl, type UnarchiveControl, type UnreadControl } from "../actions";
 import type { CardCallbacks, TaskClock } from "../cards";
-import { filterLanes, setTasksArchivedLane, useTasks, withSubagentCards, type TasksHandle } from "../data";
+import { filterLanes, openedTask, setTasksArchivedLane, useTasks, withSubagentCards, type TasksHandle } from "../data";
 import { useSearchFirstPrompts, retrySearchPrompt, type SearchCoverageControl } from "../data/search-first-prompts";
 import { useSearchConversations } from "../data/search-conversations";
 import { useTasksLanguage, type TasksLanguage } from "../i18n";
@@ -18,15 +19,17 @@ import { DEFAULT_CARD_TITLE_LINES, type CardTitleLineCount } from "../device-sto
 import { MOTION } from "./board-style";
 import { carriedSettings, useCarriedTasks } from "./carry";
 import { lingerBoard } from "./prefetch";
-import { cardFilterState, filterToCard } from "./filter-options";
+import { cardFilterState, clearedParams, filterToCard } from "./filter-options";
 import { encodeSort, nameCompare, sortLaneCards } from "./sort";
 import {
+  boardClearCount,
   decodeBoardParams,
   encodeBoardParams,
   rememberBoardParams,
   rememberBoardRoute,
   restoreBoardRoute,
   resolveBoardParams,
+  subscribeBoardParams,
   type BoardDefaults,
   type BoardParams,
 } from "./params";
@@ -36,6 +39,8 @@ import { useTaskAvailability } from "../availability";
 import { useSearchHistory } from "./search-history";
 import { taskIssueText } from "../cards/availability-tag";
 import type { TaskOperation } from "../../../shared/task-availability";
+import { questionDialogStore, type QuestionDialogStore, type QuestionDialogState } from "../actions/question-dialog";
+import { submitQuestion } from "../actions/submit-question";
 
 /** What both layouts share: settings, data after the filters, the clock, and the card callbacks. */
 export interface BoardController {
@@ -93,6 +98,8 @@ export interface BoardController {
   fields: CardSettings;
   titleLines: CardTitleLineCount;
   /** Shared by virtualised cards and their lane-motion copies. */
+  expandedTodo: ReadonlySet<string>;
+  setTodoExpanded(agentId: string, expanded: boolean): void;
   expandedSubtasks: ReadonlySet<string>;
   setSubtasksExpanded(agentId: string, expanded: boolean): void;
   /** The 1 s clock for what shows the time; its identity holds across ticks. */
@@ -100,11 +107,15 @@ export interface BoardController {
   visible: boolean;
   stop: StopControl;
   read: ReadControl;
+  /** Mark unread for a done task: its card, its menu and the details. */
+  unread: UnreadControl;
   /** Unarchive for an archived parent in the details. */
   unarchive: UnarchiveControl;
   /** Archive for a done task: its card, its menu and the details. */
   archive: ArchiveControl;
   callbacks: CardCallbacks;
+  questionDialog: QuestionDialogStore;
+  submitQuestions(state: QuestionDialogState): Promise<void>;
   buttonsFor(card: TaskCard): PermissionButton[];
   /** Fetch a rendered card's project icon; undefined when the field is off. */
   requestIcon: ((projectId: string) => void) | undefined;
@@ -132,7 +143,8 @@ export const NOTICE_MS = 4000;
 /** The layout's own answers to a parent link and a details request. */
 export interface BoardLayoutHandlers {
   reveal(agentId: string): void;
-  details(card: TaskCard, preview?: boolean): void;
+  /** `parent`: the card whose subtask row asked for these details, to go back to. */
+  details(card: TaskCard, preview?: boolean, parent?: string): void;
 }
 
 const NO_BUTTONS: PermissionButton[] = [];
@@ -144,7 +156,7 @@ function buttonsIn(card: TaskCard, language: TasksLanguage): PermissionButton[] 
   if (!permission) return NO_BUTTONS;
   let entry = buttonCache.get(permission);
   if (entry?.language !== language) {
-    entry = { language, buttons: permissionButtons(permission, language) };
+    entry = { language, buttons: permissionButtons(permission, language, true) };
     buttonCache.set(permission, entry);
   }
   return entry.buttons;
@@ -212,6 +224,7 @@ export function useBoard(
   handlers: RefObject<BoardLayoutHandlers | null>,
   compact: boolean,
 ): BoardController {
+  const home = useHomeDirectory();
   const hostId = props.host.id;
   const language = useTasksLanguage();
   const strings = BOARD_STRINGS[language];
@@ -274,6 +287,16 @@ export function useBoard(
     setParamsState({ ...next, hideSubtasks: null });
   }, [hostId, routeKey, updateDevice]);
 
+  // The sidebar's hidden-task dialog cannot pass new params to an open screen;
+  // its clear request arrives here and is applied once per request.
+  const clearRequest = useSyncExternalStore(subscribeBoardParams, () => boardClearCount(hostId), () => boardClearCount(hostId));
+  const appliedClear = useRef(clearRequest);
+  useEffect(() => {
+    if (clearRequest === appliedClear.current) return;
+    appliedClear.current = clearRequest;
+    setParams(clearedParams);
+  }, [clearRequest, setParams]);
+
   const defaults = useMemo<BoardDefaults>(
     () => ({ hideSubtasks: settings.board.hideSubtasks, doneWindow: settings.board.doneWindow }),
     [settings.board.hideSubtasks, settings.board.doneWindow],
@@ -300,6 +323,17 @@ export function useBoard(
   if (!sameFields(fieldsRef.current, cardFields)) fieldsRef.current = cardFields;
   const fields = fieldsRef.current;
 
+  const [expandedTodo, setExpandedTodo] = useState<ReadonlySet<string>>(() => new Set());
+  const setTodoExpanded = useCallback((agentId: string, expanded: boolean) => {
+    setExpandedTodo((current) => {
+      if (current.has(agentId) === expanded) return current;
+      const next = new Set(current);
+      if (expanded) next.add(agentId);
+      else next.delete(agentId);
+      return next;
+    });
+  }, []);
+
   const [expandedSubtasks, setExpandedSubtasks] = useState<ReadonlySet<string>>(() => new Set());
   const setSubtasksExpanded = useCallback((agentId: string, expanded: boolean) => {
     setExpandedSubtasks((current) => {
@@ -321,8 +355,12 @@ export function useBoard(
   }, []);
   const stop = useStopControl({ cardById: (id) => byIdRef.current.get(id), isActive, toast });
   const isReadable = useCallback((agentId: string) => byIdRef.current.get(agentId)?.readable === true, []);
-  const afterRead = useCallback(() => latest.current.tasks.refreshReads(), []);
-  const read = useReadControl({ isReadable, onRead: afterRead, toast });
+  const afterMarks = useCallback(() => {
+    latest.current.tasks.refreshReads();
+    latest.current.tasks.refreshUnreads();
+  }, []);
+  const read = useReadControl({ isReadable, onRead: afterMarks, toast });
+  const unread = useUnreadControl({ onUnread: afterMarks, toast });
   const reconcileRead = read.reconcile;
   // Unarchive runs through the same CLI as Stop.
   const verifyUnarchive = useCallback((agentId: string) => latest.current.tasks.refreshParent(agentId), []);
@@ -358,7 +396,7 @@ export function useBoard(
   const firstPrompts = useSearchFirstPrompts(paseo, unfiltered, filters.query, !searchCancelled && !fullConversationSearch);
   const conversations = useSearchConversations(paseo, unfiltered, fullConversationSearch ? filters.query : "", !searchCancelled);
   const search = fullConversationSearch ? conversations : firstPrompts;
-  const filtered = useMemo(() => filterLanes(unfiltered, filters, search.messages), [unfiltered, filters, search.messages]);
+  const filtered = useMemo(() => filterLanes(unfiltered, filters, search.messages, home), [unfiltered, filters, search.messages, home]);
   // The order is taken when the sort or the cards change, never on a clock
   // tick, so a duration sort does not reshuffle every second.
   const sort = params.sort;
@@ -373,8 +411,8 @@ export function useBoard(
   const hidden = useMemo(() => keepSameCounts(hiddenRef.current, hiddenCounts(unfiltered, filtered)), [unfiltered, filtered]);
   hiddenRef.current = hidden;
   const hiddenSubtasks = useMemo(
-    () => (filters.hideSubtasks ? hiddenSubtaskCount(unfiltered, filtered, filters, search.messages) : 0),
-    [unfiltered, filtered, filters, search.messages],
+    () => (filters.hideSubtasks ? hiddenSubtaskCount(unfiltered, filtered, filters, search.messages, home) : 0),
+    [unfiltered, filtered, filters, search.messages, home],
   );
   const total = laneOrder.reduce((sum, id) => sum + lanes[id].cards.length, 0);
   // Switching the archived lane rearranges the lanes as a filter does, twice when it turns on: at once, and when the list with archived agents lands.
@@ -407,8 +445,8 @@ export function useBoard(
   }, []);
 
   // Callbacks read the latest values through a ref, so the memoized cards see stable functions.
-  const latest = useRef({ props, paseo, toast, stop, read, unarchive, archive, strings, tasks, lanes, availability, language, fullConversationSearch, search });
-  latest.current = { props, paseo, toast, stop, read, unarchive, archive, strings, tasks, lanes, availability, language, fullConversationSearch, search };
+  const latest = useRef({ props, paseo, toast, stop, read, unread, unarchive, archive, strings, tasks, lanes, availability, language, fullConversationSearch, search });
+  latest.current = { props, paseo, toast, stop, read, unread, unarchive, archive, strings, tasks, lanes, availability, language, fullConversationSearch, search };
   const setFullConversationSearch = useCallback((on: boolean) => {
     setFullConversationSearchState(on);
     latest.current.toast.show(latest.current.strings.fullConversationToast(on));
@@ -447,8 +485,19 @@ export function useBoard(
   }, [unfiltered]);
   const subagentCardsRef = useRef(subagentCards);
   subagentCardsRef.current = subagentCards;
+  // Details use the same displayed rows as an archived parent on the board.
+  const historicalParents = useMemo(() => {
+    const out = new Map<string, TaskCard>();
+    for (const card of filtered.archived.cards) {
+      const original = tasks.byId.get(card.id);
+      if (original && card.children.length > original.children.length) out.set(card.id, card);
+    }
+    return out;
+  }, [filtered.archived.cards, tasks.byId]);
+  const historicalParentsRef = useRef(historicalParents);
+  historicalParentsRef.current = historicalParents;
   // Stable, reading the refs, so a lane's memo does not draw it again for it.
-  const cardById = useCallback((id: string) => byIdRef.current.get(id) ?? subagentCardsRef.current.get(id), []);
+  const cardById = useCallback((id: string) => historicalParentsRef.current.get(id) ?? byIdRef.current.get(id) ?? subagentCardsRef.current.get(id), []);
   const toastMessage = useCallback((message: string) => latest.current.toast.show(message), []);
   const open = useCallback((id: string) => {
     // A provider subagent has no tab: its card opens its parent's, where Paseo lists it.
@@ -459,11 +508,20 @@ export function useBoard(
       latest.current.toast.show(latest.current.strings.archivedLane.cannotOpen);
       return;
     }
-    latest.current.props.navigation?.openAgent({ agentId });
+    const navigation = latest.current.props.navigation;
+    if (!navigation) return;
+    navigation.openAgent({ agentId });
+    // Opened is seen: a task marked unread does not stay in review.
+    openedTask(latest.current.paseo, agentId);
   }, []);
   const requestProjectIcon = useCallback((projectId: string) => latest.current.tasks.requestProjectIcon(projectId), []);
   const buttonsFor = useCallback((card: TaskCard) => buttonsIn(card, language), [language]);
   const hasNavigation = props.navigation !== undefined;
+  const questionDialog = useMemo(() => questionDialogStore(paseo).fork(), [paseo]);
+  const submitQuestions = useCallback(async (state: QuestionDialogState) => {
+    const current = latest.current;
+    await submitQuestion(current.paseo, state, current.language, (id) => latest.current.paseo === current.paseo ? latest.current.tasks.byId.get(id) : undefined, (id) => current.availability.check(id, "permission"));
+  }, []);
   const stopAvailable = stop.available;
   const readAvailable = read.available;
   const unarchiveAvailable = unarchive.available;
@@ -481,7 +539,7 @@ export function useBoard(
       onReveal: (agentId, parentId) => {
         if (parentId && !findCard(latest.current.lanes, agentId)) {
           const card = cardById(agentId);
-          if (card) handlers.current?.details(card, true);
+          if (card) handlers.current?.details(card, true, parentId);
           else open(parentId);
           return;
         }
@@ -492,9 +550,16 @@ export function useBoard(
       onCancelStop: (agentId) => latest.current.stop.cancel(agentId),
       // The server cannot reach the daemon itself: no Mark read either.
       onRead: readAvailable ? (card) => write(card.id, "read", () => latest.current.read.press(card)) : undefined,
+      // A file the plugin keeps: not gated on the daemon, and not a blocked write.
+      onUnread: (card) => latest.current.unread.press(card),
       onUnarchive: unarchiveAvailable ? (agentId) => write(agentId, "unarchive", () => latest.current.unarchive.press(agentId)) : undefined,
-      onArchive: (agentId) => write(agentId, "archive", () => latest.current.archive.press(agentId)),
+      onArchive: (agentId, scope) => write(agentId, "archive", () => latest.current.archive.press(agentId, scope)),
       onPermission: (card, button) => {
+        if (button.kind === "question") {
+          const current = cardById(card.id);
+          if (current) questionDialog.open(current);
+          return;
+        }
         if (button.kind === "open") {
           open(card.id);
           return;
@@ -511,7 +576,7 @@ export function useBoard(
       onFilter: (card, by) => setParams((current) => filterToCard(current, card, latest.current.tasks.workspaces, by)),
       filterState: (card) => cardFilterState(paramsRef.current, card, latest.current.tasks.workspaces),
     }),
-    [hasNavigation, stopAvailable, readAvailable, unarchiveAvailable, open, handlers, setParams, titleUpdates, write, cardById, conversations.status],
+    [hasNavigation, stopAvailable, readAvailable, unarchiveAvailable, open, handlers, setParams, titleUpdates, write, cardById, conversations.status, questionDialog],
   );
 
   const guardedRead = useMemo(() => ({ ...read, press: (card: TaskCard) => write(card.id, "read", () => read.press(card)) }), [read, write]);
@@ -550,15 +615,20 @@ export function useBoard(
     total,
     fields,
     titleLines,
+    expandedTodo,
+    setTodoExpanded,
     expandedSubtasks,
     setSubtasksExpanded,
     clock,
     visible,
     stop,
     read: guardedRead,
+    unread,
     unarchive: guardedUnarchive,
     archive: guardedArchive,
     callbacks,
+    questionDialog,
+    submitQuestions,
     buttonsFor,
     requestIcon: fields.projectIcon ? requestProjectIcon : undefined,
     highlighted,
@@ -587,10 +657,10 @@ const PENDING_LANES: readonly LaneId[] = ["needs_input", "running", "review"];
  * with subtasks shown, less what shows. The gap between the sidebar's
  * numbers and the lanes' while the switch is off.
  */
-export function hiddenSubtaskCount(all: Record<LaneId, LaneModel>, shown: Record<LaneId, LaneModel>, filters: BoardFilters, firstMessages?: ReadonlyMap<string, string>): number {
+export function hiddenSubtaskCount(all: Record<LaneId, LaneModel>, shown: Record<LaneId, LaneModel>, filters: BoardFilters, firstMessages?: ReadonlyMap<string, string>, home?: string): number {
   const pending = {} as Record<LaneId, LaneModel>;
   for (const id of LANE_ORDER) pending[id] = PENDING_LANES.includes(id) ? all[id] : { ...all[id], cards: [] };
-  const withSubtasks = filterLanes(pending, { ...filters, hideSubtasks: false }, firstMessages);
+  const withSubtasks = filterLanes(pending, { ...filters, hideSubtasks: false }, firstMessages, home);
   return PENDING_LANES.reduce((sum, id) => sum + Math.max(0, withSubtasks[id].cards.length - shown[id].cards.length), 0);
 }
 

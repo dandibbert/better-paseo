@@ -12,7 +12,7 @@ vi.mock("react-native", async () => {
   return import("./helpers/rn-mock");
 });
 const clipboard = vi.hoisted(() => ({ copyText: vi.fn(async (_text: string) => {}), show: vi.fn(), error: vi.fn() }));
-vi.mock("@getpaseo/plugin/client/react-native", async () => {
+vi.mock("@getpaseo/plugin/client/ui", async () => {
   const rn = await import("./helpers/rn-mock");
   return {
     Icon: rn.View,
@@ -20,7 +20,6 @@ vi.mock("@getpaseo/plugin/client/react-native", async () => {
     TextInput: rn.TextInput,
     copyText: clipboard.copyText,
     useToast: () => ({ show: clipboard.show, error: clipboard.error }),
-    useRevealedText: (text: string) => text,
   };
 });
 vi.mock("@getpaseo/plugin/client", () => ({
@@ -54,6 +53,7 @@ vi.mock("../../client/web", () => ({
   bindDetailsEscape: () => () => {},
   bindTouchDismiss: () => () => {},
   openToolbarDetailsLayer: () => () => {},
+  pinTooltipLayer: () => () => {},
   suppressTouchCallout: () => {},
 }));
 import { StyleSheet } from "react-native";
@@ -118,14 +118,14 @@ describe("the image viewer's spoken labels", () => {
   it("speaks English with English settings", () => {
     updateEnhancerPreferences({ language: "en" });
     const renderer = render();
-    expect(labels(renderer)).toEqual(["Zoom in", "Zoom out", "Reset zoom", "Open in default app", "Close the image"]);
+    expect(labels(renderer)).toEqual(["Zoom in", "Zoom out", "Reset zoom", "Open file", "Close the image"]);
     act(() => renderer.unmount());
   });
 
   it("speaks Chinese with Chinese settings on a hover device", () => {
     updateEnhancerPreferences({ language: "zh" });
     const renderer = render();
-    expect(labels(renderer)).toEqual(["放大", "缩小", "复原缩放", "用默认应用打开", "关闭图片"]);
+    expect(labels(renderer)).toEqual(["放大", "缩小", "复原缩放", "打开文件", "关闭图片"]);
     act(() => renderer.unmount());
   });
 
@@ -145,8 +145,8 @@ describe("the image viewer's spoken labels", () => {
 
 describe("the image viewer's hover names", () => {
   it.each([
-    ["en", ["Zoom in", "Zoom out", "Open in default app", "Close the image"]],
-    ["zh", ["放大", "缩小", "用默认应用打开", "关闭图片"]],
+    ["en", ["Zoom in", "Zoom out", "Open file", "Close the image"]],
+    ["zh", ["放大", "缩小", "打开文件", "关闭图片"]],
   ] as const)("names an enabled button after a resting pointer (%s)", (language, names) => {
     updateEnhancerPreferences({ language });
     const renderer = render();
@@ -174,11 +174,15 @@ describe("the image viewer's hover names", () => {
     act(() => renderer.unmount());
   });
 
-  it("keeps the buttons' look: 24 square on web, surface2, muted icon turning foreground on hover", () => {
+  it("keeps the button targets and uses an icon-sized circular surface, brightening on hover", () => {
     const renderer = render();
     const zoomIn = buttons(renderer)[0]!;
     const style = StyleSheet.flatten(zoomIn.props.style) as Record<string, unknown>;
-    expect(style).toMatchObject({ width: 24, height: 24, backgroundColor: tokens.v2.surface2 });
+    expect(style).toMatchObject({ width: 24, height: 24 });
+    const fill = StyleSheet.flatten(zoomIn.findByProps({ testID: "toolbar-icon-fill" }).props.style);
+    expect(fill).toMatchObject({ width: 24, height: 24, borderRadius: 12, backgroundColor: tokens.v2.surface2 });
+    const disabledFill = StyleSheet.flatten(buttons(renderer)[2]!.findByProps({ testID: "toolbar-icon-fill" }).props.style);
+    expect(disabledFill.backgroundColor).toBe(tokens.v2.surface2);
     expect(iconColor(zoomIn)).toBe(tokens.foregroundMuted);
     act(() => zoomIn.props.onHoverIn());
     expect(iconColor(buttons(renderer)[0]!)).toBe(tokens.foreground);

@@ -1,6 +1,6 @@
 import React from "react";
 import { View, Text, StyleSheet } from "react-native";
-import { Icon } from "@getpaseo/plugin/client/react-native";
+import { Icon } from "@getpaseo/plugin/client/ui";
 import { ProviderLogo } from "./provider-logo";
 import type { ExtendedThemeTokens } from "./theme-tokens";
 import { useEnhancerPreferences } from "../preferences";
@@ -49,7 +49,6 @@ export function useFooterDetailsWidth(): number {
 export function FooterDetails({ agentName, modelId, modelName, thinkingLabel, startedAt, completedAt, durationMs, usage, telemetry, tokens }: FooterDetailsProps) {
   const { language } = useEnhancerPreferences();
   const rows: Array<{ label: string; icon: string; provider?: string | null; value: string; copyText?: string; copyLabel?: string }> = [];
-  if (agentName) rows.push({ label: "Agent", icon: "Bot", provider: agentName, value: agentName, copyLabel: "Copy agent" });
   if (modelName) rows.push({ label: "Model name", icon: "Copy", provider: agentName, value: modelName, copyText: modelId ?? undefined, copyLabel: "Copy model name" });
   if (thinkingLabel) rows.push({ label: "Thinking level", icon: "Brain", value: thinkingLabel, copyLabel: "Copy thinking level" });
   if (startedAt != null) rows.push({ label: "Start time", icon: "Clock", value: formatFullStamp(new Date(startedAt)), copyLabel: "Copy start time" });

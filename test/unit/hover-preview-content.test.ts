@@ -6,16 +6,17 @@ import "./helpers/quiet-renderer";
 
 vi.mock("react-native", () => import("./helpers/rn-mock"));
 const clipboard = vi.hoisted(() => ({ copyText: vi.fn(async (_text: string) => {}), show: vi.fn(), error: vi.fn() }));
-vi.mock("@getpaseo/plugin/client/react-native", async () => {
+vi.mock("@getpaseo/plugin/client/ui", async () => {
   const rn = await import("./helpers/rn-mock");
   return { Icon: rn.View, ScrollView: rn.ScrollView, TextInput: rn.TextInput,
-    copyText: clipboard.copyText, useToast: () => ({ show: clipboard.show, error: clipboard.error }), useRevealedText: (text: string) => text };
+    copyText: clipboard.copyText, useToast: () => ({ show: clipboard.show, error: clipboard.error }) };
 });
 vi.mock("@getpaseo/plugin/client", () => ({
   useAgent: () => undefined, useWorkspace: () => undefined,
   useRpc: () => () => Promise.resolve(null), usePaseo: () => ({}),
   useSettings: () => ({ status: "loading" }),
 }));
+import { PathContext } from "../../client/ui/path-text";
 import { buildThemeTokens } from "../../client/components/theme-tokens";
 import { ToolCallout, ToolPreviewContent } from "../../client/components/tool-callouts";
 import { ReasoningCard } from "../../client/components/reasoning-trace";
@@ -74,6 +75,19 @@ function previewOf(element: React.ReactElement) {
   return text;
 }
 describe("full hover preview content", () => {
+  it("shortens the preview path while the toolbar copies the original", async () => {
+    const path = "/Users/alice/projects/Some Project/file.ts";
+    const data = classifyTool({ name: "Edit", status: "completed", detail: { type: "edit", filePath: path, oldString: "old", newString: "new" } });
+    let view!: ReturnType<typeof TestRenderer.create>;
+    await act(async () => { view = TestRenderer.create(React.createElement(PathContext.Provider,
+      { value: { roots: [], mode: "absolute", home: "/Users/alice" } },
+      React.createElement(ToolPreviewContent, { data, tokens, compact: false, resolvePath: (value) => value }))); });
+    expect(textOf(view.toJSON())).toContain("~/projects/Some Project/file.ts");
+    await press(view, "Copy path");
+    expect(clipboard.copyText).toHaveBeenCalledWith(path);
+    act(() => view.unmount());
+  });
+
   it.each(["md", "markdown", "MD"])("toggles a Write .%s preview with one button and copies the source in both modes", async (extension) => {
     const content = "# Title\n\n**bold**\n\n| A | B |\n| --- | --- |\n| one | two |";
     const data = classifyTool({ name: "Write", status: "completed", detail: {
@@ -528,6 +542,12 @@ describe("preview line numbers and shading", () => {
         act(() => gutter().props.onResponderGrant({ nativeEvent: { locationY: line + 1, pageY: 100 } }));
         act(() => { vi.advanceTimersByTime(400); });
         act(() => gutter().props.onResponderMove({ nativeEvent: { pageY: 100 + line } }));
+        const band = body.root.findByProps({ testID: "preview-gutter-selection" });
+        expect(Object.assign({}, ...[band.props.style].flat(Infinity))).toMatchObject({
+          top: line, height: 2 * line, backgroundColor: tokens.textSelection,
+        });
+        const lines = body.root.findByProps({ testID: "preview-line-selection" });
+        expect(Object.assign({}, ...[lines.props.style].flat(Infinity)).backgroundColor).toBe(tokens.textSelection);
         expect(body.root.findAllByProps({ testID: "preview-line-selection-menu" })).toHaveLength(0);
         act(() => gutter().props.onResponderRelease());
         await press(body, "Copy selected lines");

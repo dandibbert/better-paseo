@@ -1,10 +1,11 @@
 /**
  * Shared types for block details: tap a timeline row to read it in a bottom
  * drawer, a floating bottom panel or a right-hand panel, chosen by window width
- * (docs/prototypes/block-details-sheet.md). Every slice of the feature builds on
+ * (https://github.com/RoundRedDot/better-paseo/blob/f2ab453297c4ccb88a08e2129af0cb3528c4e628/docs/prototypes/block-details-sheet.md). Every slice of the feature builds on
  * these; change them only together with their users.
  */
 import { createContext, type ReactNode } from "react";
+import type { DetailsZoomControls } from "./shell/zoom-controls";
 
 /**
  * drawer: full-width bottom sheet with a scrim (W < 600).
@@ -68,6 +69,10 @@ export interface BlockEntry {
   iconColor?: string;
   /** The row reads an image: a tap opens the viewer instead of the panel. */
   readsImage: boolean;
+  /** A desktop side panel opened for this entry closes on a click outside. */
+  dismissOnOutside?: boolean;
+  /** Reserve space in the desktop timeline while this entry is shown at the side. */
+  reserveTimeline?: boolean;
   /** The preview content, the same tree the hover panel draws. */
   render(): ReactNode;
   copies(): readonly CopyItem[];
@@ -79,25 +84,31 @@ export interface BlockEntry {
 
 export interface DetailsState {
   openId: string | null;
+  /** Keep the host available for a panel explicitly opened outside block details. */
+  independent: boolean;
   form: DetailsForm;
   detent: Detent;
   /** Drawer / floating at full height, or the side panel widened. */
   fullscreen: boolean;
   /** The block whose row marker lingers 1.2 s after the panel closed. */
   lingerId: string | null;
+  /** Opened at the side on request ("open in panel"): on desktop it reserves timeline space like work details. */
+  docked?: boolean;
 }
 
 export interface OpenOptions {
   detent?: Detent;
+  /** Open even when ordinary block details are disabled. */
+  independent?: boolean;
   /** False for a code block: no ‹ ›, not counted. */
   navigable?: boolean;
-  /** Force a form (the desktop hover's "open in panel" asks for side). */
+  /** Force a form (the desktop hover's "open in panel" asks for side, which also docks the panel). */
   form?: DetailsForm;
 }
 
 export interface DetailsApi {
   open(agentId: string, id: string, options?: OpenOptions): void;
-  close(agentId: string): void;
+  close(agentId: string, options?: { clearMarker?: boolean }): void;
   /** Previous (-1) or next (1) navigable block. */
   step(agentId: string, direction: -1 | 1): void;
   setDetent(agentId: string, detent: Detent): void;
@@ -117,7 +128,7 @@ export interface BlockPlacement {
 }
 export const BlockPlacementContext = createContext<BlockPlacement | null>(null);
 
-/** Independent native details text size, in points (`detailsFontSize`). */
+/** Independent details text size (`detailsFontSize`). */
 export interface DetailsZoom {
   /** The fixed default size used by Reset. */
   base: number;
@@ -152,7 +163,9 @@ export interface DetailsShellValue {
   toggleFullscreen?(): void;
   /** Spread on the header: vertical drag moves the drawer, horizontal swipe steps (touch only). */
   headerHandlers?: Record<string, unknown>;
-  /** Native details text zoom, set by a body pinch or the badge's buttons; absent on web. */
+  /** Details text zoom, set by native pinch or desktop toolbar controls. */
   zoom?: DetailsZoom;
+  /** The native body's text size controls, published for the toolbar (`zoom-controls.ts`). */
+  zoomControls?: DetailsZoomControls;
 }
 export const DetailsShellContext = createContext<DetailsShellValue | null>(null);

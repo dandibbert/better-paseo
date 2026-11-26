@@ -1,6 +1,6 @@
 /**
  * The details toolbar's copy buttons: as many as fit side by side, the rest
- * in a "⋯" menu (docs/prototypes/block-details-sheet.md, "复制按钮"). The
+ * in a "⋯" menu (https://github.com/RoundRedDot/better-paseo/blob/f2ab453297c4ccb88a08e2129af0cb3528c4e628/docs/prototypes/block-details-sheet.md, "复制按钮"). The
  * order is the content's, its first copy the main one, so the fold starts at
  * the last and the first always stays. An empty copy, or one with the label or
  * text of an earlier one, is not offered at all.
@@ -10,7 +10,7 @@
  */
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Animated, Platform, Pressable, StyleSheet, Text, View } from "react-native";
-import { Icon } from "@getpaseo/plugin/client/react-native";
+import { Icon } from "@getpaseo/plugin/client/ui";
 import type { ExtendedThemeTokens } from "../../components/theme-tokens";
 import { radiusV2, space } from "../../components/theme-tokens";
 import { unselectable } from "../../components/selection";
@@ -20,6 +20,7 @@ import { bindDetailsEscape, bindTouchDismiss } from "../../web";
 import { useEnhancerPreferences } from "../../preferences";
 import { toolbarLabel } from "../../i18n/toolbar-strings";
 import { usePreviewEntrance } from "../../ui/use-preview-entrance";
+import { useHover } from "../../ui/use-hover";
 import { DROPDOWN_REVEAL } from "../../ui/tokens/motion";
 
 interface Registered {
@@ -141,25 +142,20 @@ function CopyMenu({ items, tokens, close }: { items: readonly CopyOverflowItem[]
   return (
     <View testID="details-copy-menu" accessibilityRole="menu" style={styles.menu}>
       {items.map((item) => (
-        <Pressable
-          key={item.label}
-          accessibilityRole="menuitem"
-          accessibilityLabel={toolbarLabel(item.label, language)}
-          onPress={() => {
-            item.copy();
-            close();
-          }}
-          style={({ pressed }) => [styles.item, Platform.OS === "web" && styles.pointer, pressed && { backgroundColor: tokens.v2.surface2 }]}
-        >
-          <Icon name={item.icon} size={16} color={tokens.foregroundMuted} />
-          <Text selectable={false} numberOfLines={1}
-            style={[styles.label, unselectable, { color: tokens.foreground, fontFamily: tokens.fontUi }]}>
-            {toolbarLabel(item.label, language)}
-          </Text>
-        </Pressable>
+        <CopyMenuItem key={item.label} item={item} label={toolbarLabel(item.label, language)} tokens={tokens} close={close} />
       ))}
     </View>
   );
+}
+
+function CopyMenuItem({ item, label, tokens, close }: { item: CopyOverflowItem; label: string; tokens: ExtendedThemeTokens; close(): void }) {
+  const { hovered, hoverProps } = useHover();
+  return <Pressable accessibilityRole="menuitem" accessibilityLabel={label} {...hoverProps}
+    onPress={() => { item.copy(); close(); }}
+    style={({ pressed }) => [styles.item, Platform.OS === "web" && styles.pointer, (hovered || pressed) && { backgroundColor: tokens.v2.surface2 }]}>
+    <Icon name={item.icon} size={16} color={tokens.foregroundMuted} />
+    <Text selectable={false} numberOfLines={1} style={[styles.label, unselectable, { color: tokens.foreground, fontFamily: tokens.fontUi }]}>{label}</Text>
+  </Pressable>;
 }
 
 function menuLook(tokens: ExtendedThemeTokens) {
@@ -181,7 +177,7 @@ const styles = StyleSheet.create({
     transformOrigin: "right top",
   },
   menu: { paddingVertical: space.xs },
-  item: { flexDirection: "row", alignItems: "center", gap: space.sm, minHeight: 36, paddingHorizontal: space.md },
+  item: { flexDirection: "row", alignItems: "center", gap: space.sm, minHeight: 36, borderRadius: 18, paddingHorizontal: space.md },
   pointer: { cursor: "pointer" } as object,
   label: { flexShrink: 1, fontSize: 14 },
 });

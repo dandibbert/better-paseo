@@ -12,7 +12,7 @@ import type { RenderContext } from "./context";
 import { MARKER_GAP, MOBILE_BULLET_GAP } from "./styles";
 import { BlockSelectionContext } from "./block-selection";
 import { renderInline } from "./inline";
-import { escapeProse, nativeBlockSource, nativeProseSource, type NativeProseSource, type ProseLink } from "./native-prose-source";
+import { escapeProse, hasCodexInline, nativeBlockSource, nativeProseSource, type NativeProseSource, type ProseLink } from "./native-prose-source";
 import { resolveLocalLink } from "./local-path";
 import type { NativeFileLinkSource } from "../native-file-links";
 
@@ -35,9 +35,14 @@ interface Props extends TextProps {
 
 /** A paragraph, heading or list body; code fences and tables keep their existing renderers. */
 export function MarkdownProse({ context, tokens, text, prefix, bold, style, ...rest }: Props) {
-  if (Platform.OS !== "ios" || context.plainProse) {
+  const selection = useContext(BlockSelectionContext);
+  if (Platform.OS !== "ios" || context.plainProse || (tokens && hasCodexInline(tokens))) {
     const body = text === undefined ? renderInline(tokens, context, "p", bold) : context.renderText ? context.renderText(text) : text;
-    return <ProseText style={style} {...rest}>{prefix
+    // A selected block (iOS while streaming, Android) gives up native selection
+    // as the native prose does, so a double tap leaves one highlight, not two.
+    // `selectionColor` is Android's highlight; web paints `::selection` (`text-selection.ts`).
+    return <ProseText style={style} selectionColor={context.tokens.textSelection} {...rest}
+      {...(selection?.selected ? { selectable: false } : null)}>{prefix
       ? [<ProseSpan key="prefix" style={context.styles.headingHash}>{prefix}</ProseSpan>, body]
       : body}</ProseText>;
   }
@@ -72,7 +77,7 @@ function nativeStyle(style: TextProps["style"], context: RenderContext, gap = 0,
       fontWeight: String(base.fontWeight ?? "400"), color: color(base.color), lineHeight: base.lineHeight ?? metrics.bodyLineHeight,
       marginTop: 0, marginBottom: gap, marginLeft: metrics.indentStep,
       markerMinWidth: metrics.markerWidth - MARKER_GAP, gapWidth: MARKER_GAP + (unordered ? MOBILE_BULLET_GAP : 0), itemSpacing: metrics.itemGap,
-      bulletColor: processColor(tokens.foregroundMuted), bulletSize: 4,
+      bulletColor: processColor(tokens.foregroundMuted), bulletSize: context.variant === "document" ? 3 : 4,
       markerColor: processColor(tokens.foregroundMuted), markerFontWeight: "400" },
   };
 }
@@ -87,6 +92,8 @@ function IOSProse({ context, tokens, text, prefix, style, blockTokens, gap, ...r
   // The host uses the GFM container for lists; its native block layout owns wrapping.
   const Component = blockTokens?.some((token) => token.type === "list") ? NativeListProse : NativeProse;
   const props = { ...rest, markdown, markdownStyle, style: [style, { backgroundColor: "transparent" }],
+    // Fabric processes this ColorValue before UIKit applies it as tintColor.
+    selectionColor: context.tokens.textSelectionTint,
     selectable: !selection?.selected, isGFM: true, allowFontScaling: rest.allowFontScaling ?? true, allowTrailingMargin: false,
     enableLinkPreview: false, enableBlockContextMenu: false, streamingAnimation: false,
     md4cFlags: blockTokens ? GROUP_FLAGS : FLAGS,

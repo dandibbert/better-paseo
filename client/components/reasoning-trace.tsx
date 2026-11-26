@@ -8,6 +8,8 @@ import { surfaceProps } from "./view-props";
 import { MarkdownView } from "./markdown/markdown-view";
 import { variantMetrics } from "./markdown/render/styles";
 import type { ReasoningTraceData } from "../../shared/contracts";
+import type { PluginTheme } from "@getpaseo/plugin";
+import { InlineTranslation, InlineTranslateButton, InlineTranslationNotice, type InlineTranslationState } from "../translation/inline";
 import { DISCLOSURE_HEADER, DisclosureHeader, RowIcon, RowText } from "../ui/disclosure-header";
 import { STICKY_SUPPORTED, StickyCard } from "../ui/sticky-header";
 import { useScrollAnchor } from "../ui/scroll-anchor";
@@ -33,6 +35,7 @@ import { useEnhancerPreferences } from "../preferences";
 import { fitsRow } from "../tools/detail";
 import { CLAMPED_LINES, splitBodyRuns, type BodyRun } from "../reasoning/paragraphs";
 import { TYPE, blockProseBase } from "../ui/tokens/typography";
+import { selectionColorProps } from "./text-selection";
 
 /** Four lines of a thought's body: quiet compact Markdown at the block's size. */
 function clampHeight(tokens: ExtendedThemeTokens): number {
@@ -180,7 +183,7 @@ function SectionViewBody({ section, tokens, compact, storeKey, live }: SectionVi
     <View style={styles.section}>
       <Pressable accessible={false} focusable={false} {...hoverProps} style={styles.sectionTitleRow}>
         <Text
-          selectable
+          selectable {...selectionColorProps()}
           style={[
             styles.sectionTitle,
             {
@@ -310,6 +313,7 @@ export interface ReasoningCardProps {
   storeKey: string;
   /** What "copy" puts on the clipboard: the whole thought. */
   copyText: string;
+  translation?: { agentId: string; theme: PluginTheme };
 }
 
 /**
@@ -322,26 +326,52 @@ export interface ReasoningCardProps {
  * The only motion is the `RunningDot`, mounted while thinking, and the body's
  * fade-in on expansion.
  */
-export function ReasoningCard({
-  segmentation,
-  streaming,
-  durationMs,
-  expanded: expandedProp,
-  onToggle,
-  tokens,
-  compact = false,
-  storeKey,
-  copyText,
-}: ReasoningCardProps) {
+export function ReasoningCard(props: ReasoningCardProps) {
+  if (!props.translation) return <ReasoningCardContent {...props} />;
+  return <InlineTranslation agentId={props.translation.agentId} kind="reasoning" text={copyTextOf(props.copyText)} streaming={props.streaming}>
+    {(inline) => <ReasoningCardContent {...props} inline={inline} />}
+  </InlineTranslation>;
+}
+
+function ReasoningPreview({ text, streaming, tokens, translation }: {
+  text: string; streaming: boolean; tokens: ExtendedThemeTokens; translation?: { agentId: string; theme: PluginTheme };
+}) {
+  if (!translation || !text) return <ReasoningPreviewContent text={text} streaming={streaming} tokens={tokens} />;
+  return <InlineTranslation agentId={translation.agentId} kind="reasoning" text={text} streaming={streaming}>
+    {(inline) => <ReasoningPreviewContent text={text} streaming={streaming} tokens={tokens} translation={translation} inline={inline} />}
+  </InlineTranslation>;
+}
+
+function ReasoningPreviewContent({ text, streaming, tokens, translation, inline }: {
+  text: string; streaming: boolean; tokens: ExtendedThemeTokens;
+  translation?: { agentId: string; theme: PluginTheme }; inline?: InlineTranslationState;
+}) {
+  const shown = inline?.active && inline.view?.status === "done" ? inline.view.result.translation : text;
+  return <>
+    <HoverPreviewHeader tokens={tokens} streaming={streaming} left={inline && translation ? <InlineTranslateButton state={inline} theme={translation.theme} testID="reasoning-preview-translate" timeline /> : null}>
+      <View style={styles.previewActions}>
+        <ToolbarCopyButton text={text} tokens={tokens} label="Copy thought" />
+      </View>
+    </HoverPreviewHeader>
+    <HoverPreviewBody streaming={streaming}>
+      {inline && translation ? <InlineTranslationNotice state={inline} theme={translation.theme} /> : null}
+      <MarkdownView text={shown} tokens={tokens} variant="compact" quiet streaming={streaming} size={blockProseBase(tokens.typography)} />
+    </HoverPreviewBody>
+  </>;
+}
+
+function ReasoningCardContent({ segmentation: originalSegmentation, streaming, durationMs, expanded: expandedProp, onToggle, tokens, compact = false, storeKey, copyText, translation, inline }: ReasoningCardProps & { inline?: InlineTranslationState }) {
+  const translated = inline?.active && inline.view?.status === "done" ? inline.view.result.translation : null;
+  const segmentation = useMemo(() => translated === null ? originalSegmentation : segmentReasoning(translated), [originalSegmentation, translated]);
   const label = reasoningHeaderText(segmentation, streaming, durationMs);
   const { language } = useEnhancerPreferences();
   // A finished one-sentence thought is all on the row already: nothing to open.
   const budget = compact ? DISCLOSURE_HEADER.targetBudget.compact : DISCLOSURE_HEADER.targetBudget.desktop;
   const inert =
     !streaming &&
-    segmentation.kind === "prose" &&
-    plainInline(segmentation.body) === label.preview &&
-    fitsRow(label.preview, budget);
+    originalSegmentation.kind === "prose" &&
+    plainInline(originalSegmentation.body) === reasoningHeaderText(originalSegmentation, streaming, durationMs).preview &&
+    fitsRow(reasoningHeaderText(originalSegmentation, streaming, durationMs).preview, budget);
   const expanded = expandedProp && !inert;
   // Owned here, not by the row: an opened card moves the row into `StickyCard`.
   const scrollAnchor = useScrollAnchor(expanded);
@@ -399,26 +429,25 @@ export function ReasoningCard({
         ) : undefined
       }
       meta={label.meta.map((part) => toolbarLabel(part, language))}
-      actions={<ToolbarCopyButton text={copySource} tokens={tokens} label="Copy thought" />}
+      actionsActive={inline?.active}
+      actions={<>
+        {translation && inline ? <InlineTranslateButton state={inline} theme={translation.theme} testID="reasoning-translate" timeline /> : null}
+        <ToolbarCopyButton text={copySource} tokens={tokens} label="Copy thought" />
+      </>}
       onLongPress={onLongPress}
       accessibilityLabel={label.preview ? `${label.verb}: ${label.preview}` : label.verb}
       previewContent={() => (
-        <>
-          <HoverPreviewHeader tokens={tokens} streaming={streaming}>
-            <View style={styles.previewActions}>
-              <ToolbarCopyButton text={copySource} tokens={tokens} label="Copy thought" />
-            </View>
-          </HoverPreviewHeader>
-          <HoverPreviewBody streaming={streaming}>
-            <MarkdownView text={reasoningText(segmentation)} tokens={tokens} variant="compact" quiet streaming={streaming} size={blockProseBase(tokens.typography)} />
-          </HoverPreviewBody>
-        </>
+        <ReasoningPreview text={copySource()} streaming={streaming} tokens={tokens} translation={translation} />
       )}
     />
   );
+  const notice = inline && translation ? <InlineTranslationNotice state={inline} theme={translation.theme} /> : null;
+  // Closed (or with nothing to open), the header carries a finished translation; a failure or wait shows under it.
   const body = expanded ? (
     <FadeIn>
       <View {...surfaceProps(selectionSurface)} style={[styles.body, selectableSurface]}>
+        {notice}
+        <View style={inline?.active && inline.view && ["running", "settings-loading"].includes(inline.view.status) ? { opacity: 0.55 } : undefined}>
         <ReasoningSectionsView
           segmentation={segmentation}
           tokens={tokens}
@@ -426,9 +455,10 @@ export function ReasoningCard({
           streaming={streaming}
           compact={compact}
         />
+        </View>
       </View>
     </FadeIn>
-  ) : null;
+  ) : notice;
 
   // A long opened thought pins its row on a host with the sticky API (S6).
   if (expanded && STICKY_SUPPORTED) {
