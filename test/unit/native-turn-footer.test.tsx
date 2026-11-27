@@ -399,4 +399,99 @@ describe("native turn footer slot integration", () => {
     expect(details.props.durationMs).toBe(51_000);
     expect(details.props.usage).toEqual({ inputTokens: 3_000, outputTokens: 200 });
   });
+
+  it("avoids model negative-margin clipping on web/desktop and reserves non-wrapping timing room on compact native", async () => {
+    const rn = await import("./helpers/rn-mock");
+    const winWidth = rn.Dimensions.get().width;
+
+    // 1. Desktop web: flexShrink: 1, no maxWidth cap, no negative-margin + maxWidth: 100% chop.
+    await act(async () => {
+      renderer = TestRenderer.create(
+        React.createElement(NativeTurnFooterItem, {
+          theme,
+          host: { id: "host-1", label: "Host" },
+          layout: { compact: false, platform: "web" },
+          agentId: "agent-1",
+          turnId: "one",
+          model: "sol",
+          provider: "codex",
+          completedAt: new Date(52_000),
+          durationMs: 41_000,
+          telemetry: { outputTps: 27.1 },
+        }),
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const webExtras = renderer!.root.findByProps({ testID: "native-footer-extras" });
+    const webContainerStyle = rn.StyleSheet.flatten(webExtras.props.style);
+    expect(webContainerStyle.flexShrink).toBe(1);
+    expect(webContainerStyle.maxWidth).toBeUndefined();
+    const webModelButton = webExtras.find((node) => typeof node.type === "string" && node.props.accessibilityLabel === "Copy model name");
+    const webModelStyle = rn.StyleSheet.flatten(webModelButton.props.style);
+    expect(webModelStyle.marginHorizontal).toBeUndefined();
+    expect(webModelStyle.maxWidth).toBeUndefined();
+
+    act(() => renderer!.unmount());
+    renderer = undefined;
+
+    // 2. Compact iOS: flexShrink: 0 with maxWidth reserving enough room for host timing label.
+    updateEnhancerPreferences({ language: "zh" });
+    await act(async () => {
+      renderer = TestRenderer.create(
+        React.createElement(NativeTurnFooterItem, {
+          theme,
+          host: { id: "host-1", label: "Host" },
+          layout: { compact: true, platform: "ios" },
+          agentId: "agent-1",
+          turnId: "one",
+          model: "sol",
+          provider: "codex",
+          completedAt: new Date(52_000),
+          durationMs: 41_000,
+          telemetry: { outputTps: 27.6 },
+        }),
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const iosExtras = renderer!.root.findByProps({ testID: "native-footer-extras" });
+    const iosContainerStyle = rn.StyleSheet.flatten(iosExtras.props.style);
+    expect(iosContainerStyle.flexShrink).toBe(0);
+    expect(iosContainerStyle.maxWidth).toBe(Math.max(110, Math.floor(winWidth) - 200));
+    const iosModelButton = iosExtras.find((node) => typeof node.type === "string" && node.props.accessibilityLabel === "Copy model name");
+    const iosModelStyle = rn.StyleSheet.flatten(iosModelButton.props.style);
+    expect(iosModelStyle.marginHorizontal).toBeUndefined();
+    expect(iosModelStyle.maxWidth).toBeUndefined();
+
+    act(() => renderer!.unmount());
+    renderer = undefined;
+
+    // 3. Compact iOS without durationMs (host displays short HH:MM timestamp): reserves 166pt.
+    await act(async () => {
+      renderer = TestRenderer.create(
+        React.createElement(NativeTurnFooterItem, {
+          theme,
+          host: { id: "host-1", label: "Host" },
+          layout: { compact: true, platform: "ios" },
+          agentId: "agent-1",
+          turnId: "one",
+          model: "sol",
+          provider: "codex",
+          completedAt: new Date(52_000),
+          durationMs: null,
+          telemetry: { outputTps: 27.6 },
+        }),
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    const tsExtras = renderer!.root.findByProps({ testID: "native-footer-extras" });
+    expect(rn.StyleSheet.flatten(tsExtras.props.style).maxWidth).toBe(Math.max(110, Math.floor(winWidth) - 166));
+  });
 });

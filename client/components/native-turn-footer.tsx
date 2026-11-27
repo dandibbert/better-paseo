@@ -173,15 +173,26 @@ export function NativeTurnFooterItem({
     />
   );
 
-  // Host `AssistantTurnFooter` uses `label: { width: "100%", flexShrink: 0 }`
-  // inside a `flexShrink: 1` Pressable, which squeezes any sibling with
-  // `flexShrink: 1`. Keeping `flexShrink: 0` on this container lets the host's
-  // spacer shrink to its text width while `maxWidth` + `modelAnchor` cap our
-  // width so long model names ellipsize instead of clipping off-screen.
-  const maxRowWidth = compact
-    ? Math.max(120, Math.floor(windowWidth) - 156)
-    : windowWidth > 0
-      ? Math.max(240, Math.floor(windowWidth) - 220)
+  // On native (Yoga), host `AssistantTurnFooter` puts `width: "100%", flexShrink: 0`
+  // on the timing `<Text>` inside a `flexShrink: 1` Pressable, which takes the
+  // entire row as its flex basis and starves any `flexShrink: 1` sibling. Using
+  // `flexShrink: 0` with a conservative `maxWidth` keeps the timing label on a
+  // single line while still allowing `modelAnchor` to ellipsize.
+  // On web/desktop, `flexShrink: 1` lets the plugin row expand naturally to its
+  // full width without truncating model names, and removing negative horizontal
+  // margin avoids `maxWidth: 100%` border-box clipping of short model labels.
+  const isWebLayout = layout.platform === "web";
+  const hasHostDuration = durationMs !== undefined && durationMs !== null;
+  const compactReserve = hasHostDuration
+    ? hintLanguage === "zh"
+      ? 200
+      : 220
+    : completedAt
+      ? 166
+      : 114;
+  const maxRowWidth =
+    !isWebLayout && windowWidth > 0
+      ? Math.max(compact ? 110 : 240, Math.floor(windowWidth) - (compact ? compactReserve : 220))
       : undefined;
 
   const styles = useMemo(
@@ -190,10 +201,10 @@ export function NativeTurnFooterItem({
         container: {
           minHeight: FOOTER_HEIGHT,
           flexDirection: "row",
-          flexWrap: compact ? "nowrap" : "wrap",
+          flexWrap: "nowrap",
           alignItems: "center",
           gap: space.sm,
-          flexShrink: 0,
+          flexShrink: isWebLayout ? 1 : 0,
           minWidth: 0,
           ...(maxRowWidth !== undefined ? { maxWidth: maxRowWidth } : {}),
         },
@@ -215,9 +226,7 @@ export function NativeTurnFooterItem({
         modelButton: {
           flexShrink: 1,
           minWidth: 0,
-          maxWidth: "100%",
-          marginHorizontal: -space.xs,
-          paddingHorizontal: space.xs,
+          paddingHorizontal: compact ? 2 : space.xs,
           paddingVertical: space.xs / 2,
         },
         metricButton: {
@@ -236,7 +245,7 @@ export function NativeTurnFooterItem({
           minWidth: 0,
         },
       }),
-    [tokens, compact, maxRowWidth],
+    [tokens, compact, isWebLayout, maxRowWidth],
   );
 
   const showTranslate = Boolean(reply && canTranslate);
