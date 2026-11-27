@@ -30,6 +30,7 @@ import { PreferenceSyncSlot } from "./state/preference-sync-slot";
 import { useIsLatestPrompt } from "./state/latest-prompt";
 import { useCodexProvider } from "./state/provider-family";
 import { useTurnFooter, useTurnWork, type WorkAnchor } from "./state/turn-footers";
+import { registerAssistantReply, useHasNativeTurnFooter } from "./state/native-turn-footer";
 import { TurnWorkCard } from "./components/turn-work-card";
 import { standardFoldActive } from "./tools/standard-fold";
 import { setPromptUsage, usePromptUsage } from "./state/prompt-usage";
@@ -703,6 +704,15 @@ function LiveAssistantMessageRenderer({
     [cwd, revealPath, toast],
   );
 
+  const hasNativeFooter = useHasNativeTurnFooter();
+  const paseo = usePaseo();
+  const replyAt = timestamp.getTime();
+  const registersReply = !envelope && !streaming && (item.data.blockIndex === undefined || item.data.messageText !== undefined);
+  useLayoutEffect(() => {
+    if (!registersReply) return;
+    return registerAssistantReply(paseo, agentId, replyAt, messageText);
+  }, [registersReply, paseo, agentId, replyAt, messageText]);
+
   return (
     <View
       ref={rootRef}
@@ -738,7 +748,7 @@ function LiveAssistantMessageRenderer({
       ) : null}
       {/* A streaming row only observes completion usage; the visible footer
           still belongs exclusively to the final reply of a completed turn. */}
-      {!envelope ? (
+      {!envelope && !hasNativeFooter ? (
         <TurnFooter
           agentId={agentId}
           text={messageText}

@@ -1,0 +1,225 @@
+import React, { useCallback, useMemo, useRef, useState, type RefObject } from "react";
+import { Pressable, StyleSheet, Text, View } from "react-native";
+import type { PluginHostProps } from "@getpaseo/plugin/client";
+import { useAgent, usePaseo } from "@getpaseo/plugin/client";
+import { Icon } from "@getpaseo/plugin/client/ui";
+import { resolveLanguage } from "../i18n/settings-strings";
+import { toolbarLabel } from "../i18n/toolbar-strings";
+import { useEnhancerPreferences } from "../preferences";
+import { useFooterModel } from "../state/footer-model";
+import { useRegisteredAssistantReply } from "../state/native-turn-footer";
+import type { TurnTelemetry } from "../state/turn-duration";
+import { replyTranslationKey } from "../translation/reply-pending";
+import { WholeReplyTranslateButton } from "../translation/reply-whole";
+import { useTranslationSettingsState } from "../translation/settings-store";
+import { DISCLOSURE_HEADER } from "../ui/disclosure-header";
+import { useScrollDismiss } from "../ui/scroll-anchor";
+import { CenteredToolbarDetails, ToolbarItem, TooltipSideContext } from "../ui/toolbar-button";
+import { TYPE } from "../ui/tokens/typography";
+import { useCopy } from "../ui/use-copy";
+import { useInputCapabilities } from "../ui/use-input-capabilities";
+import { FooterDetails, useFooterDetailsWidth } from "./footer-details";
+import { ProviderLogo } from "./provider-logo";
+import { unselectable } from "./selection";
+import { radiusV2, space, useThemeTokens } from "./theme-tokens";
+import { formatFooterMetric } from "./turn-footer";
+
+export interface NativeTurnFooterItemProps extends PluginHostProps {
+  agentId: string;
+  turnId: string | null;
+  model: string | null;
+  provider: string | null;
+  completedAt: Date | null;
+  durationMs: number | null;
+  telemetry: TurnTelemetry | null;
+}
+
+const FOOTER_HEIGHT = 24;
+
+/**
+ * Renders Better Paseo's model, metric, and translation enhancements inside the
+ * host's native `AssistantTurnFooter` slot so Copy, Fork, Metrics, and Timing
+ * stay on a single row without duplicating the footer.
+ */
+export function NativeTurnFooterItem({
+  agentId,
+  model,
+  provider,
+  completedAt,
+  durationMs,
+  telemetry,
+  theme,
+  layout,
+}: NativeTurnFooterItemProps) {
+  const preferences = useEnhancerPreferences();
+  const tokens = useThemeTokens(theme, preferences, layout.platform);
+  const compact = layout.compact;
+  const { language, footerMetric } = preferences;
+  const hintLanguage = resolveLanguage(language);
+  const paseo = usePaseo();
+  const storeProvider = useAgent(agentId, (agent) => agent.provider);
+  const storeModel = useAgent(agentId, (agent) => agent.model);
+  const thinkingOptionId = useAgent(agentId, (agent) => agent.thinkingOptionId);
+  const cwd = useAgent(agentId, (agent) => agent.cwd);
+  const agentName = provider ?? storeProvider;
+  const modelId = model ?? storeModel;
+  const resolvedModel = useFooterModel(paseo, agentName, modelId, thinkingOptionId, cwd);
+  const reply = useRegisteredAssistantReply(
+    paseo,
+    agentId,
+    completedAt ? completedAt.getTime() : null,
+    durationMs,
+  );
+  const settings = useTranslationSettingsState();
+  const canTranslate = settings.status !== "ready" || settings.values.enabled;
+  const metric = formatFooterMetric(footerMetric, telemetry ?? undefined, telemetry?.usage ?? null);
+
+  const modelCopy = useCopy();
+  const capabilities = useInputCapabilities(compact);
+  const footerRef = useRef<View>(null);
+  const [pressedAnchor, setPressedAnchor] = useState<RefObject<View | null> | null>(null);
+  const showDetails = useCallback((anchor: RefObject<View | null>) => setPressedAnchor(anchor), []);
+  const closeDetails = useCallback(() => setPressedAnchor(null), []);
+  useScrollDismiss(pressedAnchor !== null, closeDetails);
+  const longPress = capabilities.touch ? showDetails : undefined;
+  const detailsWidth = useFooterDetailsWidth();
+  const copyModel = useCallback(() => {
+    if (modelId) void modelCopy.copy(modelId, { label: "Copy model name" });
+  }, [modelId, modelCopy.copy]);
+
+  const details = (
+    <FooterDetails
+      agentName={agentName}
+      modelId={modelId}
+      modelName={resolvedModel.modelName}
+      thinkingLabel={resolvedModel.thinkingLabel}
+      completedAt={completedAt ? completedAt.getTime() : null}
+      durationMs={durationMs}
+      usage={telemetry?.usage ?? null}
+      telemetry={telemetry ?? undefined}
+      tokens={tokens}
+    />
+  );
+
+  const styles = useMemo(
+    () =>
+      StyleSheet.create({
+        container: {
+          minHeight: FOOTER_HEIGHT,
+          flexDirection: "row",
+          flexWrap: compact ? "nowrap" : "wrap",
+          alignItems: "center",
+          gap: space.sm,
+          flexShrink: 1,
+          minWidth: 0,
+        },
+        translateWrap: {
+          flexShrink: 0,
+        },
+        metadata: {
+          width: "auto",
+          minHeight: FOOTER_HEIGHT,
+          flexDirection: "row",
+          alignItems: "center",
+          gap: space.xs,
+          borderRadius: radiusV2.block,
+        },
+        modelButton: {
+          flexShrink: 1,
+          minWidth: 0,
+          marginHorizontal: -space.xs,
+          paddingHorizontal: space.xs,
+          paddingVertical: space.xs / 2,
+        },
+        metricButton: {
+          flexShrink: 0,
+        },
+        time: {
+          fontFamily: tokens.fontUi,
+          fontSize: TYPE.button.size,
+          lineHeight: TYPE.button.lineHeight,
+          fontVariant: ["tabular-nums"],
+          color: tokens.foregroundMuted,
+          ...unselectable,
+        },
+        modelText: {
+          flexShrink: 1,
+        },
+      }),
+    [tokens, compact],
+  );
+
+  const showTranslate = Boolean(reply && canTranslate);
+  const showModel = Boolean(resolvedModel.modelName);
+  const showMetric = Boolean(metric);
+  if (!showTranslate && !showModel && !showMetric) return null;
+
+  return (
+    <TooltipSideContext.Provider value="auto">
+      <Pressable
+        ref={footerRef}
+        testID="native-footer-extras"
+        accessible={false}
+        focusable={false}
+        onLongPress={longPress ? () => longPress(footerRef) : undefined}
+        style={styles.container}
+      >
+        {reply && canTranslate ? (
+          <View style={styles.translateWrap}>
+            <WholeReplyTranslateButton
+              agentId={agentId}
+              replyKey={replyTranslationKey(agentId, reply.replyAt)}
+              text={reply.text}
+              theme={theme}
+            />
+          </View>
+        ) : null}
+        {resolvedModel.modelName ? (
+          <ToolbarItem
+            label={modelCopy.copied ? "Copied" : "Copy model name"}
+            tokens={tokens}
+            align="start"
+            accessibilityLabel={modelCopy.copied ? "Model name copied" : "Copy model name"}
+            onPress={copyModel}
+            onLongPress={longPress}
+            hitSlop={compact ? (44 - FOOTER_HEIGHT) / 2 : 0}
+            buttonStyle={[styles.metadata, styles.modelButton]}
+            details={details}
+            detailsWidth={detailsWidth}
+          >
+            {modelCopy.copied ? (
+              <Icon name="Check" size={DISCLOSURE_HEADER.icon} color={tokens.success} />
+            ) : agentName ? (
+              <ProviderLogo provider={agentName} size={DISCLOSURE_HEADER.icon} color={tokens.foregroundMuted} />
+            ) : (
+              <Icon name="Copy" size={DISCLOSURE_HEADER.icon} color={tokens.foregroundMuted} />
+            )}
+            <Text numberOfLines={1} ellipsizeMode="tail" style={[styles.time, styles.modelText]}>
+              {resolvedModel.modelName}
+            </Text>
+          </ToolbarItem>
+        ) : null}
+        {metric ? (
+          <ToolbarItem
+            label={`${toolbarLabel(metric.label, language)}${hintLanguage === "zh" ? "：" : ":"} ${metric.value}`}
+            accessibilityLabel={`${metric.label}: ${metric.value}`}
+            tokens={tokens}
+            align="end"
+            buttonStyle={[styles.metadata, styles.metricButton]}
+            details={details}
+            detailsWidth={detailsWidth}
+            onLongPress={longPress}
+          >
+            <Icon name="Gauge" size={DISCLOSURE_HEADER.icon} color={tokens.foregroundMuted} />
+            <Text style={styles.time}>{metric.value}</Text>
+          </ToolbarItem>
+        ) : null}
+      </Pressable>
+      {pressedAnchor ? (
+        <CenteredToolbarDetails close={closeDetails} width={detailsWidth} tokens={tokens}>
+          {details}
+        </CenteredToolbarDetails>
+      ) : null}
+    </TooltipSideContext.Provider>
+  );
+}

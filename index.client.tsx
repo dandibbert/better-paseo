@@ -23,6 +23,8 @@ import { embeddedFontsRpc } from "./shared/font-rpc";
 import { markBitmapsRpc } from "./shared/mark-rpc";
 import { setMarkLoader } from "./client/components/marks";
 import { contributeTasks } from "./client/tasks/contribute";
+import { NativeTurnFooterItem, type NativeTurnFooterItemProps } from "./client/components/native-turn-footer";
+import { setNativeTurnFooterActive } from "./client/state/native-turn-footer";
 import {
   LiveToolCallRenderer,
   LiveReasoningRenderer,
@@ -78,6 +80,30 @@ export default function contribute(client: PluginClientContext) {
   // Older hosts do not offer an installed-plugin update indicator.
   const indicatorHost = client as PluginClientContext & { addUpdateIndicator?: (component: typeof PluginUpdateIndicator) => () => void };
   const removeUpdateIndicator = indicatorHost.addUpdateIndicator?.(PluginUpdateIndicator);
+
+  // Hosts with addTurnFooterItem draw the native turn footer (Copy, Fork,
+  // Metrics, Timing) themselves and provide a plugin slot inside it, so hide
+  // Better Paseo's separate TurnFooter row to prevent duplicate footers.
+  const footerHost = client as PluginClientContext & {
+    addTurnFooterItem?: (contribution: {
+      id: string;
+      Component: React.ComponentType<NativeTurnFooterItemProps>;
+    }) => () => void;
+  };
+  const removeTurnFooterItem =
+    typeof footerHost.addTurnFooterItem === "function"
+      ? followChat(() => {
+          setNativeTurnFooterActive(true);
+          const remove = footerHost.addTurnFooterItem!({
+            id: "turn-footer",
+            Component: NativeTurnFooterItem,
+          });
+          return () => {
+            setNativeTurnFooterActive(false);
+            remove();
+          };
+        })
+      : () => {};
 
   // Live chat timeline interception: render real tool calls, reasoning, and todos with enhanced UI.
   // Standard folds successful edits into the assistant reply's work card
@@ -328,6 +354,7 @@ export default function contribute(client: PluginClientContext) {
     removeTasks();
     removeSettings();
     removeUpdateIndicator?.();
+    removeTurnFooterItem();
     removePerfCommand();
     removeTimelineLevelControl();
     removeFonts();
