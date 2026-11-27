@@ -138,6 +138,7 @@ export function ToolbarItem({
   align: alignProp,
   outlined = false,
   buttonStyle,
+  anchorStyle,
   hitSlop = 4,
   accessibilityLabel = label,
   details,
@@ -156,6 +157,7 @@ export function ToolbarItem({
   iconSize?: number;
   iconBackground?: string;
   buttonStyle?: StyleProp<ViewStyle>;
+  anchorStyle?: StyleProp<ViewStyle>;
   /**
    * Applied last, over the toolbar's own disabled and hover looks, for a
    * button with its own pressed appearance.
@@ -251,7 +253,7 @@ export function ToolbarItem({
     // Every web View is its own stacking context (`z-index: 0`), so the name
     // can only rise over the buttons after this one if the button does.
     <View ref={anchorRef} collapsable={details || onLongPress ? false : undefined} onLayout={onLayout}
-      style={[styles.anchor, open && styles.raised]}>
+      style={[styles.anchor, anchorStyle, open && styles.raised]}>
       <Pressable
         testID={testID}
         accessibilityRole={onPress ? "button" : "image"}

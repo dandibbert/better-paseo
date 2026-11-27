@@ -1,5 +1,5 @@
 import React, { useCallback, useMemo, useRef, useState, type RefObject } from "react";
-import { Pressable, StyleSheet, Text, View } from "react-native";
+import { Pressable, StyleSheet, Text, View, useWindowDimensions } from "react-native";
 import type { PluginHostProps } from "@getpaseo/plugin/client";
 import { useAgent, usePaseo } from "@getpaseo/plugin/client";
 import { Icon } from "@getpaseo/plugin/client/ui";
@@ -54,6 +54,7 @@ export function NativeTurnFooterItem({
   const preferences = useEnhancerPreferences();
   const tokens = useThemeTokens(theme, preferences, layout.platform);
   const compact = layout.compact;
+  const { width: windowWidth } = useWindowDimensions();
   const { language, footerMetric } = preferences;
   const hintLanguage = resolveLanguage(language);
   const paseo = usePaseo();
@@ -101,6 +102,17 @@ export function NativeTurnFooterItem({
     />
   );
 
+  // Host `AssistantTurnFooter` uses `label: { width: "100%", flexShrink: 0 }`
+  // inside a `flexShrink: 1` Pressable, which squeezes any sibling with
+  // `flexShrink: 1`. Keeping `flexShrink: 0` on this container lets the host's
+  // spacer shrink to its text width while `maxWidth` + `modelAnchor` cap our
+  // width so long model names ellipsize instead of clipping off-screen.
+  const maxRowWidth = compact
+    ? Math.max(120, Math.floor(windowWidth) - 156)
+    : windowWidth > 0
+      ? Math.max(240, Math.floor(windowWidth) - 220)
+      : undefined;
+
   const styles = useMemo(
     () =>
       StyleSheet.create({
@@ -110,11 +122,16 @@ export function NativeTurnFooterItem({
           flexWrap: compact ? "nowrap" : "wrap",
           alignItems: "center",
           gap: space.sm,
-          flexShrink: 1,
+          flexShrink: 0,
           minWidth: 0,
+          ...(maxRowWidth !== undefined ? { maxWidth: maxRowWidth } : {}),
         },
         translateWrap: {
           flexShrink: 0,
+        },
+        modelAnchor: {
+          flexShrink: 1,
+          minWidth: 0,
         },
         metadata: {
           width: "auto",
@@ -127,6 +144,7 @@ export function NativeTurnFooterItem({
         modelButton: {
           flexShrink: 1,
           minWidth: 0,
+          maxWidth: "100%",
           marginHorizontal: -space.xs,
           paddingHorizontal: space.xs,
           paddingVertical: space.xs / 2,
@@ -144,9 +162,10 @@ export function NativeTurnFooterItem({
         },
         modelText: {
           flexShrink: 1,
+          minWidth: 0,
         },
       }),
-    [tokens, compact],
+    [tokens, compact, maxRowWidth],
   );
 
   const showTranslate = Boolean(reply && canTranslate);
@@ -183,6 +202,7 @@ export function NativeTurnFooterItem({
             onPress={copyModel}
             onLongPress={longPress}
             hitSlop={compact ? (44 - FOOTER_HEIGHT) / 2 : 0}
+            anchorStyle={styles.modelAnchor}
             buttonStyle={[styles.metadata, styles.modelButton]}
             details={details}
             detailsWidth={detailsWidth}
