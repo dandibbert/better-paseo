@@ -12,6 +12,7 @@ const runtime = vi.hoisted(() => ({
   copyText: vi.fn(async (_text: string) => {}),
   translate: vi.fn(() => new Promise<never>(() => {})),
   family: vi.fn(async ({ provider }: { provider: string }) => ({ codex: ["my-codex", "gemini", "grok"].includes(provider) })),
+  turnUsage: vi.fn(async () => ({ turns: [] as Array<Record<string, unknown>> })),
 }));
 
 vi.mock("react-native", () => import("./helpers/rn-mock"));
@@ -29,7 +30,13 @@ vi.mock("@getpaseo/plugin/client", () => ({
     ),
   usePaseo: () => runtime.api,
   useRpc: (rpc: unknown) =>
-    rpc === translateTimelineItemRpc ? runtime.translate : rpc === providerFamilyRpc ? runtime.family : () => Promise.resolve(null),
+    rpc === translateTimelineItemRpc
+      ? runtime.translate
+      : rpc === providerFamilyRpc
+        ? runtime.family
+        : rpc === turnUsageRpc
+          ? runtime.turnUsage
+          : () => Promise.resolve(null),
   useWorkspace: () => null,
   useSettings: () => ({ status: "loading" }),
 }));
@@ -62,6 +69,7 @@ vi.mock("../../client/components/markdown/markdown-view", async () => {
 import contribute from "../../index.client";
 import { LiveAssistantRenderer, type LiveAssistantPayload } from "../../client/live-renderers";
 import { AssistantFooter } from "../../client/components/turn-footer";
+import { FooterDetails } from "../../client/components/footer-details";
 import { NativeTurnFooterItem } from "../../client/components/native-turn-footer";
 import { resetEnhancerPreferences, updateEnhancerPreferences } from "../../client/preferences";
 import {
@@ -72,6 +80,7 @@ import {
 } from "../../client/state/native-turn-footer";
 import { translateTimelineItemRpc } from "../../shared/timeline-translation";
 import { providerFamilyRpc } from "../../shared/provider-family-rpc";
+import { turnUsageRpc } from "../../shared/turn-usage-rpc";
 import { resetTimelineTailsForTests } from "../../client/timeline-tail";
 import { timelineEntry as entry, timelinePage as page } from "./helpers/turn-timeline";
 
@@ -107,6 +116,7 @@ beforeEach(() => {
   resetNativeTurnFooterForTests();
   resetTimelineTailsForTests();
   resetEnhancerPreferences();
+  runtime.turnUsage.mockImplementation(async () => ({ turns: [] }));
   runtime.agent = { status: "idle", cwd: "/workspace", provider: "codex", model: "sol", thinkingOptionId: "medium" };
   runtime.api = {
     providers: { listModels: vi.fn(async () => catalog) },
@@ -255,5 +265,138 @@ describe("native turn footer slot integration", () => {
     cleanup();
     expect(removed).toHaveBeenCalledTimes(2);
     expect(hasNativeTurnFooter()).toBe(false);
+  });
+
+  it("unions host props with Better Paseo turn-footers store data in FooterDetails and metric badge", async () => {
+    updateEnhancerPreferences({ footerMetric: "outputTokens", language: "en" });
+    runtime.api = {
+      providers: { listModels: vi.fn(async () => catalog) },
+      agents: {
+        ref: () => ({
+          timeline: {
+            refetch: vi.fn(async () =>
+              page([
+                entry({ type: "user_message", text: "Hi" }, 1, 1000, "one"),
+                Object.assign(entry({ type: "assistant_message", text: "Done." }, 2, 52_000, "one"), {
+                  telemetry: { ttftMs: 420, apiTurnCount: 2 },
+                }),
+              ]),
+            ),
+            subscribe: () => Object.assign(() => {}, { ready: Promise.resolve() }),
+          },
+        }),
+      },
+    };
+    runtime.turnUsage.mockResolvedValue({
+      turns: [
+        {
+          turnId: "one",
+          startedAt: 1_000,
+          endedAt: 52_000,
+          usage: { inputTokens: 12_500, cachedInputTokens: 4_000, outputTokens: 850 },
+        },
+      ],
+    });
+    const unregister = registerAssistantReply(runtime.api, "agent-1", 52_000, "Done.");
+
+    await act(async () => {
+      renderer = TestRenderer.create(
+        React.createElement(NativeTurnFooterItem, {
+          theme,
+          host: { id: "host-1", label: "Host" },
+          layout: { compact: true, platform: "ios" },
+          agentId: "agent-1",
+          turnId: "one",
+          model: "sol",
+          provider: "codex",
+          completedAt: new Date(52_000),
+          durationMs: null,
+          telemetry: { outputTps: 667.9 },
+        }),
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const text = (node: ReactTestInstance): string =>
+      node.children.map((c) => (typeof c === "string" ? c : text(c))).join(" ");
+    const extras = renderer!.root.findByProps({ testID: "native-footer-extras" });
+    expect(text(extras)).toContain("850");
+
+    act(() => {
+      extras.props.onLongPress();
+    });
+    const details = renderer!.root.findByType(FooterDetails);
+    expect(details.props.startedAt).toBe(1_000);
+    expect(details.props.completedAt).toBe(52_000);
+    expect(details.props.durationMs).toBe(51_000);
+    expect(details.props.usage).toEqual({
+      inputTokens: 12_500,
+      cachedInputTokens: 4_000,
+      outputTokens: 850,
+    });
+    expect(details.props.telemetry).toMatchObject({
+      outputTps: 667.9,
+      ttftMs: 420,
+      apiTurnCount: 2,
+    });
+    const detailText = text(details);
+    expect(detailText).toContain("Start time");
+    expect(detailText).toContain("End time");
+    expect(detailText).toContain("Elapsed time");
+    expect(detailText).toContain("Input");
+    expect(detailText).toContain("Cached");
+    expect(detailText).toContain("Output");
+    expect(detailText).toContain("TPS");
+    expect(detailText).toContain("TTFT");
+    unregister();
+  });
+
+  it("recovers timing by completion timestamp when reply is unregistered and derives startedAt from durationMs", async () => {
+    updateEnhancerPreferences({ footerMetric: "outputTokens", language: "en" });
+    runtime.turnUsage.mockResolvedValue({
+      turns: [
+        {
+          turnId: "one",
+          startedAt: 1_000,
+          endedAt: 52_000,
+          usage: { inputTokens: 3_000, outputTokens: 200 },
+        },
+      ],
+    });
+
+    await act(async () => {
+      renderer = TestRenderer.create(
+        React.createElement(NativeTurnFooterItem, {
+          theme,
+          host: { id: "host-1", label: "Host" },
+          layout: { compact: true, platform: "ios" },
+          agentId: "agent-1",
+          turnId: null,
+          model: "sol",
+          provider: "codex",
+          completedAt: new Date(52_000),
+          durationMs: 51_000,
+          telemetry: null,
+        }),
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const text = (node: ReactTestInstance): string =>
+      node.children.map((c) => (typeof c === "string" ? c : text(c))).join(" ");
+    const extras = renderer!.root.findByProps({ testID: "native-footer-extras" });
+    expect(text(extras)).toContain("200");
+
+    act(() => {
+      extras.props.onLongPress();
+    });
+    const details = renderer!.root.findByType(FooterDetails);
+    expect(details.props.startedAt).toBe(1_000);
+    expect(details.props.durationMs).toBe(51_000);
+    expect(details.props.usage).toEqual({ inputTokens: 3_000, outputTokens: 200 });
   });
 });

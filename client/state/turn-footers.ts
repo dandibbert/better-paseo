@@ -98,6 +98,7 @@ function turnMarks(turns: readonly RecordedTurn[], from: number): TurnMarks | un
 export function createTurnFooterStore(source: () => Timeline, loadRecorded?: (since: number) => Promise<RecordedTurn[]>,
   pageReader: AgentTimelinePageReader = createAgentTimelinePageReader()) {
   const targets = new Set<Target>();
+  const completionTargets = new Set<{ completedAt: number | null; turnId: string | null }>();
   const listeners = new Set<() => void>();
   const usageByTurn = new Map<string, Usage>();
   let recorded: readonly RecordedTurn[] = [];
@@ -133,6 +134,23 @@ export function createTurnFooterStore(source: () => Timeline, loadRecorded?: (si
     for (const set of workListeners.values()) for (const listener of set) listener();
   };
   const get = (at: number, text: string) => footers.get(at)?.get(text) ?? null;
+  const getByCompletion = (completedAt: number | null, turnId?: string | null): CompletedTurnFooter | null => {
+    if (turnId) {
+      for (const map of footers.values()) {
+        for (const footer of map.values()) {
+          if (footer.turnId === turnId) return footer;
+        }
+      }
+    }
+    if (completedAt !== null) {
+      for (const map of footers.values()) {
+        for (const footer of map.values()) {
+          if (footer.completedAt === completedAt) return footer;
+        }
+      }
+    }
+    return null;
+  };
 
   /** `atStart`: no older page exists, so a turn at the top is whole. */
   function needsOlder(items: Entry[], atStart = false): boolean {
@@ -336,7 +354,7 @@ export function createTurnFooterStore(source: () => Timeline, loadRecorded?: (si
   }
 
   function retained(): boolean {
-    return targets.size > 0 || liveRetains > 0;
+    return targets.size > 0 || completionTargets.size > 0 || liveRetains > 0;
   }
 
   function turnIndex(): TurnIndex {
@@ -422,6 +440,7 @@ export function createTurnFooterStore(source: () => Timeline, loadRecorded?: (si
 
   return {
     get,
+    getByCompletion,
     work,
     lineCount,
     subscribeWork(anchor: WorkAnchor, listener: () => void) {
@@ -485,6 +504,16 @@ export function createTurnFooterStore(source: () => Timeline, loadRecorded?: (si
         disconnect();
       };
     },
+    retainCompletion(completedAt: number | null, turnId: string | null = null) {
+      const target = { completedAt, turnId };
+      completionTargets.add(target);
+      connect();
+      if (!entries.length) void request();
+      return () => {
+        completionTargets.delete(target);
+        disconnect();
+      };
+    },
   };
 }
 
@@ -500,7 +529,7 @@ function useFooterStore(paseo: PaseoApi, agentId: string) {
     if (!agents) stores.set(paseo, agents = new Map());
     let store = agents.get(agentId);
     if (!store) agents.set(agentId, store = createTurnFooterStore(() => paseo.agents.ref(agentId).timeline,
-      async (since) => (await turnUsageRef.current({ agentId, since })).turns,
+      async (since) => (await turnUsageRef.current({ agentId, since }))?.turns ?? [],
       getAgentTimelinePageReader(paseo, agentId)));
     return store;
   }, [paseo, agentId]);
@@ -550,5 +579,46 @@ export function useTurnFooter(paseo: PaseoApi, agentId: string, at: number, text
   }, [store, enabled, targetAt, targetText, observeOnly]);
   const getSnapshot = useCallback(() => enabled && !observeOnly ? store.get(targetAt, targetText) : null,
     [store, enabled, observeOnly, targetAt, targetText]);
+  return useSyncExternalStore(store.subscribe, getSnapshot, getSnapshot);
+}
+
+export interface TurnFooterMatch {
+  replyAt?: number | null;
+  text?: string | null;
+  completedAt?: number | null;
+  turnId?: string | null;
+}
+
+export function useTurnFooterMatch(
+  paseo: PaseoApi,
+  agentId: string,
+  match: TurnFooterMatch,
+  running: boolean | null,
+) {
+  const store = useFooterStore(paseo, agentId);
+  const enabled = typeof running === "boolean";
+  const hasReply = typeof match.replyAt === "number" && typeof match.text === "string";
+  const replyAt = hasReply ? match.replyAt! : 0;
+  const replyText = hasReply ? match.text! : "";
+  const completedAt = match.completedAt ?? null;
+  const turnId = match.turnId ?? null;
+  const hasCompletion = completedAt !== null || turnId !== null;
+  useLayoutEffect(() => {
+    if (enabled) store.setRunning(running);
+  }, [store, enabled, running]);
+  useLayoutEffect(() => {
+    if (!enabled) return;
+    if (hasReply) return store.retain(replyAt, replyText);
+    if (hasCompletion) return store.retainCompletion(completedAt, turnId);
+    return store.observe();
+  }, [store, enabled, hasReply, replyAt, replyText, hasCompletion, completedAt, turnId]);
+  const getSnapshot = useCallback(() => {
+    if (!enabled) return null;
+    if (hasReply) {
+      const byReply = store.get(replyAt, replyText);
+      if (byReply) return byReply;
+    }
+    return hasCompletion ? store.getByCompletion(completedAt, turnId) : null;
+  }, [store, enabled, hasReply, replyAt, replyText, hasCompletion, completedAt, turnId]);
   return useSyncExternalStore(store.subscribe, getSnapshot, getSnapshot);
 }

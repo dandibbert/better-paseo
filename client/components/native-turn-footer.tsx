@@ -9,6 +9,8 @@ import { useEnhancerPreferences } from "../preferences";
 import { useFooterModel } from "../state/footer-model";
 import { useRegisteredAssistantReply } from "../state/native-turn-footer";
 import type { TurnTelemetry } from "../state/turn-duration";
+import type { TurnUsage } from "./user-message";
+import { useTurnFooterMatch } from "../state/turn-footers";
 import { replyTranslationKey } from "../translation/reply-pending";
 import { WholeReplyTranslateButton } from "../translation/reply-whole";
 import { useTranslationSettingsState } from "../translation/settings-store";
@@ -36,6 +38,47 @@ export interface NativeTurnFooterItemProps extends PluginHostProps {
 
 const FOOTER_HEIGHT = 24;
 
+function mergeDefinedFields<T extends object>(
+  primary: T | null | undefined,
+  secondary: T | null | undefined,
+): Partial<T> | undefined {
+  if (!primary && !secondary) return undefined;
+  const merged: Record<string, unknown> = {};
+  for (const source of [secondary, primary]) {
+    if (!source) continue;
+    for (const [key, value] of Object.entries(source)) {
+      if (value !== undefined && value !== null) merged[key] = value;
+    }
+  }
+  return Object.keys(merged).length > 0 ? (merged as Partial<T>) : undefined;
+}
+
+function mergeTurnTelemetry(
+  primary: TurnTelemetry | null | undefined,
+  secondary: TurnTelemetry | null | undefined,
+  timingUsage: TurnUsage | null | undefined,
+): { telemetry: TurnTelemetry | undefined; usage: TurnUsage | null } {
+  type TelemetryUsage = NonNullable<TurnTelemetry["usage"]>;
+  const mergedTelemetryUsage = mergeDefinedFields<TelemetryUsage>(
+    primary?.usage,
+    mergeDefinedFields<TelemetryUsage>(secondary?.usage, timingUsage),
+  );
+  const mergedUsage =
+    (mergeDefinedFields<TurnUsage>(
+      timingUsage,
+      mergeDefinedFields<TurnUsage>(primary?.usage, secondary?.usage),
+    ) as TurnUsage | undefined) ?? null;
+  const baseTelemetry = mergeDefinedFields<TurnTelemetry>(primary, secondary);
+  if (!baseTelemetry && !mergedTelemetryUsage) {
+    return { telemetry: undefined, usage: mergedUsage };
+  }
+  const telemetry: TurnTelemetry = {
+    ...(baseTelemetry as TurnTelemetry),
+    ...(mergedTelemetryUsage ? { usage: mergedTelemetryUsage as TelemetryUsage } : {}),
+  };
+  return { telemetry, usage: mergedUsage };
+}
+
 /**
  * Renders Better Paseo's model, metric, and translation enhancements inside the
  * host's native `AssistantTurnFooter` slot so Copy, Fork, Metrics, and Timing
@@ -43,6 +86,7 @@ const FOOTER_HEIGHT = 24;
  */
 export function NativeTurnFooterItem({
   agentId,
+  turnId,
   model,
   provider,
   completedAt,
@@ -58,22 +102,48 @@ export function NativeTurnFooterItem({
   const { language, footerMetric } = preferences;
   const hintLanguage = resolveLanguage(language);
   const paseo = usePaseo();
+  const status = useAgent(agentId, (agent) => agent.status);
   const storeProvider = useAgent(agentId, (agent) => agent.provider);
   const storeModel = useAgent(agentId, (agent) => agent.model);
   const thinkingOptionId = useAgent(agentId, (agent) => agent.thinkingOptionId);
   const cwd = useAgent(agentId, (agent) => agent.cwd);
-  const agentName = provider ?? storeProvider;
-  const modelId = model ?? storeModel;
-  const resolvedModel = useFooterModel(paseo, agentName, modelId, thinkingOptionId, cwd);
+  const hostCompletedAtMs = completedAt ? completedAt.getTime() : null;
   const reply = useRegisteredAssistantReply(
     paseo,
     agentId,
-    completedAt ? completedAt.getTime() : null,
+    hostCompletedAtMs,
     durationMs,
   );
+  const timing = useTurnFooterMatch(
+    paseo,
+    agentId,
+    {
+      replyAt: reply?.replyAt ?? null,
+      text: reply?.text ?? null,
+      completedAt: hostCompletedAtMs,
+      turnId,
+    },
+    status ? status === "running" : false,
+  );
+  const { telemetry: mergedTelemetry, usage: mergedUsage } = mergeTurnTelemetry(
+    telemetry,
+    timing?.telemetry,
+    timing?.usage,
+  );
+  const agentName = provider ?? storeProvider;
+  const modelId = model ?? mergedTelemetry?.model ?? storeModel;
+  const resolvedModel = useFooterModel(paseo, agentName, modelId, thinkingOptionId, cwd);
+  const mergedCompletedAt = hostCompletedAtMs ?? timing?.completedAt ?? null;
+  const rawDurationMs = durationMs ?? timing?.durationMs ?? mergedTelemetry?.durationMs ?? null;
+  const mergedStartedAt =
+    timing?.startedAt ??
+    (mergedCompletedAt !== null && rawDurationMs !== null ? mergedCompletedAt - rawDurationMs : null);
+  const mergedDurationMs =
+    rawDurationMs ??
+    (mergedStartedAt !== null && mergedCompletedAt !== null ? Math.max(0, mergedCompletedAt - mergedStartedAt) : null);
   const settings = useTranslationSettingsState();
   const canTranslate = settings.status !== "ready" || settings.values.enabled;
-  const metric = formatFooterMetric(footerMetric, telemetry ?? undefined, telemetry?.usage ?? null);
+  const metric = formatFooterMetric(footerMetric, mergedTelemetry, mergedUsage);
 
   const modelCopy = useCopy();
   const capabilities = useInputCapabilities(compact);
@@ -94,10 +164,11 @@ export function NativeTurnFooterItem({
       modelId={modelId}
       modelName={resolvedModel.modelName}
       thinkingLabel={resolvedModel.thinkingLabel}
-      completedAt={completedAt ? completedAt.getTime() : null}
-      durationMs={durationMs}
-      usage={telemetry?.usage ?? null}
-      telemetry={telemetry ?? undefined}
+      startedAt={mergedStartedAt}
+      completedAt={mergedCompletedAt}
+      durationMs={mergedDurationMs}
+      usage={mergedUsage}
+      telemetry={mergedTelemetry}
       tokens={tokens}
     />
   );
