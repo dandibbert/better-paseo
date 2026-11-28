@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { Pressable, ScrollView, Text, TextInput, View } from "react-native";
 import type { PluginScreenProps } from "@getpaseo/plugin/client";
 import * as pluginClient from "@getpaseo/plugin/client";
@@ -14,6 +14,7 @@ import { StatusIcon, TaskCardView } from "../cards";
 import { archiveCardsWithApi, permissionButtons, respondToPermission, useReadControl, type PermissionButton } from "../actions";
 import { useToast } from "@getpaseo/plugin/client/ui";
 import { ArchiveAllButton, MarkAllReadButton } from "./board-parts";
+import { lastBoardParams, rememberBoardParams, subscribeBoardParams } from "./params";
 import { BOARD_STRINGS } from "./strings";
 import { aggregateHostTasks, type AggregateTask, type HostTaskSnapshots } from "./all-hosts-model";
 
@@ -291,6 +292,13 @@ export function AllHostsBoard({
       return { ...previous, [serverId]: tasks };
     });
   }, []);
+  const activeHostId = screen.host.id;
+  const boardParams = useSyncExternalStore(
+    subscribeBoardParams,
+    () => lastBoardParams(activeHostId),
+    () => lastBoardParams(activeHostId),
+  );
+  const hideSubtasks = boardParams.hideSubtasks ?? settings.board.hideSubtasks;
   const options = useMemo<TasksOptions>(() => ({
     doneWindow: window, includeDone: true, includeArchived: showArchived,
   }), [window, showArchived]);
@@ -298,8 +306,8 @@ export function AllHostsBoard({
   // Never show a stale card as live after its host disconnects: snapshot
   // removal happens in an effect, but online-host filtering is synchronous.
   const aggregated = useMemo(() => aggregateHostTasks(
-    online, snapshots as HostTaskSnapshots, hostFilter, query,
-  ), [online, snapshots, hostFilter, query]);
+    online, snapshots as HostTaskSnapshots, hostFilter, query, { hideSubtasks },
+  ), [online, snapshots, hostFilter, query, hideSubtasks]);
   const laneOrder = showArchived ? LANE_ORDER : LANE_ORDER.filter((id) => id !== "archived");
   const activeCount = laneOrder.reduce((total, id) => total + aggregated[id].length, 0);
   const waiting = online.filter((host) => !snapshots[host.serverId]?.ready);
@@ -344,7 +352,6 @@ export function AllHostsBoard({
   const showMore = useCallback((id: LaneId) => {
     setLimits((current) => ({ ...current, [id]: current[id] + MORE_LANE_LIMIT }));
   }, []);
-  const activeHostId = screen.host.id;
   const activeHostLabel = hosts.find((host) => host.serverId === activeHostId)?.label ?? screen.host.label;
   const snapshotsRef = useRef(snapshots);
   snapshotsRef.current = snapshots;
@@ -493,7 +500,7 @@ export function AllHostsBoard({
       needs_input: INITIAL_LANE_LIMIT, running: INITIAL_LANE_LIMIT,
       review: INITIAL_LANE_LIMIT, done: INITIAL_LANE_LIMIT, archived: INITIAL_LANE_LIMIT,
     });
-  }, [query, hostFilter, window, showArchived]);
+  }, [query, hostFilter, window, showArchived, hideSubtasks]);
 
   const compactLaneId = laneOrder.includes(lane) ? lane : "running";
 
@@ -524,6 +531,12 @@ export function AllHostsBoard({
           <HostChip key={option} label={labels.windows[option]} selected={window === option}
             onPress={() => setWindow(option)} screen={screen} />
         ))}
+        <HostChip
+          label={labels.showSubtasks}
+          selected={!hideSubtasks}
+          onPress={() => rememberBoardParams(activeHostId, { ...boardParams, hideSubtasks: !hideSubtasks })}
+          screen={screen}
+        />
         <HostChip label={labels.lanes.archived} selected={showArchived} onPress={() => setShowArchived(!showArchived)} screen={screen} />
         <HostChip label={ui.refresh} selected={false} onPress={refresh} screen={screen} />
       </View>

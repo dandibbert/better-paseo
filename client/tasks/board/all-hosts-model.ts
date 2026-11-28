@@ -1,4 +1,4 @@
-import type { TasksHandle } from "../data";
+import { filterLanes, withSubagentCards, type TasksHandle } from "../data";
 import { LANE_ORDER, settledAt, type LaneId, type TaskCard } from "../model";
 
 /** A host is always identified by its configured Paseo serverId, never by its display label. */
@@ -18,6 +18,10 @@ export interface AggregateTask {
 export type HostTaskSnapshots = Readonly<Record<string, Pick<TasksHandle, "lanes" | "ready">>>;
 
 export type AggregateLanes = Record<LaneId, AggregateTask[]>;
+
+export interface AggregateHostOptions {
+  hideSubtasks?: boolean;
+}
 
 function matchesQuery(item: AggregateTask, query: string): boolean {
   if (!query) return true;
@@ -55,6 +59,7 @@ export function aggregateHostTasks(
   snapshots: HostTaskSnapshots,
   hostFilter: string | null,
   searchQuery: string,
+  options: AggregateHostOptions = {},
 ): AggregateLanes {
   const lanes: AggregateLanes = {
     needs_input: [],
@@ -63,13 +68,30 @@ export function aggregateHostTasks(
     done: [],
     archived: [],
   };
+  const hideSubtasks = options.hideSubtasks === true;
   const query = searchQuery.trim().toLocaleLowerCase();
   for (const host of hosts) {
     if (hostFilter && host.serverId !== hostFilter) continue;
     const snapshot = snapshots[host.serverId];
     if (!snapshot?.ready) continue;
+    const hasProviderSubagent = LANE_ORDER.some((laneId) =>
+      laneId !== "archived" &&
+      snapshot.lanes[laneId].cards.some((card) =>
+        Array.isArray(card.children) && card.children.some((child) => child.kind === "provider"),
+      ),
+    );
+    let hostLanes = hasProviderSubagent ? withSubagentCards(snapshot.lanes) : snapshot.lanes;
+    if (hideSubtasks) {
+      hostLanes = filterLanes(hostLanes, {
+        query: "",
+        workspaceIds: [],
+        providers: [],
+        labels: [],
+        hideSubtasks: true,
+      });
+    }
     for (const lane of LANE_ORDER) {
-      for (const card of snapshot.lanes[lane].cards) {
+      for (const card of hostLanes[lane].cards) {
         const item: AggregateTask = {
           key: JSON.stringify([host.serverId, card.id]),
           serverId: host.serverId,

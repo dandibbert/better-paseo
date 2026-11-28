@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+vi.mock("react-native", () => import("./helpers/rn-mock"));
 import { aggregateHostTasks } from "../../client/tasks/board/all-hosts-model";
 import type { HostTaskSnapshots } from "../../client/tasks/board/all-hosts-model";
 import type { LaneId, LaneModel, TaskCard } from "../../client/tasks/model";
@@ -82,5 +83,56 @@ describe("all-hosts Tasks aggregation", () => {
     const result = aggregateHostTasks([], {}, null, "");
     expect(Object.keys(result)).toEqual(LANE_IDS);
     expect(LANE_IDS.every((lane) => result[lane].length === 0)).toBe(true);
+  });
+
+  it("includes provider subagents when subtasks are shown and folds same-lane subtasks when hideSubtasks is true", () => {
+    const parentCard = {
+      ...task("parent", "running", "Karabiner setup", "2026-11-08T07:01:00Z"),
+      status: "running",
+      parent: null,
+      children: [
+        {
+          id: "child",
+          title: "Read-only review",
+          status: "running",
+          provider: "codex",
+          modelLabel: "GPT-6.2-sol",
+          thinkingLabel: "high",
+          modeLabel: null,
+          context: null,
+          lane: "running",
+          timing: { updatedAt: "2026-11-08T07:01:00Z" },
+        },
+      ],
+    } as unknown as TaskCard;
+    const childCard = {
+      ...task("child", "running", "Read-only review", "2026-11-08T07:01:00Z"),
+      status: "running",
+      parent: { id: "parent", title: "Karabiner setup", missing: false, archived: false },
+      children: [
+        {
+          id: "provider-sub",
+          kind: "provider",
+          title: "Search dotfiles",
+          status: "running",
+          provider: "codex",
+          modelLabel: null,
+          thinkingLabel: null,
+          modeLabel: null,
+          context: null,
+          lane: "running",
+          timing: { updatedAt: "2026-11-08T07:01:05Z" },
+        },
+      ],
+    } as unknown as TaskCard;
+    const subSnapshots: HostTaskSnapshots = {
+      m1: snapshot([parentCard, childCard]),
+    };
+
+    const shown = aggregateHostTasks(hosts, subSnapshots, null, "", { hideSubtasks: false });
+    expect(shown.running.map((item) => item.card.id)).toEqual(["provider-sub", "child", "parent"]);
+
+    const folded = aggregateHostTasks(hosts, subSnapshots, null, "", { hideSubtasks: true });
+    expect(folded.running.map((item) => item.card.id)).toEqual(["parent"]);
   });
 });
