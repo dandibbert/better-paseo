@@ -1,4 +1,4 @@
-import React, { useCallback, useMemo, useRef, useState, type RefObject } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import { Pressable, StyleSheet, Text, View, useWindowDimensions } from "react-native";
 import type { PluginHostProps } from "@getpaseo/plugin/client";
 import { useAgent, usePaseo } from "@getpaseo/plugin/client";
@@ -37,6 +37,52 @@ export interface NativeTurnFooterItemProps extends PluginHostProps {
 }
 
 const FOOTER_HEIGHT = 24;
+const HOST_TIMING_FIX_ID = "bp-native-turn-footer-fix";
+// Host `AssistantTurnFooter` stacks two `width: 100%; flexShrink: 0` labels
+// with `marginLeft: "-100%"`, so CSS flexbox sums both widths and leaves a wide
+// gap whenever the hidden full-date timestamp is wider than the duration label.
+const HOST_TIMING_FIX_CSS = `
+div:has(> [data-testid="turn-footer-timing-label"]):has(~ [data-testid="native-footer-extras"]) {
+  position: relative !important;
+  width: auto !important;
+}
+div:has(> [data-testid="turn-footer-timing-label"]):has(~ [data-testid="native-footer-extras"]) > [data-testid="turn-footer-timing-label"] {
+  width: auto !important;
+  margin-left: 0 !important;
+  white-space: nowrap !important;
+}
+div:has(> [data-testid="turn-footer-timing-label"]):has(~ [data-testid="native-footer-extras"]) > [aria-hidden="true"] {
+  position: absolute !important;
+  left: 0 !important;
+  width: auto !important;
+  margin-left: 0 !important;
+  white-space: nowrap !important;
+  pointer-events: none !important;
+}
+`;
+
+let hostTimingFixHolders = 0;
+
+function ensureHostTurnFooterCss(): () => void {
+  if (typeof document === "undefined") return () => {};
+  hostTimingFixHolders++;
+  let style = document.getElementById(HOST_TIMING_FIX_ID);
+  if (!style) {
+    style = document.createElement("style");
+    style.id = HOST_TIMING_FIX_ID;
+    style.textContent = HOST_TIMING_FIX_CSS;
+    document.head.appendChild(style);
+  }
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    hostTimingFixHolders = Math.max(0, hostTimingFixHolders - 1);
+    if (hostTimingFixHolders === 0) {
+      document.getElementById(HOST_TIMING_FIX_ID)?.remove();
+    }
+  };
+}
 
 function mergeDefinedFields<T extends object>(
   primary: T | null | undefined,
@@ -182,14 +228,20 @@ export function NativeTurnFooterItem({
   // full width without truncating model names, and removing negative horizontal
   // margin avoids `maxWidth: 100%` border-box clipping of short model labels.
   const isWebLayout = layout.platform === "web";
+  useEffect(() => (isWebLayout ? ensureHostTurnFooterCss() : undefined), [isWebLayout]);
   const hasHostDuration = durationMs !== undefined && durationMs !== null;
+  const longHostDuration = hasHostDuration && durationMs >= 60_000;
   const compactReserve = hasHostDuration
     ? hintLanguage === "zh"
-      ? 200
-      : 220
+      ? longHostDuration
+        ? 198
+        : 184
+      : longHostDuration
+        ? 218
+        : 204
     : completedAt
-      ? 166
-      : 114;
+      ? 158
+      : 112;
   const maxRowWidth =
     !isWebLayout && windowWidth > 0
       ? Math.max(compact ? 110 : 240, Math.floor(windowWidth) - (compact ? compactReserve : 220))
@@ -203,13 +255,18 @@ export function NativeTurnFooterItem({
           flexDirection: "row",
           flexWrap: "nowrap",
           alignItems: "center",
-          gap: space.sm,
+          gap: space.md,
           flexShrink: isWebLayout ? 1 : 0,
           minWidth: 0,
-          ...(maxRowWidth !== undefined ? { maxWidth: maxRowWidth } : {}),
+          ...(compact && !isWebLayout && maxRowWidth !== undefined
+            ? { width: maxRowWidth, maxWidth: maxRowWidth }
+            : maxRowWidth !== undefined
+              ? { maxWidth: maxRowWidth }
+              : {}),
         },
         translateWrap: {
           flexShrink: 0,
+          marginHorizontal: -space.xs,
         },
         modelAnchor: {
           flexShrink: 1,
@@ -226,11 +283,12 @@ export function NativeTurnFooterItem({
         modelButton: {
           flexShrink: 1,
           minWidth: 0,
-          paddingHorizontal: compact ? 2 : space.xs,
+          paddingHorizontal: 0,
           paddingVertical: space.xs / 2,
         },
         metricButton: {
           flexShrink: 0,
+          paddingHorizontal: 0,
         },
         time: {
           fontFamily: tokens.fontUi,

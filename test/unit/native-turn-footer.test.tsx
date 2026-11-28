@@ -462,16 +462,20 @@ describe("native turn footer slot integration", () => {
     const iosExtras = renderer!.root.findByProps({ testID: "native-footer-extras" });
     const iosContainerStyle = rn.StyleSheet.flatten(iosExtras.props.style);
     expect(iosContainerStyle.flexShrink).toBe(0);
-    expect(iosContainerStyle.maxWidth).toBe(Math.max(110, Math.floor(winWidth) - 200));
+    expect(iosContainerStyle.width).toBe(Math.max(110, Math.floor(winWidth) - 184));
+    expect(iosContainerStyle.maxWidth).toBe(Math.max(110, Math.floor(winWidth) - 184));
     const iosModelButton = iosExtras.find((node) => typeof node.type === "string" && node.props.accessibilityLabel === "Copy model name");
+    const iosMetricButton = iosExtras.find((node) => typeof node.type === "string" && node.props.accessibilityLabel?.startsWith("Output TPS:"));
     const iosModelStyle = rn.StyleSheet.flatten(iosModelButton.props.style);
     expect(iosModelStyle.marginHorizontal).toBeUndefined();
     expect(iosModelStyle.maxWidth).toBeUndefined();
+    expect(iosModelStyle.paddingHorizontal).toBe(0);
+    expect(rn.StyleSheet.flatten(iosMetricButton.props.style).paddingHorizontal).toBe(0);
 
     act(() => renderer!.unmount());
     renderer = undefined;
 
-    // 3. Compact iOS without durationMs (host displays short HH:MM timestamp): reserves 166pt.
+    // 3. Compact iOS without durationMs (host displays short HH:MM timestamp): reserves 158pt.
     await act(async () => {
       renderer = TestRenderer.create(
         React.createElement(NativeTurnFooterItem, {
@@ -492,6 +496,126 @@ describe("native turn footer slot integration", () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
     const tsExtras = renderer!.root.findByProps({ testID: "native-footer-extras" });
-    expect(rn.StyleSheet.flatten(tsExtras.props.style).maxWidth).toBe(Math.max(110, Math.floor(winWidth) - 166));
+    expect(rn.StyleSheet.flatten(tsExtras.props.style).width).toBe(Math.max(110, Math.floor(winWidth) - 158));
+    expect(rn.StyleSheet.flatten(tsExtras.props.style).maxWidth).toBe(Math.max(110, Math.floor(winWidth) - 158));
+  });
+
+  it("enforces single-line host timing, zero mid-row whitespace chasm, and consistent visual gaps under Yoga across phone widths", async () => {
+    const YogaModule = await import("yoga-layout");
+    const Yoga = YogaModule.default;
+    const { Align, FlexDirection, Gutter, MeasureMode } = YogaModule;
+    const rn = await import("./helpers/rn-mock");
+
+    for (const [windowW, durationMs, textW] of [
+      [375, null, 32],
+      [390, null, 32],
+      [430, null, 32],
+      [375, 41_000, 58],
+      [390, 41_000, 58],
+      [430, 41_000, 58],
+      [375, 290_000, 72],
+      [390, 290_000, 72],
+    ] as const) {
+      updateEnhancerPreferences({ language: "zh" });
+      await act(async () => {
+        renderer = TestRenderer.create(
+          React.createElement(NativeTurnFooterItem, {
+            theme,
+            host: { id: "host-1", label: "Host" },
+            layout: { compact: true, platform: "ios" },
+            agentId: "agent-1",
+            turnId: "one",
+            model: "sol",
+            provider: "codex",
+            completedAt: new Date(52_000),
+            durationMs,
+            telemetry: { outputTps: 27.6 },
+          }),
+        );
+      });
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+
+      const extras = renderer!.root.findByProps({ testID: "native-footer-extras" });
+      const style = rn.StyleSheet.flatten(extras.props.style);
+      // Scale configured reserve delta against the current viewport width.
+      const reserve = rn.Dimensions.get().width - (style.width as number);
+      const pluginW = Math.max(110, windowW - reserve);
+
+      const rowW = windowW - 16;
+      const root = Yoga.Node.create();
+      root.setWidth(rowW);
+      const cont = Yoga.Node.create();
+      cont.setFlexDirection(FlexDirection.Row);
+      cont.setGap(Gutter.Column, 8);
+      const actNode = Yoga.Node.create();
+      actNode.setWidth(88);
+      actNode.setHeight(24);
+      cont.insertChild(actNode, 0);
+
+      const lblBtn = Yoga.Node.create();
+      lblBtn.setFlexDirection(FlexDirection.Row);
+      lblBtn.setFlexShrink(1);
+      lblBtn.setMinWidth(0);
+      lblBtn.setMinHeight(24);
+      lblBtn.setAlignItems(Align.Center);
+      const lblText = Yoga.Node.create();
+      lblText.setWidthPercent(100);
+      lblText.setFlexShrink(0);
+      lblText.setMeasureFunc((mw, wm) =>
+        wm === MeasureMode.Undefined || mw >= textW
+          ? { width: textW, height: 18 }
+          : { width: mw, height: Math.ceil(textW / Math.max(1, mw)) * 18 },
+      );
+      lblBtn.insertChild(lblText, 0);
+      cont.insertChild(lblBtn, 1);
+
+      const plug = Yoga.Node.create();
+      plug.setFlexDirection(FlexDirection.Row);
+      plug.setGap(Gutter.Column, style.gap as number);
+      plug.setFlexShrink(0);
+      plug.setMinWidth(0);
+      plug.setWidth(pluginW);
+      plug.setMaxWidth(pluginW);
+
+      const tr = Yoga.Node.create();
+      tr.setWidth(24 - 8); // 24px button with marginHorizontal: -4
+      tr.setHeight(24);
+      tr.setFlexShrink(0);
+      const mod = Yoga.Node.create();
+      mod.setWidth(65);
+      mod.setHeight(24);
+      mod.setFlexShrink(1);
+      mod.setMinWidth(0);
+      const met = Yoga.Node.create();
+      met.setWidth(56);
+      met.setHeight(24);
+      met.setFlexShrink(0);
+      plug.insertChild(tr, 0);
+      plug.insertChild(mod, 1);
+      plug.insertChild(met, 2);
+
+      cont.insertChild(plug, 2);
+      root.insertChild(cont, 0);
+      root.calculateLayout(rowW, undefined);
+
+      // 1. Host timing never wraps to two lines.
+      expect(lblBtn.getComputedHeight()).toBe(24);
+      // 2. No extra whitespace chasm after the host timing label before Translate.
+      const slackAfterLabel = lblBtn.getComputedWidth() - textW;
+      expect(slackAfterLabel).toBeGreaterThanOrEqual(0);
+      expect(slackAfterLabel).toBeLessThanOrEqual(8);
+      // 3. Visual gaps across host-metrics->label, label->translate, translate->model, model->metric stay within 4pt.
+      const metricsToLabel = 5 + 8; // 24px Metrics icon (5px right pad) + 8px container gap
+      const labelToTranslate = slackAfterLabel + 8 + 1;
+      const translateToModel = 1 + (style.gap as number);
+      const modelToMetric = style.gap as number;
+      const gaps = [metricsToLabel, labelToTranslate, translateToModel, modelToMetric];
+      expect(Math.max(...gaps) - Math.min(...gaps)).toBeLessThanOrEqual(5);
+
+      act(() => renderer!.unmount());
+      renderer = undefined;
+    }
   });
 });
